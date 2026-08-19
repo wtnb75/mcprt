@@ -57,7 +57,7 @@ gatewayは1プロセス。起動時に全backendへ接続してtool一覧を取�
 | `internal/backend` | backend1台につき1インスタンス。stdioなら公式SDKでサブプロセスを起動、HTTPならリモートに接続。どちらも同じ`Client`として扱えるようラップする |
 | `internal/router` | 全backendの`ListTools`結果を受け取り、prefix適用→記載順／overridesで衝突解決→`map[toolName]resolvedTool{backend, originalName}`を構築。隠れたtoolはWARNログに出す |
 | `internal/gateway` | 公式SDKの`Server`をラップ。`tools/list`はrouterのテーブルをそのまま返し、`tools/call`は1個の汎用ハンドラでtool名をrouterに引かせてbackendへ転送 |
-| `cmd/mcprt` | エントリポイント（cobraで構成）。`--config`でYAMLパス指定、`--log-level`でログレベル指定。起動シーケンス（全backend並行接続→router構築→server起動）を実行 |
+| `cmd/mcprt` | エントリポイント（cobraで構成）。v1から`server`サブコマンドとして実装（`mcprt server --config <path> [--log-level <level>]`）。起動シーケンス（全backend並行接続→router構築→server起動）を実行 |
 
 ## データフロー
 
@@ -127,7 +127,8 @@ overrides:
 ## CLI
 
 - `spf13/cobra`を使用
-- v1は単一コマンド（`mcprt --config <path> [--log-level <level>]`）だが、将来`mcprt validate`のようなサブコマンドを追加しやすいようcobraの構成にしておく
+- v1から`server`サブコマンドとして実装する: `mcprt server --config <path> [--log-level <level>]`
+- 将来`mcprt validate`のような他のサブコマンドを追加しやすい構成にしておく（最初から単一コマンドで作らず、サブコマンド前提の構造にしておく）
 
 ## テスト方針
 
