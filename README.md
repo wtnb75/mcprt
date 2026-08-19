@@ -16,7 +16,7 @@ Minimal example:
 
     listen:
       stdio: true
-      http: ":8080"
+      http: "127.0.0.1:8080"
 
     backends:
       - name: filesystem
@@ -32,6 +32,10 @@ Minimal example:
 
     overrides:
       gh__search: github
+
+v1 has no built-in gateway authentication, so keep `listen.http` bound to
+localhost or a trusted network and put a reverse proxy (or equivalent) in
+front of it before exposing it any further.
 
 ## Development
 

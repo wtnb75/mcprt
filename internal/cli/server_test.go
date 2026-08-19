@@ -99,6 +99,53 @@ backends:
 	}
 }
 
+// TestServerCommand_StdioShutdownIsClean covers the stdio listener's
+// shutdown path: gateway.ServeStdio returns ctx.Err() when the context is
+// cancelled, and a cancelled context is a clean shutdown, not a failure the
+// command should exit non-zero on.
+func TestServerCommand_StdioShutdownIsClean(t *testing.T) {
+	// mcp.StdioTransport reads os.Stdin at connect time, so point it at a
+	// pipe nothing ever writes to: the session then stays open until the
+	// context is cancelled. os.Stdout is left alone -- the server writes
+	// nothing unless a client sends a request.
+	//
+	// This swaps the package-level os.Stdin for the test's duration, so this
+	// test must not run with t.Parallel() (nor alongside another test that
+	// touches os.Stdin).
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("creating stdin pipe: %v", err)
+	}
+	origStdin := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() {
+		os.Stdin = origStdin
+		_ = w.Close()
+		_ = r.Close()
+	})
+
+	configPath := writeConfig(t, "listen:\n  stdio: true\n\nbackends: []\n")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	execErr := make(chan error, 1)
+	go func() {
+		execErr <- cli.Execute(ctx, []string{"server", "--config", configPath})
+	}()
+
+	// Give the command a moment to load the config and start the listener.
+	time.Sleep(200 * time.Millisecond)
+
+	cancel()
+	select {
+	case err := <-execErr:
+		if err != nil {
+			t.Fatalf("server exited with error on shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not exit within 5s of context cancellation")
+	}
+}
+
 func TestServerCommand_NoListenerConfigured(t *testing.T) {
 	configPath := writeConfig(t, "backends: []\n")
 

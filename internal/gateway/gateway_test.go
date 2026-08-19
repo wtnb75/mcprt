@@ -34,6 +34,50 @@ func newFakeBackendServer(name string, toolNames ...string) *mcp.Server {
 	return srv
 }
 
+// TestGateway_CallOnDeadBackendReturnsError checks that a call to a backend
+// that is no longer reachable surfaces the error to the client (callHandler
+// also logs it, which isn't asserted here).
+func TestGateway_CallOnDeadBackendReturnsError(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendServer := newFakeBackendServer("backend-dead", "boom")
+	httpBackend := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpBackend.Close()
+
+	ctx := context.Background()
+	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-dead", Transport: "http", URL: httpBackend.URL})
+	if err != nil {
+		t.Fatalf("connect backend-dead: %v", err)
+	}
+	tools, err := conn.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("list backend-dead tools: %v", err)
+	}
+
+	table := router.Resolve([]router.Entry{{BackendName: "backend-dead", Tools: tools}}, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, table)
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	// Kill the backend connection, then call the tool it used to serve.
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close backend-dead: %v", err)
+	}
+
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "boom", Arguments: map[string]any{}})
+	if err == nil && (res == nil || !res.IsError) {
+		t.Fatalf("call boom on dead backend: got no error (result %+v), want an error", res)
+	}
+}
+
 func TestGateway_RoutesByPriorityAndExposesUniqueTools(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 

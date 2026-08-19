@@ -95,9 +95,22 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 		go func() { errCh <- gateway.ServeHTTP(ctx, srv, cfg.Listen.HTTP) }()
 	}
 
+	// Log each listener's outcome as it arrives, so a listener that fails
+	// while another is still healthy is reported immediately. A cancelled
+	// context is how a clean shutdown reaches ServeStdio, so it isn't a
+	// failure.
 	var firstErr error
 	for i := 0; i < running; i++ {
-		if err := <-errCh; err != nil && firstErr == nil {
+		err := <-errCh
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, context.Canceled) {
+			logger.Debug("listener stopped due to shutdown", "error", err)
+			continue
+		}
+		logger.Error("listener stopped with error", "error", err)
+		if firstErr == nil {
 			firstErr = err
 		}
 	}

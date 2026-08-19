@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -21,20 +22,25 @@ func New(logger *slog.Logger, backends map[string]*backend.Backend, table *route
 
 	for _, resolved := range table.Tools {
 		b := backends[resolved.BackendName]
-		addTool(srv, logger, resolved.Tool, callHandler(b, resolved.OriginalName))
+		addTool(srv, logger, resolved.Tool, callHandler(logger, b, resolved.OriginalName))
 	}
 
 	return srv
 }
 
 // callHandler forwards a tools/call to originalName on backend b, passing
-// the raw arguments through unchanged.
-func callHandler(b *backend.Backend, originalName string) mcp.ToolHandler {
+// the raw arguments through unchanged. A failure is returned to the client
+// and logged, so a dead or erroring backend is visible to the operator.
+func callHandler(logger *slog.Logger, b *backend.Backend, originalName string) mcp.ToolHandler {
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		return b.Session.CallTool(ctx, &mcp.CallToolParams{
+		result, err := b.Session.CallTool(ctx, &mcp.CallToolParams{
 			Name:      originalName,
 			Arguments: req.Params.Arguments,
 		})
+		if err != nil {
+			logger.Error("backend call failed", "backend", b.Name, "tool", originalName, "error", err)
+		}
+		return result, err
 	}
 }
 
@@ -67,7 +73,15 @@ func ServeHTTP(ctx context.Context, srv *mcp.Server, addr string) error {
 
 	select {
 	case <-ctx.Done():
-		return httpServer.Shutdown(context.Background())
+		// Bound the graceful shutdown: MCP Streamable HTTP clients hold a
+		// long-lived SSE stream open, so Shutdown would otherwise wait
+		// forever for the connection to go idle.
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(sctx); err != nil {
+			return httpServer.Close()
+		}
+		return nil
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return err
