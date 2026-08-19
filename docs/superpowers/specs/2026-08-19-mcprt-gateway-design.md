@@ -92,6 +92,12 @@ backends:
       FOO: bar
     # prefix省略時はprefixなし
 
+  - name: filesystem-archive
+    transport: stdio
+    command: ["mcp-server-filesystem", "--root", "/archive"]
+    # こちらもprefixなし。仮にfilesystemと同じく"search"というtoolを持つ場合、
+    # 記載順ならfilesystemが勝つが、overridesで明示的に逆転できる
+
   - name: github
     transport: http
     url: "http://localhost:9090/mcp"
@@ -100,10 +106,11 @@ backends:
     prefix: "gh__"
 
 overrides:
-  search: github    # tool名"search"は常にbackend "github"を採用（記載順より優先）
+  search: filesystem-archive    # 公開後のtool名"search"はfilesystem-archiveを採用（記載順より優先）
 ```
 
 - 優先度は**backendsリストの記載順**（上ほど高優先）のみで決める。数値によるpriority指定は行わない（overridesで個別に上書きできれば十分なため）
+- `overrides`のキーは**prefix適用後（公開後）のtool名**を指す。backendにprefixが設定されている場合は、prefix込みの名前をキーに書く必要がある（例: `gh__search: github`）
 - `${VAR}`形式の環境変数展開は`headers`/`env`の値に対して行う
 - `overrides`が存在しないbackend名を指している場合は起動時バリデーションでエラーにする
 
