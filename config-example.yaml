@@ -1,0 +1,14 @@
+listen:
+  stdio: true
+  http: "127.0.0.1:8080"
+
+backends:
+- name: example
+  transport: http
+  url: "http://127.0.0.1:8000/mcp"
+- name: backend2
+  transport: http
+  url: "http://127.0.0.1:8001/mcp"
+
+overrides:
+  example_tool: example
