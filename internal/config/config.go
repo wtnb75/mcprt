@@ -19,9 +19,11 @@ var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // Config is the top-level gateway configuration, loaded from a YAML file.
 type Config struct {
-	Listen    ListenConfig      `yaml:"listen"`
-	Backends  []BackendConfig   `yaml:"backends"`
-	Overrides map[string]string `yaml:"overrides,omitempty"`
+	Listen                    ListenConfig      `yaml:"listen"`
+	Backends                  []BackendConfig   `yaml:"backends"`
+	Overrides                 map[string]string `yaml:"overrides,omitempty"`
+	ResourceOverrides         map[string]string `yaml:"resource_overrides,omitempty"`
+	ResourceTemplateOverrides map[string]string `yaml:"resource_template_overrides,omitempty"`
 }
 
 // ListenConfig controls which client-facing transports the gateway serves.
@@ -168,6 +170,16 @@ func validate(cfg *Config) error {
 	for toolName, backendName := range cfg.Overrides {
 		if !names[backendName] {
 			return fmt.Errorf("override %q references unknown backend %q", toolName, backendName)
+		}
+	}
+	for uri, backendName := range cfg.ResourceOverrides {
+		if !names[backendName] {
+			return fmt.Errorf("resource_overrides %q references unknown backend %q", uri, backendName)
+		}
+	}
+	for uriTemplate, backendName := range cfg.ResourceTemplateOverrides {
+		if !names[backendName] {
+			return fmt.Errorf("resource_template_overrides %q references unknown backend %q", uriTemplate, backendName)
 		}
 	}
 

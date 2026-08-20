@@ -315,3 +315,61 @@ overrides:
 		t.Fatal("Parse: expected error for override referencing unknown backend, got nil")
 	}
 }
+
+func TestParse_ResourceOverrides(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: filesystem-primary
+    transport: stdio
+    command: ["a"]
+  - name: filesystem-secondary
+    transport: stdio
+    command: ["b"]
+
+resource_overrides:
+  "file:///data/README.md": filesystem-primary
+
+resource_template_overrides:
+  "file:///data/{path}": filesystem-primary
+`)
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.ResourceOverrides["file:///data/README.md"] != "filesystem-primary" {
+		t.Fatalf("ResourceOverrides[...] = %q, want %q", cfg.ResourceOverrides["file:///data/README.md"], "filesystem-primary")
+	}
+	if cfg.ResourceTemplateOverrides["file:///data/{path}"] != "filesystem-primary" {
+		t.Fatalf("ResourceTemplateOverrides[...] = %q, want %q", cfg.ResourceTemplateOverrides["file:///data/{path}"], "filesystem-primary")
+	}
+}
+
+func TestParse_ResourceOverrideReferencesUnknownBackend(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: known
+    transport: stdio
+    command: ["a"]
+
+resource_overrides:
+  "file:///data/README.md": nonexistent
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for resource_overrides referencing unknown backend, got nil")
+	}
+}
+
+func TestParse_ResourceTemplateOverrideReferencesUnknownBackend(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: known
+    transport: stdio
+    command: ["a"]
+
+resource_template_overrides:
+  "file:///data/{path}": nonexistent
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for resource_template_overrides referencing unknown backend, got nil")
+	}
+}
