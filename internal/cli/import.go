@@ -19,21 +19,21 @@ import (
 // Fields with no mcprt equivalent (headersHelper, VS Code's non-env
 // placeholders, ...) are intentionally not modeled here.
 type mcpJSONServer struct {
-	Type    string            `json:"type"`
-	Command string            `json:"command"`
-	Args    []string          `json:"args"`
-	Env     map[string]string `json:"env"`
-	Cwd     string            `json:"cwd"`
-	URL     string            `json:"url"`
-	Headers map[string]string `json:"headers"`
+	Type    string            `json:"type,omitempty"`
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	Cwd     string            `json:"cwd,omitempty"`
+	URL     string            `json:"url,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // mcpJSONFile is the top level of a generic mcp.json-style client config.
 // "mcpServers" is used by Claude Desktop and Cursor; VS Code uses "servers".
 // A file may reasonably contain either (or, in principle, both).
 type mcpJSONFile struct {
-	MCPServers map[string]mcpJSONServer `json:"mcpServers"`
-	Servers    map[string]mcpJSONServer `json:"servers"`
+	MCPServers map[string]mcpJSONServer `json:"mcpServers,omitempty"`
+	Servers    map[string]mcpJSONServer `json:"servers,omitempty"`
 }
 
 // envPlaceholderRE matches VS Code's "${env:NAME}" env-reference syntax, so
