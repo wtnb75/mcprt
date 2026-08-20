@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"regexp"
@@ -97,9 +98,7 @@ func mergeEnvFiles(cfg *Config) error {
 		if err != nil {
 			return fmt.Errorf("backend %q: env_file: %w", b.Name, err)
 		}
-		for k, v := range b.Env {
-			fileEnv[k] = v
-		}
+		maps.Copy(fileEnv, b.Env)
 		b.Env = fileEnv
 	}
 	return nil

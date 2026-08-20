@@ -120,7 +120,7 @@ func TestParse_EnvFile(t *testing.T) {
 	envFile := filepath.Join(t.TempDir(), ".env")
 	writeFile(t, envFile, "FOO=from-file\nBAR=${FOO}\n")
 
-	data := []byte(fmt.Sprintf(`
+	data := fmt.Appendf(nil, `
 backends:
   - name: filesystem
     transport: stdio
@@ -128,7 +128,7 @@ backends:
     env_file: %q
     env:
       FOO: from-config
-`, envFile))
+`, envFile)
 
 	cfg, err := config.Parse(data)
 	if err != nil {
@@ -152,13 +152,13 @@ func TestParse_EnvFileNotDoubleExpanded(t *testing.T) {
 	writeFile(t, envFile, `MSG=\$HOME`+"\n")
 	t.Setenv("HOME", "/should/not/leak")
 
-	data := []byte(fmt.Sprintf(`
+	data := fmt.Appendf(nil, `
 backends:
   - name: filesystem
     transport: stdio
     command: ["a"]
     env_file: %q
-`, envFile))
+`, envFile)
 
 	cfg, err := config.Parse(data)
 	if err != nil {
