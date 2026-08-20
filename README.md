@@ -25,6 +25,18 @@ Minimal example:
         dir: "/data"
         env_file: ".env"   # .env-format file, merged into env (env: takes precedence on conflicts)
 
+      - name: remote-filesystem
+        transport: stdio
+        command: ["mcp-server-filesystem", "--root", "/data"]
+        dir: "/data"        # working directory on the remote host
+        env:
+          FOO: bar          # exported on the remote host before command runs
+        ssh:
+          host: "user@example.com"
+          port: 2222                              # optional
+          identity_file: "/home/me/.ssh/id_ed25519" # optional, passed as -i
+          args: ["-o", "StrictHostKeyChecking=no"]  # optional, appended to the ssh invocation
+
       - name: github
         transport: http
         url: "http://localhost:9090/mcp"
@@ -34,6 +46,11 @@ Minimal example:
 
     overrides:
       gh__search: github
+
+When `ssh` is set on a stdio backend, mcprt runs `command` on the remote host
+by shelling out to the local `ssh` binary (so `~/.ssh/config`, `ssh-agent`,
+and `known_hosts` all apply as usual); `dir` and `env`/`env_file` are applied
+on the remote side, not the local one.
 
 v1 has no built-in gateway authentication, so keep `listen.http` bound to
 localhost or a trusted network and put a reverse proxy (or equivalent) in

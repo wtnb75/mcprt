@@ -29,9 +29,19 @@ type BackendConfig struct {
 	Dir       string            `yaml:"dir"`      // working directory for the stdio subprocess
 	EnvFile   string            `yaml:"env_file"` // .env-format file merged under Env
 	Env       map[string]string `yaml:"env"`
+	SSH       *SSHConfig        `yaml:"ssh"` // if set, run the stdio Command on a remote host via ssh
 	URL       string            `yaml:"url"`
 	Headers   map[string]string `yaml:"headers"`
 	Prefix    string            `yaml:"prefix"`
+}
+
+// SSHConfig describes how to reach the remote host a stdio backend's
+// Command should be run on.
+type SSHConfig struct {
+	Host         string   `yaml:"host"` // required, e.g. "user@example.com"
+	Port         int      `yaml:"port"`
+	IdentityFile string   `yaml:"identity_file"` // passed as -i
+	Args         []string `yaml:"args"`          // extra ssh arguments, e.g. ["-J", "jumphost"]
 }
 
 // Load reads and parses the config file at path.
@@ -101,6 +111,15 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("duplicate backend name: %q", b.Name)
 		}
 		names[b.Name] = true
+
+		if b.SSH != nil {
+			if b.Transport != "stdio" {
+				return fmt.Errorf("backend %q: ssh is only valid for stdio transport", b.Name)
+			}
+			if b.SSH.Host == "" {
+				return fmt.Errorf("backend %q: ssh requires host", b.Name)
+			}
+		}
 
 		switch b.Transport {
 		case "stdio":

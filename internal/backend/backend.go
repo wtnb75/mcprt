@@ -6,6 +6,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -27,9 +30,14 @@ func Connect(ctx context.Context, cfg config.BackendConfig) (*Backend, error) {
 	var transport mcp.Transport
 	switch cfg.Transport {
 	case "stdio":
-		cmd := exec.Command(cfg.Command[0], cfg.Command[1:]...)
-		cmd.Dir = cfg.Dir
-		cmd.Env = envWithOverrides(cfg.Env)
+		var cmd *exec.Cmd
+		if cfg.SSH != nil {
+			cmd = sshCommand(cfg)
+		} else {
+			cmd = exec.Command(cfg.Command[0], cfg.Command[1:]...)
+			cmd.Dir = cfg.Dir
+			cmd.Env = envWithOverrides(cfg.Env)
+		}
 		transport = &mcp.CommandTransport{Command: cmd}
 	case "http":
 		transport = &mcp.StreamableClientTransport{
@@ -74,6 +82,55 @@ func envWithOverrides(extra map[string]string) []string {
 		env = append(env, k+"="+v)
 	}
 	return env
+}
+
+// sshCommand builds the "ssh ... <remote-script>" command that runs cfg.Command
+// on cfg.SSH.Host. The local ssh client process inherits the gateway's own
+// environment unchanged; cfg.Dir and cfg.Env are instead embedded into the
+// remote shell script, since they need to take effect on the remote side.
+func sshCommand(cfg config.BackendConfig) *exec.Cmd {
+	var args []string
+	if cfg.SSH.Port != 0 {
+		args = append(args, "-p", strconv.Itoa(cfg.SSH.Port))
+	}
+	if cfg.SSH.IdentityFile != "" {
+		args = append(args, "-i", cfg.SSH.IdentityFile)
+	}
+	args = append(args, cfg.SSH.Args...)
+	args = append(args, cfg.SSH.Host, remoteScript(cfg))
+	return exec.Command("ssh", args...)
+}
+
+// remoteScript builds a single POSIX shell command string that cds into
+// cfg.Dir (if set), exports cfg.Env, then execs cfg.Command.
+func remoteScript(cfg config.BackendConfig) string {
+	var b strings.Builder
+	if cfg.Dir != "" {
+		fmt.Fprintf(&b, "cd %s && ", shellQuote(cfg.Dir))
+	}
+
+	keys := make([]string, 0, len(cfg.Env))
+	for k := range cfg.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(&b, "export %s=%s && ", k, shellQuote(cfg.Env[k]))
+	}
+
+	quoted := make([]string, len(cfg.Command))
+	for i, arg := range cfg.Command {
+		quoted[i] = shellQuote(arg)
+	}
+	b.WriteString("exec ")
+	b.WriteString(strings.Join(quoted, " "))
+	return b.String()
+}
+
+// shellQuote wraps s in single quotes for safe use as one word in a POSIX
+// shell command, escaping any single quotes it contains.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // headerRoundTripper injects fixed headers (e.g. an Authorization token)

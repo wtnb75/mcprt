@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 
@@ -36,8 +38,8 @@ func TestConnect_Stdio(t *testing.T) {
 	for _, tool := range tools {
 		names = append(names, tool.Name)
 	}
-	if len(tools) != 2 || !slices.Contains(names, "echo") || !slices.Contains(names, "cwd") {
-		t.Fatalf("ListTools = %v, want tools named \"echo\" and \"cwd\"", names)
+	if len(tools) != 3 || !slices.Contains(names, "echo") || !slices.Contains(names, "cwd") || !slices.Contains(names, "env") {
+		t.Fatalf("ListTools = %v, want tools named \"echo\", \"cwd\" and \"env\"", names)
 	}
 }
 
@@ -48,18 +50,10 @@ func TestConnect_Stdio_Dir(t *testing.T) {
 		t.Fatalf("EvalSymlinks: %v", err)
 	}
 
-	// Build the echoserver into a plain binary first: with cmd.Dir pointing
-	// outside the module, "go run" can't resolve go.mod for the package.
-	binPath := filepath.Join(t.TempDir(), "echoserver")
-	build := exec.Command("go", "build", "-o", binPath, "./testdata/echoserver")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("go build echoserver: %v\n%s", err, out)
-	}
-
 	b, err := backend.Connect(ctx, config.BackendConfig{
 		Name:      "echo",
 		Transport: "stdio",
-		Command:   []string{binPath},
+		Command:   []string{buildEchoserver(t)},
 		Dir:       wantDir,
 	})
 	if err != nil {
@@ -67,22 +61,102 @@ func TestConnect_Stdio_Dir(t *testing.T) {
 	}
 	defer func() { _ = b.Close() }()
 
+	if got := callCwd(t, ctx, b); got != wantDir {
+		t.Fatalf("cwd = %q, want %q", got, wantDir)
+	}
+}
+
+func TestConnect_Stdio_SSH(t *testing.T) {
+	ctx := context.Background()
+	wantDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	installFakeSSH(t)
+
+	b, err := backend.Connect(ctx, config.BackendConfig{
+		Name:      "echo",
+		Transport: "stdio",
+		Command:   []string{buildEchoserver(t)},
+		Dir:       wantDir,
+		Env:       map[string]string{"MCPRT_TEST_SSH_VAR": "via-ssh"},
+		SSH:       &config.SSHConfig{Host: "irrelevant-host"},
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	if got := callCwd(t, ctx, b); got != wantDir {
+		t.Fatalf("cwd = %q, want %q", got, wantDir)
+	}
+
+	res, err := b.Session.CallTool(ctx, &mcp.CallToolParams{Name: "env", Arguments: map[string]any{"name": "MCPRT_TEST_SSH_VAR"}})
+	if err != nil {
+		t.Fatalf("CallTool(env): %v", err)
+	}
+	var envOut struct {
+		Value string `json:"value"`
+	}
+	unmarshalStructured(t, res, &envOut)
+	if envOut.Value != "via-ssh" {
+		t.Fatalf("env(MCPRT_TEST_SSH_VAR) = %q, want %q", envOut.Value, "via-ssh")
+	}
+}
+
+// buildEchoserver builds the echoserver test fixture into a plain binary and
+// returns its path. Tests that set Dir (or ssh, which behaves the same way)
+// can't use "go run": with cmd.Dir pointing outside the module, "go run"
+// can't resolve go.mod for the package.
+func buildEchoserver(t *testing.T) string {
+	t.Helper()
+	binPath := filepath.Join(t.TempDir(), "echoserver")
+	build := exec.Command("go", "build", "-o", binPath, "./testdata/echoserver")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build echoserver: %v\n%s", err, out)
+	}
+	return binPath
+}
+
+// installFakeSSH puts a fake "ssh" on PATH that ignores all its connection
+// arguments and just runs the last argument (the remote script backend.go
+// builds) locally via sh -c. This lets tests exercise the real
+// backend.Connect -> ssh -> remote-script -> MCP-handshake path without a
+// real ssh server.
+func installFakeSSH(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ssh script requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	script := "#!/bin/sh\nfor last; do :; done\nexec sh -c \"$last\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(fake ssh): %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func callCwd(t *testing.T, ctx context.Context, b *backend.Backend) string {
+	t.Helper()
 	res, err := b.Session.CallTool(ctx, &mcp.CallToolParams{Name: "cwd"})
 	if err != nil {
 		t.Fatalf("CallTool(cwd): %v", err)
 	}
+	var out struct {
+		Dir string `json:"dir"`
+	}
+	unmarshalStructured(t, res, &out)
+	return out.Dir
+}
+
+func unmarshalStructured(t *testing.T, res *mcp.CallToolResult, out any) {
+	t.Helper()
 	raw, err := json.Marshal(res.StructuredContent)
 	if err != nil {
 		t.Fatalf("Marshal: %v", err)
 	}
-	var out struct {
-		Dir string `json:"dir"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
+	if err := json.Unmarshal(raw, out); err != nil {
 		t.Fatalf("Unmarshal: %v", err)
-	}
-	if out.Dir != wantDir {
-		t.Fatalf("cwd = %q, want %q", out.Dir, wantDir)
 	}
 }
 

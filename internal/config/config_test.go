@@ -156,6 +156,58 @@ backends:
 	}
 }
 
+func TestParse_SSH(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: remote
+    transport: stdio
+    command: ["mcp-server-filesystem"]
+    ssh:
+      host: user@example.com
+      port: 2222
+      identity_file: /home/me/.ssh/id_ed25519
+      args: ["-o", "StrictHostKeyChecking=no"]
+`)
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ssh := cfg.Backends[0].SSH
+	if ssh == nil {
+		t.Fatal("Backends[0].SSH = nil, want non-nil")
+	}
+	if ssh.Host != "user@example.com" || ssh.Port != 2222 || ssh.IdentityFile != "/home/me/.ssh/id_ed25519" || len(ssh.Args) != 2 {
+		t.Fatalf("Backends[0].SSH = %+v, unexpected", ssh)
+	}
+}
+
+func TestParse_SSHMissingHost(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: stdio
+    command: ["a"]
+    ssh: {}
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for ssh with no host, got nil")
+	}
+}
+
+func TestParse_SSHRequiresStdioTransport(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: http
+    url: "http://localhost:9090/mcp"
+    ssh:
+      host: user@example.com
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for ssh on a non-stdio transport, got nil")
+	}
+}
+
 func TestParse_OverrideReferencesUnknownBackend(t *testing.T) {
 	data := []byte(`
 backends:
