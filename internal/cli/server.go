@@ -95,7 +95,7 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 		logger.Warn("tool name conflict", "tool", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
 
-	srv := gateway.New(logger, backends, table)
+	srv := gateway.New(logger, backends, gateway.Tables{Tools: table})
 
 	running := 0
 	errCh := make(chan error, 2)

@@ -14,15 +14,36 @@ import (
 	"github.com/wtnb75/mcprt/internal/router"
 )
 
-// New builds an mcp.Server that exposes table's resolved tools, forwarding
-// each tools/call to the backend that owns it. backends must contain an
-// entry for every BackendName referenced in table (the caller builds both
-// from the same set of connected backends).
-func New(logger *slog.Logger, backends map[string]*backend.Backend, table *router.Table[*mcp.Tool]) *mcp.Server {
+// Tables bundles the independent routing tables the gateway serves: tools,
+// resources, and resource templates. They are built once at startup and
+// never change while the gateway runs.
+type Tables struct {
+	Tools             *router.Table[*mcp.Tool]
+	Resources         *router.Table[*mcp.Resource]
+	ResourceTemplates *router.Table[*mcp.ResourceTemplate]
+}
+
+// New builds an mcp.Server that exposes tables' resolved tools/resources,
+// forwarding each call to the backend that owns it. backends must contain
+// an entry for every BackendName referenced in tables (the caller builds
+// both from the same set of connected backends).
+func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Tables) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{Logger: logger})
 
-	for _, resolved := range table.Items {
-		registerTool(srv, logger, backends, resolved)
+	if tables.Tools != nil {
+		for _, resolved := range tables.Tools.Items {
+			registerTool(srv, logger, backends, resolved)
+		}
+	}
+	if tables.Resources != nil {
+		for _, resolved := range tables.Resources.Items {
+			registerResource(srv, logger, backends, resolved)
+		}
+	}
+	if tables.ResourceTemplates != nil {
+		for _, resolved := range tables.ResourceTemplates.Items {
+			registerResourceTemplate(srv, logger, backends, resolved)
+		}
 	}
 
 	return srv
@@ -46,6 +67,103 @@ func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*bac
 		}
 	}
 	logger.Error("tool unavailable: every candidate backend had an invalid definition", "tool", resolved.Item.Name)
+}
+
+// registerResource registers resolved.Item, falling back to the next
+// lower-priority backend's definition (if any) when one turns out to have
+// an invalid URI, so a conflict's winner having a malformed URI doesn't
+// need to take a validly-defined loser down with it.
+func registerResource(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Resource]) {
+	candidates := append([]router.Candidate[*mcp.Resource]{{
+		Item:         resolved.Item,
+		BackendName:  resolved.BackendName,
+		OriginalName: resolved.OriginalName,
+	}}, resolved.Fallbacks...)
+
+	for _, c := range candidates {
+		b := backends[c.BackendName]
+		if addResource(srv, logger, c.Item, resourceReadHandler(logger, b, c.OriginalName)) {
+			return
+		}
+	}
+	logger.Error("resource unavailable: every candidate backend had an invalid URI", "uri", resolved.Item.URI)
+}
+
+// resourceReadHandler forwards resources/read to originalURI on backend b.
+// originalURI is the fixed URI this exact resource was registered under:
+// prefix is never applied to resource URIs, so it equals the exposed URI,
+// and every call for this resource reads the same URI.
+func resourceReadHandler(logger *slog.Logger, b *backend.Backend, originalURI string) mcp.ResourceHandler {
+	return func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		result, err := b.Session.ReadResource(ctx, &mcp.ReadResourceParams{URI: originalURI})
+		if err != nil {
+			logger.Error("backend call failed", "backend", b.Name, "uri", originalURI, "error", err)
+		}
+		return result, err
+	}
+}
+
+// addResource registers r on srv, recovering from AddResource's panic on an
+// invalid or non-absolute URI so that one broken backend resource
+// definition can't take down the whole gateway process at startup. It
+// reports whether r was registered.
+func addResource(srv *mcp.Server, logger *slog.Logger, r *mcp.Resource, h mcp.ResourceHandler) (ok bool) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			logger.Error("invalid resource definition", "uri", r.URI, "error", rec)
+			ok = false
+		}
+	}()
+	srv.AddResource(r, h)
+	return true
+}
+
+// registerResourceTemplate is registerResource's counterpart for resource
+// templates: same panic-recovery/fallback structure, but its read handler
+// forwards the caller's actual matched URI instead of a fixed one.
+func registerResourceTemplate(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.ResourceTemplate]) {
+	candidates := append([]router.Candidate[*mcp.ResourceTemplate]{{
+		Item:         resolved.Item,
+		BackendName:  resolved.BackendName,
+		OriginalName: resolved.OriginalName,
+	}}, resolved.Fallbacks...)
+
+	for _, c := range candidates {
+		b := backends[c.BackendName]
+		if addResourceTemplate(srv, logger, c.Item, resourceTemplateReadHandler(logger, b)) {
+			return
+		}
+	}
+	logger.Error("resource template unavailable: every candidate backend had an invalid URI template", "uriTemplate", resolved.Item.URITemplate)
+}
+
+// resourceTemplateReadHandler forwards resources/read to the actual URI the
+// client requested (req.Params.URI, the concrete URI that matched this
+// template) on backend b -- unlike an exact resource, a template serves a
+// different URI on every call, so the fixed-URI approach resourceReadHandler
+// uses doesn't apply here.
+func resourceTemplateReadHandler(logger *slog.Logger, b *backend.Backend) mcp.ResourceHandler {
+	return func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		result, err := b.Session.ReadResource(ctx, &mcp.ReadResourceParams{URI: req.Params.URI})
+		if err != nil {
+			logger.Error("backend call failed", "backend", b.Name, "uri", req.Params.URI, "error", err)
+		}
+		return result, err
+	}
+}
+
+// addResourceTemplate registers t on srv, recovering from
+// AddResourceTemplate's panic on an invalid URI template. It reports
+// whether t was registered.
+func addResourceTemplate(srv *mcp.Server, logger *slog.Logger, t *mcp.ResourceTemplate, h mcp.ResourceHandler) (ok bool) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			logger.Error("invalid resource template definition", "uriTemplate", t.URITemplate, "error", rec)
+			ok = false
+		}
+	}()
+	srv.AddResourceTemplate(t, h)
+	return true
 }
 
 // callHandler forwards a tools/call to originalName on backend b, passing

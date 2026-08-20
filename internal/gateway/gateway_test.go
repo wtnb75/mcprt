@@ -55,7 +55,7 @@ func TestGateway_CallOnDeadBackendReturnsError(t *testing.T) {
 	}
 
 	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-dead", Items: tools}}, toolNameOf, toolRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, table)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, gateway.Tables{Tools: table})
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 	defer gw.Close()
@@ -119,7 +119,7 @@ func TestGateway_FallsBackWhenWinnerSchemaInvalid(t *testing.T) {
 		},
 	}
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-b": connB}, table)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-b": connB}, gateway.Tables{Tools: table})
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 	defer gw.Close()
@@ -182,7 +182,7 @@ func TestGateway_RoutesByPriorityAndExposesUniqueTools(t *testing.T) {
 		t.Fatalf("unexpected conflicts: %+v", table.Conflicts)
 	}
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA, "backend-b": connB}, table)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA, "backend-b": connB}, gateway.Tables{Tools: table})
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 	defer gw.Close()
@@ -232,4 +232,188 @@ func toolRename(t *mcp.Tool, name string) *mcp.Tool {
 	c := *t
 	c.Name = name
 	return &c
+}
+
+func newFakeResourceBackendServer(name string, uris ...string) *mcp.Server {
+	srv := mcp.NewServer(&mcp.Implementation{Name: name, Version: "v1"}, nil)
+	for _, uri := range uris {
+		srv.AddResource(&mcp.Resource{URI: uri, Name: uri},
+			func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+				return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: req.Params.URI, Text: name}}}, nil
+			})
+	}
+	return srv
+}
+
+func newFakeResourceTemplateBackendServer(name, uriTemplate string) *mcp.Server {
+	srv := mcp.NewServer(&mcp.Implementation{Name: name, Version: "v1"}, nil)
+	srv.AddResourceTemplate(&mcp.ResourceTemplate{URITemplate: uriTemplate, Name: uriTemplate},
+		func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+			return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: req.Params.URI, Text: req.Params.URI}}}, nil
+		})
+	return srv
+}
+
+// TestGateway_ResourceReadExact checks that resources/read for an exact
+// registered URI is forwarded to the owning backend and its result
+// returned unchanged.
+func TestGateway_ResourceReadExact(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendServer := newFakeResourceBackendServer("backend-a", "file:///a")
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpA.Close()
+
+	ctx := context.Background()
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = connA.Close() }()
+
+	resources, err := connA.ListResources(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a resources: %v", err)
+	}
+
+	resourceNameOf := func(r *mcp.Resource) string { return r.URI }
+	resourceRename := func(r *mcp.Resource, name string) *mcp.Resource { c := *r; c.URI = name; return &c }
+	table := router.Resolve([]router.Entry[*mcp.Resource]{
+		{BackendName: "backend-a", Items: resources},
+	}, resourceNameOf, resourceRename, nil)
+
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Resources: table})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: "file:///a"})
+	if err != nil {
+		t.Fatalf("ReadResource(file:///a): %v", err)
+	}
+	if len(res.Contents) != 1 || res.Contents[0].Text != "backend-a" {
+		t.Fatalf("ReadResource result = %+v, want text \"backend-a\"", res.Contents)
+	}
+}
+
+// TestGateway_ResourceTemplateReadForwardsActualURI checks that
+// resources/read for a URI matching a registered template forwards the
+// client's actual requested URI to the backend (not the template string).
+func TestGateway_ResourceTemplateReadForwardsActualURI(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendServer := newFakeResourceTemplateBackendServer("backend-a", "file:///dir/{f}")
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpA.Close()
+
+	ctx := context.Background()
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = connA.Close() }()
+
+	templates, err := connA.ListResourceTemplates(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a resource templates: %v", err)
+	}
+
+	templateNameOf := func(rt *mcp.ResourceTemplate) string { return rt.URITemplate }
+	templateRename := func(rt *mcp.ResourceTemplate, name string) *mcp.ResourceTemplate {
+		c := *rt
+		c.URITemplate = name
+		return &c
+	}
+	table := router.Resolve([]router.Entry[*mcp.ResourceTemplate]{
+		{BackendName: "backend-a", Items: templates},
+	}, templateNameOf, templateRename, nil)
+
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{ResourceTemplates: table})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: "file:///dir/x"})
+	if err != nil {
+		t.Fatalf("ReadResource(file:///dir/x): %v", err)
+	}
+	if len(res.Contents) != 1 || res.Contents[0].Text != "file:///dir/x" {
+		t.Fatalf("ReadResource result = %+v, want text \"file:///dir/x\" (the actual requested URI forwarded to the backend)", res.Contents)
+	}
+}
+
+// TestGateway_ResourceFallsBackWhenWinnerURIInvalid checks that when the
+// conflict winner's resource URI is malformed (AddResource panics on it),
+// the gateway falls back to the next candidate rather than dropping the
+// resource entirely.
+func TestGateway_ResourceFallsBackWhenWinnerURIInvalid(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendBServer := newFakeResourceBackendServer("backend-b", "file:///a")
+	httpB := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendBServer }, nil))
+	defer httpB.Close()
+
+	ctx := context.Background()
+	connB, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-b", Transport: "http", URL: httpB.URL})
+	if err != nil {
+		t.Fatalf("connect backend-b: %v", err)
+	}
+	defer func() { _ = connB.Close() }()
+
+	resourcesB, err := connB.ListResources(ctx)
+	if err != nil {
+		t.Fatalf("list backend-b resources: %v", err)
+	}
+
+	// Hand-build a table: the winner ("backend-a") has an invalid URI, which
+	// mcp.Server.AddResource panics on; the loser ("backend-b") is a valid
+	// fallback candidate.
+	table := &router.Table[*mcp.Resource]{
+		Items: map[string]*router.Resolved[*mcp.Resource]{
+			"resource-key": {
+				Item:         &mcp.Resource{URI: "http://%gg", Name: "bad"},
+				BackendName:  "backend-a",
+				OriginalName: "http://%gg",
+				Fallbacks: []router.Candidate[*mcp.Resource]{{
+					Item:         resourcesB[0],
+					BackendName:  "backend-b",
+					OriginalName: "file:///a",
+				}},
+			},
+		},
+	}
+
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-b": connB}, gateway.Tables{Resources: table})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: "file:///a"})
+	if err != nil {
+		t.Fatalf("ReadResource(file:///a): %v", err)
+	}
+	if len(res.Contents) != 1 || res.Contents[0].Text != "backend-b" {
+		t.Fatalf("ReadResource result = %+v, want text \"backend-b\" (the fallback)", res.Contents)
+	}
 }
