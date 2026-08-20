@@ -1,20 +1,30 @@
 version: '3'
 
 tasks:
+  default:
+    desc: list
+    cmds:
+      - task -l --sort=alphanumeric
+
   build:
+    desc: build binary
     cmds:
       - go build -o bin/mcprt ./cmd/mcprt
 
   test:
+    desc: run test
     cmds:
       - go test ./...
 
   lint:
+    desc: run lint
     cmds:
       - gofmt -l .
       - go vet ./...
       - golangci-lint run ./...
 
   fmt:
+    desc: run fmt
     cmds:
       - gofmt -w .
+      - go fix ./...
