@@ -20,37 +20,37 @@ var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 type Config struct {
 	Listen    ListenConfig      `yaml:"listen"`
 	Backends  []BackendConfig   `yaml:"backends"`
-	Overrides map[string]string `yaml:"overrides"`
+	Overrides map[string]string `yaml:"overrides,omitempty"`
 }
 
 // ListenConfig controls which client-facing transports the gateway serves.
 type ListenConfig struct {
-	Stdio bool   `yaml:"stdio"`
-	HTTP  string `yaml:"http"`
+	Stdio bool   `yaml:"stdio,omitempty"`
+	HTTP  string `yaml:"http,omitempty"`
 }
 
 // BackendConfig describes one backend MCP server to connect to.
 type BackendConfig struct {
 	Name      string            `yaml:"name"`
 	Transport string            `yaml:"transport"` // "stdio" or "http"
-	Command   []string          `yaml:"command"`
-	Dir       string            `yaml:"dir"`      // working directory for the stdio subprocess
-	EnvFile   string            `yaml:"env_file"` // .env-format file merged under Env
-	Env       map[string]string `yaml:"env"`
-	SSH       *SSHConfig        `yaml:"ssh"` // if set, run the stdio Command on a remote host via ssh
-	URL       string            `yaml:"url"`
-	Headers   map[string]string `yaml:"headers"`
-	Proxy     string            `yaml:"proxy"` // proxy URL for http transport; "none" disables proxying even if HTTP_PROXY etc. are set; unset follows HTTP_PROXY/HTTPS_PROXY/NO_PROXY
-	Prefix    string            `yaml:"prefix"`
+	Command   []string          `yaml:"command,omitempty"`
+	Dir       string            `yaml:"dir,omitempty"`      // working directory for the stdio subprocess
+	EnvFile   string            `yaml:"env_file,omitempty"` // .env-format file merged under Env
+	Env       map[string]string `yaml:"env,omitempty"`
+	SSH       *SSHConfig        `yaml:"ssh,omitempty"` // if set, run the stdio Command on a remote host via ssh
+	URL       string            `yaml:"url,omitempty"`
+	Headers   map[string]string `yaml:"headers,omitempty"`
+	Proxy     string            `yaml:"proxy,omitempty"` // proxy URL for http transport; "none" disables proxying even if HTTP_PROXY etc. are set; unset follows HTTP_PROXY/HTTPS_PROXY/NO_PROXY
+	Prefix    string            `yaml:"prefix,omitempty"`
 }
 
 // SSHConfig describes how to reach the remote host a stdio backend's
 // Command should be run on.
 type SSHConfig struct {
 	Host         string   `yaml:"host"` // required, e.g. "user@example.com"
-	Port         int      `yaml:"port"`
-	IdentityFile string   `yaml:"identity_file"` // passed as -i
-	Args         []string `yaml:"args"`          // extra ssh arguments, e.g. ["-J", "jumphost"]
+	Port         int      `yaml:"port,omitempty"`
+	IdentityFile string   `yaml:"identity_file,omitempty"` // passed as -i
+	Args         []string `yaml:"args,omitempty"`          // extra ssh arguments, e.g. ["-J", "jumphost"]
 }
 
 // Load reads and parses the config file at path.
