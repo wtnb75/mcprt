@@ -20,6 +20,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(newPingCmd())
 	root.AddCommand(newCallCmd())
 	root.AddCommand(newInitCmd())
+	root.AddCommand(newImportCmd())
 	return root
 }
 
