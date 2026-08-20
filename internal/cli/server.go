@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/spf13/cobra"
 
 	"github.com/wtnb75/mcprt/internal/backend"
@@ -89,7 +90,7 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 		}
 	}()
 
-	table := router.Resolve(entries, cfg.Overrides)
+	table := router.Resolve(entries, toolNameOf, toolRename, cfg.Overrides)
 	for _, c := range table.Conflicts {
 		logger.Warn("tool name conflict", "tool", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
@@ -137,10 +138,10 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 // fail or stall the whole startup. The returned entries preserve configs'
 // order, since router.Resolve treats that order as priority (index 0 =
 // highest).
-func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.BackendConfig) (map[string]*backend.Backend, []router.Entry) {
+func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.BackendConfig) (map[string]*backend.Backend, []router.Entry[*mcp.Tool]) {
 	type outcome struct {
 		backend *backend.Backend
-		entry   router.Entry
+		entry   router.Entry[*mcp.Tool]
 	}
 	outcomes := make([]*outcome, len(configs))
 
@@ -165,14 +166,14 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 			}
 			outcomes[i] = &outcome{
 				backend: b,
-				entry:   router.Entry{BackendName: bc.Name, Prefix: bc.Prefix, Tools: tools},
+				entry:   router.Entry[*mcp.Tool]{BackendName: bc.Name, Prefix: bc.Prefix, Items: tools},
 			}
 		}(i, bc)
 	}
 	wg.Wait()
 
 	backends := make(map[string]*backend.Backend, len(configs))
-	entries := make([]router.Entry, 0, len(configs))
+	entries := make([]router.Entry[*mcp.Tool], 0, len(configs))
 	for _, o := range outcomes {
 		if o == nil {
 			continue
@@ -181,4 +182,12 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 		entries = append(entries, o.entry)
 	}
 	return backends, entries
+}
+
+func toolNameOf(t *mcp.Tool) string { return t.Name }
+
+func toolRename(t *mcp.Tool, name string) *mcp.Tool {
+	c := *t
+	c.Name = name
+	return &c
 }

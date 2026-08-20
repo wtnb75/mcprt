@@ -68,8 +68,8 @@ func runCall(ctx context.Context, cmd *cobra.Command, configPath, toolName, args
 		}
 	}()
 
-	table := router.Resolve(entries, cfg.Overrides)
-	resolved, ok := table.Tools[toolName]
+	table := router.Resolve(entries, toolNameOf, toolRename, cfg.Overrides)
+	resolved, ok := table.Items[toolName]
 	if !ok {
 		return fmt.Errorf("unknown tool %q", toolName)
 	}

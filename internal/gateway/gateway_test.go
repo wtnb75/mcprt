@@ -54,7 +54,7 @@ func TestGateway_CallOnDeadBackendReturnsError(t *testing.T) {
 		t.Fatalf("list backend-dead tools: %v", err)
 	}
 
-	table := router.Resolve([]router.Entry{{BackendName: "backend-dead", Tools: tools}}, nil)
+	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-dead", Items: tools}}, toolNameOf, toolRename, nil)
 	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, table)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
@@ -104,14 +104,14 @@ func TestGateway_FallsBackWhenWinnerSchemaInvalid(t *testing.T) {
 	// Hand-build a table: the winner ("backend-a") has no InputSchema,
 	// which mcp.Server.AddTool panics on; the loser ("backend-b") is a
 	// valid fallback candidate for the same exposed name.
-	table := &router.Table{
-		Tools: map[string]*router.Resolved{
+	table := &router.Table[*mcp.Tool]{
+		Items: map[string]*router.Resolved[*mcp.Tool]{
 			"search": {
-				Tool:         &mcp.Tool{Name: "search"},
+				Item:         &mcp.Tool{Name: "search"},
 				BackendName:  "backend-a",
 				OriginalName: "search",
-				Fallbacks: []router.Candidate{{
-					Tool:         toolsB[0],
+				Fallbacks: []router.Candidate[*mcp.Tool]{{
+					Item:         toolsB[0],
 					BackendName:  "backend-b",
 					OriginalName: "search",
 				}},
@@ -173,10 +173,10 @@ func TestGateway_RoutesByPriorityAndExposesUniqueTools(t *testing.T) {
 		t.Fatalf("list backend-b tools: %v", err)
 	}
 
-	table := router.Resolve([]router.Entry{
-		{BackendName: "backend-a", Tools: toolsA},
-		{BackendName: "backend-b", Tools: toolsB},
-	}, nil)
+	table := router.Resolve([]router.Entry[*mcp.Tool]{
+		{BackendName: "backend-a", Items: toolsA},
+		{BackendName: "backend-b", Items: toolsB},
+	}, toolNameOf, toolRename, nil)
 
 	if len(table.Conflicts) != 1 || table.Conflicts[0].ExposedName != "search" || table.Conflicts[0].Winner != "backend-a" {
 		t.Fatalf("unexpected conflicts: %+v", table.Conflicts)
@@ -224,4 +224,12 @@ func TestGateway_RoutesByPriorityAndExposesUniqueTools(t *testing.T) {
 	if !ok || structured["source"] != "backend-b" {
 		t.Fatalf("unique_b result = %+v, want structured content with source=backend-b", res.StructuredContent)
 	}
+}
+
+func toolNameOf(t *mcp.Tool) string { return t.Name }
+
+func toolRename(t *mcp.Tool, name string) *mcp.Tool {
+	c := *t
+	c.Name = name
+	return &c
 }

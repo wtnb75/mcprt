@@ -18,34 +18,34 @@ import (
 // each tools/call to the backend that owns it. backends must contain an
 // entry for every BackendName referenced in table (the caller builds both
 // from the same set of connected backends).
-func New(logger *slog.Logger, backends map[string]*backend.Backend, table *router.Table) *mcp.Server {
+func New(logger *slog.Logger, backends map[string]*backend.Backend, table *router.Table[*mcp.Tool]) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{Logger: logger})
 
-	for _, resolved := range table.Tools {
+	for _, resolved := range table.Items {
 		registerTool(srv, logger, backends, resolved)
 	}
 
 	return srv
 }
 
-// registerTool registers resolved.Tool, falling back to the next
+// registerTool registers resolved.Item, falling back to the next
 // lower-priority backend's definition (if any) when one turns out to be
 // unregisterable, so a conflict's winner having a malformed schema doesn't
 // need to take a validly-defined loser down with it.
-func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved) {
-	candidates := append([]router.Candidate{{
-		Tool:         resolved.Tool,
+func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Tool]) {
+	candidates := append([]router.Candidate[*mcp.Tool]{{
+		Item:         resolved.Item,
 		BackendName:  resolved.BackendName,
 		OriginalName: resolved.OriginalName,
 	}}, resolved.Fallbacks...)
 
 	for _, c := range candidates {
 		b := backends[c.BackendName]
-		if addTool(srv, logger, c.Tool, callHandler(logger, b, c.OriginalName)) {
+		if addTool(srv, logger, c.Item, callHandler(logger, b, c.OriginalName)) {
 			return
 		}
 	}
-	logger.Error("tool unavailable: every candidate backend had an invalid definition", "tool", resolved.Tool.Name)
+	logger.Error("tool unavailable: every candidate backend had an invalid definition", "tool", resolved.Item.Name)
 }
 
 // callHandler forwards a tools/call to originalName on backend b, passing

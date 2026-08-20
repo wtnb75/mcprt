@@ -82,7 +82,7 @@ func runList(ctx context.Context, cmd *cobra.Command, configPath string, jsonOut
 		}
 	}()
 
-	table := router.Resolve(entries, cfg.Overrides)
+	table := router.Resolve(entries, toolNameOf, toolRename, cfg.Overrides)
 
 	if jsonOutput {
 		return printListJSON(cmd, listToolDetails(table), listConflicts(table))
@@ -93,9 +93,9 @@ func runList(ctx context.Context, cmd *cobra.Command, configPath string, jsonOut
 
 // listTable converts table into the sorted, text-friendly shapes printed by
 // `mcprt list`.
-func listTable(table *router.Table) ([]listEntry, []listConflict) {
-	entries := make([]listEntry, 0, len(table.Tools))
-	for name, resolved := range table.Tools {
+func listTable(table *router.Table[*mcp.Tool]) ([]listEntry, []listConflict) {
+	entries := make([]listEntry, 0, len(table.Items))
+	for name, resolved := range table.Items {
 		entries = append(entries, listEntry{Name: name, Backend: resolved.BackendName, OriginalName: resolved.OriginalName})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
@@ -105,16 +105,16 @@ func listTable(table *router.Table) ([]listEntry, []listConflict) {
 
 // listToolDetails converts table into the sorted, full-detail shape printed
 // by `mcprt list --json`.
-func listToolDetails(table *router.Table) []listToolDetail {
-	details := make([]listToolDetail, 0, len(table.Tools))
-	for _, resolved := range table.Tools {
-		details = append(details, listToolDetail{Backend: resolved.BackendName, OriginalName: resolved.OriginalName, Tool: resolved.Tool})
+func listToolDetails(table *router.Table[*mcp.Tool]) []listToolDetail {
+	details := make([]listToolDetail, 0, len(table.Items))
+	for _, resolved := range table.Items {
+		details = append(details, listToolDetail{Backend: resolved.BackendName, OriginalName: resolved.OriginalName, Tool: resolved.Item})
 	}
 	sort.Slice(details, func(i, j int) bool { return details[i].Tool.Name < details[j].Tool.Name })
 	return details
 }
 
-func listConflicts(table *router.Table) []listConflict {
+func listConflicts(table *router.Table[*mcp.Tool]) []listConflict {
 	conflicts := make([]listConflict, 0, len(table.Conflicts))
 	for _, c := range table.Conflicts {
 		conflicts = append(conflicts, listConflict{Name: c.ExposedName, Winner: c.Winner, Hidden: c.Losers})

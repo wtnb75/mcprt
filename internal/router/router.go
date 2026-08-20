@@ -1,82 +1,84 @@
 package router
 
-import "github.com/modelcontextprotocol/go-sdk/mcp"
-
-// Entry is one backend's tool list, tagged with the backend's exposed-name
-// prefix. entries passed to Resolve must be ordered by priority: index 0 is
-// the highest priority (wins ties absent an override).
-type Entry struct {
+// Entry is one backend's list of items (tools, resources, or resource
+// templates), tagged with the backend's exposed-name prefix. entries passed
+// to Resolve must be ordered by priority: index 0 is the highest priority
+// (wins ties absent an override).
+type Entry[T any] struct {
 	BackendName string
 	Prefix      string
-	Tools       []*mcp.Tool
+	Items       []T
 }
 
-// Resolved is a single tool exposed by the gateway, mapped back to the
-// backend and original (un-prefixed) tool name that serves it.
-type Resolved struct {
-	Tool         *mcp.Tool
+// Resolved is a single item exposed by the gateway, mapped back to the
+// backend and original (un-prefixed) name that serves it.
+type Resolved[T any] struct {
+	Item         T
 	BackendName  string
 	OriginalName string
 	// Fallbacks holds the other backends' definitions for this same exposed
 	// name (in priority order), for a caller that wants to try the next one
-	// if Tool turns out to be unregisterable (e.g. a malformed schema).
-	Fallbacks []Candidate
+	// if Item turns out to be unregisterable (e.g. a malformed schema or an
+	// invalid URI).
+	Fallbacks []Candidate[T]
 }
 
-// Candidate is one backend's tool definition that could serve a given
-// exposed name.
-type Candidate struct {
-	Tool         *mcp.Tool
+// Candidate is one backend's definition that could serve a given exposed
+// name.
+type Candidate[T any] struct {
+	Item         T
 	BackendName  string
 	OriginalName string
 }
 
-// Conflict records that multiple backends produced the same exposed tool
-// name, and which backend's tool won.
+// Conflict records that multiple backends produced the same exposed name,
+// and which backend's item won.
 type Conflict struct {
 	ExposedName string
 	Winner      string
 	Losers      []string
 }
 
-// Table is the fully resolved routing table: exposed tool name -> the
-// backend/tool that serves it, plus a record of any naming conflicts that
+// Table is the fully resolved routing table: exposed name -> the
+// backend/item that serves it, plus a record of any naming conflicts that
 // were resolved along the way.
-type Table struct {
-	Tools     map[string]*Resolved
+type Table[T any] struct {
+	Items     map[string]*Resolved[T]
 	Conflicts []Conflict
 }
 
-type candidate struct {
+type candidate[T any] struct {
 	backendName  string
 	originalName string
-	tool         *mcp.Tool
+	item         T
 }
 
-// Resolve merges the tool lists from entries into a single routing table.
-// overrides maps an exposed tool name to the backend name that must win
-// that name's conflict; an override that names a real backend which does
-// not produce a tool under that exposed name has no effect (resolution
-// falls back to list order).
-func Resolve(entries []Entry, overrides map[string]string) *Table {
-	candidatesByName := make(map[string][]candidate)
+// Resolve merges entries' item lists into a single routing table. nameOf
+// returns an item's own (un-prefixed) name; rename returns a copy of an
+// item with its name (or URI) set to the given exposed name. overrides maps
+// an exposed name to the backend name that must win that name's conflict;
+// an override that names a real backend which does not produce an item
+// under that exposed name has no effect (resolution falls back to list
+// order).
+func Resolve[T any](entries []Entry[T], nameOf func(T) string, rename func(T, string) T, overrides map[string]string) *Table[T] {
+	candidatesByName := make(map[string][]candidate[T])
 	var order []string // first-seen order, for deterministic conflict reporting
 
 	for _, e := range entries {
-		for _, t := range e.Tools {
-			exposedName := e.Prefix + t.Name
+		for _, item := range e.Items {
+			exposedName := e.Prefix + nameOf(item)
 			if _, seen := candidatesByName[exposedName]; !seen {
 				order = append(order, exposedName)
 			}
-			candidatesByName[exposedName] = append(candidatesByName[exposedName], candidate{
+			candidatesByName[exposedName] = append(candidatesByName[exposedName], candidate[T]{
 				backendName:  e.BackendName,
-				originalName: t.Name,
-				tool:         t,
+				originalName: nameOf(item),
+				item:         item,
 			})
 		}
 	}
 
-	table := &Table{Tools: make(map[string]*Resolved, len(order))}
+	table := &Table[T]{Items: make(map[string]*Resolved[T], len(order))}
 	for _, exposedName := range order {
 		cands := candidatesByName[exposedName]
 		winnerIdx := 0
@@ -89,8 +91,8 @@ func Resolve(entries []Entry, overrides map[string]string) *Table {
 			}
 		}
 		winner := cands[winnerIdx]
-		resolved := &Resolved{
-			Tool:         exposedTool(winner.tool, exposedName),
+		resolved := &Resolved[T]{
+			Item:         rename(winner.item, exposedName),
 			BackendName:  winner.backendName,
 			OriginalName: winner.originalName,
 		}
@@ -101,25 +103,15 @@ func Resolve(entries []Entry, overrides map[string]string) *Table {
 					continue
 				}
 				conflict.Losers = append(conflict.Losers, c.backendName)
-				resolved.Fallbacks = append(resolved.Fallbacks, Candidate{
-					Tool:         exposedTool(c.tool, exposedName),
+				resolved.Fallbacks = append(resolved.Fallbacks, Candidate[T]{
+					Item:         rename(c.item, exposedName),
 					BackendName:  c.backendName,
 					OriginalName: c.originalName,
 				})
 			}
 			table.Conflicts = append(table.Conflicts, conflict)
 		}
-		table.Tools[exposedName] = resolved
+		table.Items[exposedName] = resolved
 	}
 	return table
-}
-
-// exposedTool returns a copy of t with Name set to exposedName, so the
-// gateway can register it under its (possibly prefixed) public name while
-// keeping the rest of the backend's tool definition (description, schema)
-// intact.
-func exposedTool(t *mcp.Tool, exposedName string) *mcp.Tool {
-	clone := *t
-	clone.Name = exposedName
-	return &clone
 }
