@@ -1,0 +1,74 @@
+version: 2
+
+project_name: mcprt
+
+release:
+  github:
+    owner: wtnb75
+    name: mcprt
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: ./cmd/mcprt
+    binary: mcprt
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/wtnb75/mcprt/internal/cli.version={{ .Version }}
+      - -X github.com/wtnb75/mcprt/internal/cli.commit={{ .Commit }}
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ .Version }}-SNAPSHOT-{{ .ShortCommit }}"
+
+changelog:
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Others
+      order: 999
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+dockers_v2:
+  - images:
+      - ghcr.io/wtnb75/mcprt
+    tags:
+      - "{{ .Version }}"
+      - latest
+    dockerfile: Dockerfile
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      org.opencontainers.image.title: "{{ .ProjectName }}"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.source: "{{ .GitURL }}"
