@@ -15,6 +15,7 @@ func NewRootCmd() *cobra.Command {
 		Short: "mcprt aggregates multiple MCP servers behind a single gateway",
 	}
 	root.AddCommand(newServerCmd())
+	root.AddCommand(newValidateCmd())
 	return root
 }
 
