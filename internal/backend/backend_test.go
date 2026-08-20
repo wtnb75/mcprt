@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"sync/atomic"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -160,13 +162,20 @@ func unmarshalStructured(t *testing.T, res *mcp.CallToolResult, out any) {
 	}
 }
 
-func TestConnect_HTTPWithHeaders(t *testing.T) {
+// newFakeMCPHandler returns an HTTP handler serving a minimal MCP server
+// with a single no-op "ping" tool, for backend.Connect(transport: "http")
+// tests to dial.
+func newFakeMCPHandler() http.Handler {
 	fakeServer := mcp.NewServer(&mcp.Implementation{Name: "fake", Version: "v1"}, nil)
 	mcp.AddTool(fakeServer, &mcp.Tool{Name: "ping", Description: "ping"},
 		func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
 			return nil, struct{}{}, nil
 		})
-	mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return fakeServer }, nil)
+	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return fakeServer }, nil)
+}
+
+func TestConnect_HTTPWithHeaders(t *testing.T) {
+	mcpHandler := newFakeMCPHandler()
 
 	var gotAuth string
 	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -193,6 +202,66 @@ func TestConnect_HTTPWithHeaders(t *testing.T) {
 	}
 	if gotAuth != "Bearer test-token" {
 		t.Fatalf("Authorization header = %q, want %q", gotAuth, "Bearer test-token")
+	}
+}
+
+func TestConnect_HTTP_Proxy(t *testing.T) {
+	ctx := context.Background()
+	backendSrv := httptest.NewServer(newFakeMCPHandler())
+	defer backendSrv.Close()
+
+	// A forward-proxy request already arrives with an absolute-form URL, so
+	// a no-op Director is enough to turn ReverseProxy into a forward proxy;
+	// FlushInterval: -1 streams the response immediately instead of
+	// buffering, which the MCP client's long-lived SSE connection needs.
+	var proxied atomic.Bool
+	proxySrv := httptest.NewServer(&httputil.ReverseProxy{
+		Director:      func(r *http.Request) { proxied.Store(true) },
+		FlushInterval: -1,
+	})
+	defer proxySrv.Close()
+
+	b, err := backend.Connect(ctx, config.BackendConfig{
+		Name:      "proxied",
+		Transport: "http",
+		URL:       backendSrv.URL,
+		Proxy:     proxySrv.URL,
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	if _, err := b.ListTools(ctx); err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	if !proxied.Load() {
+		t.Fatal("request did not go through the configured proxy")
+	}
+}
+
+func TestConnect_HTTP_ProxyNone(t *testing.T) {
+	ctx := context.Background()
+	backendSrv := httptest.NewServer(newFakeMCPHandler())
+	defer backendSrv.Close()
+
+	// Nothing listens on this port. If proxy: "none" failed to override
+	// HTTP_PROXY, ListTools below would fail to connect.
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
+
+	b, err := backend.Connect(ctx, config.BackendConfig{
+		Name:      "direct",
+		Transport: "http",
+		URL:       backendSrv.URL,
+		Proxy:     "none",
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	if _, err := b.ListTools(ctx); err != nil {
+		t.Fatalf("ListTools: %v", err)
 	}
 }
 

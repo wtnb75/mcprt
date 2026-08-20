@@ -208,6 +208,44 @@ backends:
 	}
 }
 
+func TestParse_Proxy(t *testing.T) {
+	t.Setenv("TEST_PROXY_TOKEN", "secret")
+	data := []byte(`
+backends:
+  - name: proxied
+    transport: http
+    url: "http://localhost:9090/mcp"
+    proxy: "http://user:${TEST_PROXY_TOKEN}@proxy.example.com:8080"
+  - name: direct
+    transport: http
+    url: "http://localhost:9091/mcp"
+    proxy: "none"
+`)
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got, want := cfg.Backends[0].Proxy, "http://user:secret@proxy.example.com:8080"; got != want {
+		t.Fatalf("Backends[0].Proxy = %q, want %q (expanded)", got, want)
+	}
+	if got, want := cfg.Backends[1].Proxy, "none"; got != want {
+		t.Fatalf("Backends[1].Proxy = %q, want %q", got, want)
+	}
+}
+
+func TestParse_ProxyInvalidURL(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: http
+    url: "http://localhost:9090/mcp"
+    proxy: "://not-a-url"
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for invalid proxy url, got nil")
+	}
+}
+
 func TestParse_OverrideReferencesUnknownBackend(t *testing.T) {
 	data := []byte(`
 backends:

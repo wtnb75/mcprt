@@ -43,6 +43,12 @@ Minimal example:
         headers:
           Authorization: "Bearer ${GITHUB_TOKEN}"
         prefix: "gh__"
+        proxy: "http://user:${PROXY_TOKEN}@proxy.example.com:8080" # optional; fixed proxy for this backend only
+
+      - name: internal-api
+        transport: http
+        url: "http://internal.example.com/mcp"
+        proxy: "none" # bypass HTTP_PROXY/HTTPS_PROXY for this backend, even if set
 
     overrides:
       gh__search: github
@@ -51,6 +57,11 @@ When `ssh` is set on a stdio backend, mcprt runs `command` on the remote host
 by shelling out to the local `ssh` binary (so `~/.ssh/config`, `ssh-agent`,
 and `known_hosts` all apply as usual); `dir` and `env`/`env_file` are applied
 on the remote side, not the local one.
+
+For an http backend, `proxy` controls outbound proxying per backend: unset
+follows the usual `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment
+variables, a URL forces that fixed proxy, and `"none"` forces a direct
+connection regardless of those environment variables.
 
 v1 has no built-in gateway authentication, so keep `listen.http` bound to
 localhost or a trusted network and put a reverse proxy (or equivalent) in

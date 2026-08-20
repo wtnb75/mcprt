@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 
 	"github.com/joho/godotenv"
@@ -32,6 +33,7 @@ type BackendConfig struct {
 	SSH       *SSHConfig        `yaml:"ssh"` // if set, run the stdio Command on a remote host via ssh
 	URL       string            `yaml:"url"`
 	Headers   map[string]string `yaml:"headers"`
+	Proxy     string            `yaml:"proxy"` // proxy URL for http transport; "none" disables proxying even if HTTP_PROXY etc. are set; unset follows HTTP_PROXY/HTTPS_PROXY/NO_PROXY
 	Prefix    string            `yaml:"prefix"`
 }
 
@@ -98,6 +100,7 @@ func expandEnvRefs(cfg *Config) {
 		for k, v := range cfg.Backends[i].Headers {
 			cfg.Backends[i].Headers[k] = os.Expand(v, os.Getenv)
 		}
+		cfg.Backends[i].Proxy = os.Expand(cfg.Backends[i].Proxy, os.Getenv)
 	}
 }
 
@@ -118,6 +121,12 @@ func validate(cfg *Config) error {
 			}
 			if b.SSH.Host == "" {
 				return fmt.Errorf("backend %q: ssh requires host", b.Name)
+			}
+		}
+
+		if b.Proxy != "" && b.Proxy != "none" {
+			if _, err := url.Parse(b.Proxy); err != nil {
+				return fmt.Errorf("backend %q: invalid proxy url: %w", b.Name, err)
 			}
 		}
 

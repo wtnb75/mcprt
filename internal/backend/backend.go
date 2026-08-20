@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"sort"
@@ -40,9 +41,13 @@ func Connect(ctx context.Context, cfg config.BackendConfig) (*Backend, error) {
 		}
 		transport = &mcp.CommandTransport{Command: cmd}
 	case "http":
+		base, err := httpBaseTransport(cfg.Proxy)
+		if err != nil {
+			return nil, fmt.Errorf("backend %q: %w", cfg.Name, err)
+		}
 		transport = &mcp.StreamableClientTransport{
 			Endpoint:   cfg.URL,
-			HTTPClient: &http.Client{Transport: headerRoundTripper{headers: cfg.Headers, base: http.DefaultTransport}},
+			HTTPClient: &http.Client{Transport: headerRoundTripper{headers: cfg.Headers, base: base}},
 		}
 	default:
 		return nil, fmt.Errorf("backend %q: unknown transport %q", cfg.Name, cfg.Transport)
@@ -131,6 +136,31 @@ func remoteScript(cfg config.BackendConfig) string {
 // shell command, escaping any single quotes it contains.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// httpBaseTransport returns the RoundTripper an http backend's requests
+// should go through, according to proxy:
+//   - "" (unset): http.DefaultTransport, which follows HTTP_PROXY,
+//     HTTPS_PROXY and NO_PROXY as usual.
+//   - "none": a direct connection, ignoring those environment variables.
+//   - any other value: a fixed proxy URL.
+func httpBaseTransport(proxy string) (http.RoundTripper, error) {
+	switch proxy {
+	case "":
+		return http.DefaultTransport, nil
+	case "none":
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		t.Proxy = nil
+		return t, nil
+	default:
+		proxyURL, err := url.Parse(proxy)
+		if err != nil {
+			return nil, fmt.Errorf("invalid proxy url: %w", err)
+		}
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		t.Proxy = http.ProxyURL(proxyURL)
+		return t, nil
+	}
 }
 
 // headerRoundTripper injects fixed headers (e.g. an Authorization token)

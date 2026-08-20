@@ -62,6 +62,55 @@ func TestSSHCommand(t *testing.T) {
 	}
 }
 
+func TestHTTPBaseTransport_Default(t *testing.T) {
+	rt, err := httpBaseTransport("")
+	if err != nil {
+		t.Fatalf("httpBaseTransport: %v", err)
+	}
+	if rt != http.RoundTripper(http.DefaultTransport) {
+		t.Fatalf("httpBaseTransport(\"\") = %v, want http.DefaultTransport unchanged", rt)
+	}
+}
+
+func TestHTTPBaseTransport_None(t *testing.T) {
+	rt, err := httpBaseTransport("none")
+	if err != nil {
+		t.Fatalf("httpBaseTransport: %v", err)
+	}
+	tr, ok := rt.(*http.Transport)
+	if !ok || tr.Proxy != nil {
+		t.Fatalf("httpBaseTransport(\"none\") = %+v, want a *http.Transport with Proxy == nil", rt)
+	}
+}
+
+func TestHTTPBaseTransport_FixedURL(t *testing.T) {
+	rt, err := httpBaseTransport("http://proxy.example.com:8080")
+	if err != nil {
+		t.Fatalf("httpBaseTransport: %v", err)
+	}
+	tr, ok := rt.(*http.Transport)
+	if !ok || tr.Proxy == nil {
+		t.Fatalf("httpBaseTransport(url) = %+v, want a *http.Transport with a Proxy func set", rt)
+	}
+	req, err := http.NewRequest(http.MethodGet, "http://target.example.com/", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	got, err := tr.Proxy(req)
+	if err != nil {
+		t.Fatalf("Proxy(req): %v", err)
+	}
+	if got.String() != "http://proxy.example.com:8080" {
+		t.Fatalf("Proxy(req) = %q, want %q", got, "http://proxy.example.com:8080")
+	}
+}
+
+func TestHTTPBaseTransport_InvalidURL(t *testing.T) {
+	if _, err := httpBaseTransport("://not-a-url"); err == nil {
+		t.Fatal("httpBaseTransport: expected error for invalid proxy url, got nil")
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
