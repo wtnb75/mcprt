@@ -265,6 +265,41 @@ func TestConnect_HTTP_ProxyNone(t *testing.T) {
 	}
 }
 
+func TestListResourcesAndResourceTemplates(t *testing.T) {
+	fakeServer := mcp.NewServer(&mcp.Implementation{Name: "fake", Version: "v1"}, nil)
+	handler := func(context.Context, *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{Text: "stub"}}}, nil
+	}
+	fakeServer.AddResource(&mcp.Resource{URI: "file:///a", Name: "a"}, handler)
+	fakeServer.AddResourceTemplate(&mcp.ResourceTemplate{URITemplate: "file:///dir/{f}", Name: "dir"}, handler)
+
+	srv := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return fakeServer }, nil))
+	defer srv.Close()
+
+	ctx := context.Background()
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	resources, err := b.ListResources(ctx)
+	if err != nil {
+		t.Fatalf("ListResources: %v", err)
+	}
+	if len(resources) != 1 || resources[0].URI != "file:///a" {
+		t.Fatalf("ListResources = %+v, want one resource with URI file:///a", resources)
+	}
+
+	templates, err := b.ListResourceTemplates(ctx)
+	if err != nil {
+		t.Fatalf("ListResourceTemplates: %v", err)
+	}
+	if len(templates) != 1 || templates[0].URITemplate != "file:///dir/{f}" {
+		t.Fatalf("ListResourceTemplates = %+v, want one template file:///dir/{f}", templates)
+	}
+}
+
 func TestConnect_UnknownTransport(t *testing.T) {
 	_, err := backend.Connect(context.Background(), config.BackendConfig{Name: "bad", Transport: "carrier-pigeon"})
 	if err == nil {

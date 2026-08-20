@@ -73,6 +73,32 @@ func (b *Backend) ListTools(ctx context.Context) ([]*mcp.Tool, error) {
 	return tools, nil
 }
 
+// ListResources fetches the backend's full resource list, following
+// pagination.
+func (b *Backend) ListResources(ctx context.Context) ([]*mcp.Resource, error) {
+	var resources []*mcp.Resource
+	for r, err := range b.Session.Resources(ctx, nil) {
+		if err != nil {
+			return nil, fmt.Errorf("backend %q: list resources: %w", b.Name, err)
+		}
+		resources = append(resources, r)
+	}
+	return resources, nil
+}
+
+// ListResourceTemplates fetches the backend's full resource template list,
+// following pagination.
+func (b *Backend) ListResourceTemplates(ctx context.Context) ([]*mcp.ResourceTemplate, error) {
+	var templates []*mcp.ResourceTemplate
+	for t, err := range b.Session.ResourceTemplates(ctx, nil) {
+		if err != nil {
+			return nil, fmt.Errorf("backend %q: list resource templates: %w", b.Name, err)
+		}
+		templates = append(templates, t)
+	}
+	return templates, nil
+}
+
 // Close closes the connection to the backend.
 func (b *Backend) Close() error {
 	return b.Session.Close()
