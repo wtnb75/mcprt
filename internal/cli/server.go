@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -14,6 +15,11 @@ import (
 	"github.com/wtnb75/mcprt/internal/gateway"
 	"github.com/wtnb75/mcprt/internal/router"
 )
+
+// backendConnectTimeout bounds how long connectBackends waits on any single
+// backend's Connect+ListTools, so one hung backend can't stall the whole
+// gateway's startup (see connectBackends). A var so tests can shrink it.
+var backendConnectTimeout = 30 * time.Second
 
 func newServerCmd() *cobra.Command {
 	var configPath string
@@ -70,6 +76,12 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 		return errors.New("no listener configured: enable listen.stdio or set listen.http")
 	}
 
+	// A child context we can cancel ourselves: if one listener fails while
+	// another is still healthy, cancelling here tells the healthy one to
+	// shut down too instead of leaving runServer blocked waiting on it.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	backends, entries := connectBackends(ctx, logger, cfg.Backends)
 	defer func() {
 		for _, b := range backends {
@@ -98,7 +110,8 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	// Log each listener's outcome as it arrives, so a listener that fails
 	// while another is still healthy is reported immediately. A cancelled
 	// context is how a clean shutdown reaches ServeStdio, so it isn't a
-	// failure.
+	// failure. cancel() on a real failure stops the other listener too,
+	// instead of waiting on it indefinitely.
 	var firstErr error
 	for i := 0; i < running; i++ {
 		err := <-errCh
@@ -112,16 +125,18 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 		logger.Error("listener stopped with error", "error", err)
 		if firstErr == nil {
 			firstErr = err
+			cancel()
 		}
 	}
 	return firstErr
 }
 
 // connectBackends connects to every configured backend concurrently and
-// lists its tools. A backend that fails to connect or list tools is logged
-// and excluded (best-effort); it does not fail the whole startup. The
-// returned entries preserve configs' order, since router.Resolve treats
-// that order as priority (index 0 = highest).
+// lists its tools. A backend that fails to connect, list tools, or exceed
+// backendConnectTimeout is logged and excluded (best-effort); it does not
+// fail or stall the whole startup. The returned entries preserve configs'
+// order, since router.Resolve treats that order as priority (index 0 =
+// highest).
 func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.BackendConfig) (map[string]*backend.Backend, []router.Entry) {
 	type outcome struct {
 		backend *backend.Backend
@@ -134,6 +149,9 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 		wg.Add(1)
 		go func(i int, bc config.BackendConfig) {
 			defer wg.Done()
+			ctx, cancel := context.WithTimeout(ctx, backendConnectTimeout)
+			defer cancel()
+
 			b, err := backend.Connect(ctx, bc)
 			if err != nil {
 				logger.Error("skipping backend: connect failed", "backend", bc.Name, "error", err)

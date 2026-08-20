@@ -143,6 +143,46 @@ backends:
 	}
 }
 
+func TestParse_EnvFileNotDoubleExpanded(t *testing.T) {
+	// godotenv's own escape syntax: "\$HOME" in the file resolves to the
+	// literal string "$HOME" (not expanded within the file). That value
+	// must not then be expanded a second time against the host process's
+	// environment.
+	envFile := filepath.Join(t.TempDir(), ".env")
+	writeFile(t, envFile, `MSG=\$HOME`+"\n")
+	t.Setenv("HOME", "/should/not/leak")
+
+	data := []byte(fmt.Sprintf(`
+backends:
+  - name: filesystem
+    transport: stdio
+    command: ["a"]
+    env_file: %q
+`, envFile))
+
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got, want := cfg.Backends[0].Env["MSG"], "$HOME"; got != want {
+		t.Fatalf("Env[MSG] = %q, want %q (env_file value must not be re-expanded against the host env)", got, want)
+	}
+}
+
+func TestParse_EnvInvalidKey(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: stdio
+    command: ["a"]
+    env:
+      "FOO; rm -rf /": bar
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for invalid env key, got nil")
+	}
+}
+
 func TestParse_EnvFileMissing(t *testing.T) {
 	data := []byte(`
 backends:
@@ -191,6 +231,21 @@ backends:
 `)
 	if _, err := config.Parse(data); err == nil {
 		t.Fatal("Parse: expected error for ssh with no host, got nil")
+	}
+}
+
+func TestParse_SSHPortOutOfRange(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: stdio
+    command: ["a"]
+    ssh:
+      host: user@example.com
+      port: 70000
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for ssh port out of range, got nil")
 	}
 }
 

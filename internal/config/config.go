@@ -4,10 +4,17 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 
 	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v3"
 )
+
+// envKeyRE matches a POSIX portable environment variable name. Backend env
+// keys are interpolated unquoted into a shell "export NAME=..." statement
+// when run over ssh (see backend.remoteScript), so a key outside this set
+// could inject arbitrary shell syntax.
+var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // Config is the top-level gateway configuration, loaded from a YAML file.
 type Config struct {
@@ -55,17 +62,23 @@ func Load(path string) (*Config, error) {
 	return Parse(data)
 }
 
-// Parse parses YAML config data, expands ${VAR} references in backend env
-// and header values, and validates the result.
+// Parse parses YAML config data, expands ${VAR} references in backend env,
+// header and proxy values, merges in each backend's env_file, and validates
+// the result.
 func Parse(data []byte) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing yaml: %w", err)
 	}
+	// Expand ${VAR} refs in the config-declared env/headers/proxy first,
+	// then merge in env_file: an env_file's own ${VAR} refs are resolved by
+	// godotenv against other vars in that same file (see mergeEnvFiles), not
+	// against the host environment, so its values must not go through
+	// os.Expand afterward too.
+	expandEnvRefs(&cfg)
 	if err := mergeEnvFiles(&cfg); err != nil {
 		return nil, err
 	}
-	expandEnvRefs(&cfg)
 	if err := validate(&cfg); err != nil {
 		return nil, err
 	}
@@ -115,12 +128,21 @@ func validate(cfg *Config) error {
 		}
 		names[b.Name] = true
 
+		for k := range b.Env {
+			if !envKeyRE.MatchString(k) {
+				return fmt.Errorf("backend %q: invalid env key %q (must match %s)", b.Name, k, envKeyRE.String())
+			}
+		}
+
 		if b.SSH != nil {
 			if b.Transport != "stdio" {
 				return fmt.Errorf("backend %q: ssh is only valid for stdio transport", b.Name)
 			}
 			if b.SSH.Host == "" {
 				return fmt.Errorf("backend %q: ssh requires host", b.Name)
+			}
+			if b.SSH.Port < 0 || b.SSH.Port > 65535 {
+				return fmt.Errorf("backend %q: ssh port %d out of range", b.Name, b.SSH.Port)
 			}
 		}
 

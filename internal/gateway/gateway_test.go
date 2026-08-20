@@ -78,6 +78,69 @@ func TestGateway_CallOnDeadBackendReturnsError(t *testing.T) {
 	}
 }
 
+// TestGateway_FallsBackWhenWinnerSchemaInvalid checks that when the
+// conflict winner's tool definition is malformed (AddTool panics on it),
+// the gateway falls back to the next candidate rather than dropping the
+// tool entirely.
+func TestGateway_FallsBackWhenWinnerSchemaInvalid(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendBServer := newFakeBackendServer("backend-b", "search")
+	httpB := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendBServer }, nil))
+	defer httpB.Close()
+
+	ctx := context.Background()
+	connB, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-b", Transport: "http", URL: httpB.URL})
+	if err != nil {
+		t.Fatalf("connect backend-b: %v", err)
+	}
+	defer func() { _ = connB.Close() }()
+
+	toolsB, err := connB.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("list backend-b tools: %v", err)
+	}
+
+	// Hand-build a table: the winner ("backend-a") has no InputSchema,
+	// which mcp.Server.AddTool panics on; the loser ("backend-b") is a
+	// valid fallback candidate for the same exposed name.
+	table := &router.Table{
+		Tools: map[string]*router.Resolved{
+			"search": {
+				Tool:         &mcp.Tool{Name: "search"},
+				BackendName:  "backend-a",
+				OriginalName: "search",
+				Fallbacks: []router.Candidate{{
+					Tool:         toolsB[0],
+					BackendName:  "backend-b",
+					OriginalName: "search",
+				}},
+			},
+		},
+	}
+
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-b": connB}, table)
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "search", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatalf("call search: %v", err)
+	}
+	structured, ok := res.StructuredContent.(map[string]any)
+	if !ok || structured["source"] != "backend-b" {
+		t.Fatalf("search result = %+v, want structured content with source=backend-b (the fallback)", res.StructuredContent)
+	}
+}
+
 func TestGateway_RoutesByPriorityAndExposesUniqueTools(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 

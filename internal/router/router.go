@@ -17,6 +17,18 @@ type Resolved struct {
 	Tool         *mcp.Tool
 	BackendName  string
 	OriginalName string
+	// Fallbacks holds the other backends' definitions for this same exposed
+	// name (in priority order), for a caller that wants to try the next one
+	// if Tool turns out to be unregisterable (e.g. a malformed schema).
+	Fallbacks []Candidate
+}
+
+// Candidate is one backend's tool definition that could serve a given
+// exposed name.
+type Candidate struct {
+	Tool         *mcp.Tool
+	BackendName  string
+	OriginalName string
 }
 
 // Conflict records that multiple backends produced the same exposed tool
@@ -77,7 +89,7 @@ func Resolve(entries []Entry, overrides map[string]string) *Table {
 			}
 		}
 		winner := cands[winnerIdx]
-		table.Tools[exposedName] = &Resolved{
+		resolved := &Resolved{
 			Tool:         exposedTool(winner.tool, exposedName),
 			BackendName:  winner.backendName,
 			OriginalName: winner.originalName,
@@ -85,12 +97,19 @@ func Resolve(entries []Entry, overrides map[string]string) *Table {
 		if len(cands) > 1 {
 			conflict := Conflict{ExposedName: exposedName, Winner: winner.backendName}
 			for i, c := range cands {
-				if i != winnerIdx {
-					conflict.Losers = append(conflict.Losers, c.backendName)
+				if i == winnerIdx {
+					continue
 				}
+				conflict.Losers = append(conflict.Losers, c.backendName)
+				resolved.Fallbacks = append(resolved.Fallbacks, Candidate{
+					Tool:         exposedTool(c.tool, exposedName),
+					BackendName:  c.backendName,
+					OriginalName: c.originalName,
+				})
 			}
 			table.Conflicts = append(table.Conflicts, conflict)
 		}
+		table.Tools[exposedName] = resolved
 	}
 	return table
 }

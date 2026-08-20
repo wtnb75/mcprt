@@ -145,23 +145,33 @@ func shellQuote(s string) string {
 //   - "none": a direct connection, ignoring those environment variables.
 //   - any other value: a fixed proxy URL.
 func httpBaseTransport(proxy string) (http.RoundTripper, error) {
-	switch proxy {
-	case "":
+	if proxy == "" {
 		return http.DefaultTransport, nil
-	case "none":
-		t := http.DefaultTransport.(*http.Transport).Clone()
+	}
+
+	t := defaultTransportTemplate.Clone()
+	if proxy == "none" {
 		t.Proxy = nil
 		return t, nil
-	default:
-		proxyURL, err := url.Parse(proxy)
-		if err != nil {
-			return nil, fmt.Errorf("invalid proxy url: %w", err)
-		}
-		t := http.DefaultTransport.(*http.Transport).Clone()
-		t.Proxy = http.ProxyURL(proxyURL)
-		return t, nil
 	}
+	proxyURL, err := url.Parse(proxy)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy url: %w", err)
+	}
+	t.Proxy = http.ProxyURL(proxyURL)
+	return t, nil
 }
+
+// defaultTransportTemplate is the *http.Transport cloned as a base for a
+// backend-specific proxy setting. http.DefaultTransport is documented as an
+// *http.Transport, but its static type is only http.RoundTripper; fall back
+// to a plain zero-value Transport rather than panic if that ever changes.
+var defaultTransportTemplate = func() *http.Transport {
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		return t
+	}
+	return &http.Transport{}
+}()
 
 // headerRoundTripper injects fixed headers (e.g. an Authorization token)
 // into every outgoing request to a remote HTTP backend.

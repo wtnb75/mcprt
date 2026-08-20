@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -21,11 +22,30 @@ func New(logger *slog.Logger, backends map[string]*backend.Backend, table *route
 	srv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{Logger: logger})
 
 	for _, resolved := range table.Tools {
-		b := backends[resolved.BackendName]
-		addTool(srv, logger, resolved.Tool, callHandler(logger, b, resolved.OriginalName))
+		registerTool(srv, logger, backends, resolved)
 	}
 
 	return srv
+}
+
+// registerTool registers resolved.Tool, falling back to the next
+// lower-priority backend's definition (if any) when one turns out to be
+// unregisterable, so a conflict's winner having a malformed schema doesn't
+// need to take a validly-defined loser down with it.
+func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved) {
+	candidates := append([]router.Candidate{{
+		Tool:         resolved.Tool,
+		BackendName:  resolved.BackendName,
+		OriginalName: resolved.OriginalName,
+	}}, resolved.Fallbacks...)
+
+	for _, c := range candidates {
+		b := backends[c.BackendName]
+		if addTool(srv, logger, c.Tool, callHandler(logger, b, c.OriginalName)) {
+			return
+		}
+	}
+	logger.Error("tool unavailable: every candidate backend had an invalid definition", "tool", resolved.Tool.Name)
 }
 
 // callHandler forwards a tools/call to originalName on backend b, passing
@@ -46,14 +66,17 @@ func callHandler(logger *slog.Logger, b *backend.Backend, originalName string) m
 
 // addTool registers t on srv, recovering from AddTool's panic on a
 // malformed schema so that one broken backend tool definition can't take
-// down the whole gateway process at startup.
-func addTool(srv *mcp.Server, logger *slog.Logger, t *mcp.Tool, h mcp.ToolHandler) {
+// down the whole gateway process at startup. It reports whether t was
+// registered.
+func addTool(srv *mcp.Server, logger *slog.Logger, t *mcp.Tool, h mcp.ToolHandler) (ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Error("skipping tool: invalid definition", "tool", t.Name, "error", r)
+			logger.Error("invalid tool definition", "tool", t.Name, "error", r)
+			ok = false
 		}
 	}()
 	srv.AddTool(t, h)
+	return true
 }
 
 // ServeStdio runs srv over stdin/stdout until ctx is cancelled or the
@@ -61,6 +84,11 @@ func addTool(srv *mcp.Server, logger *slog.Logger, t *mcp.Tool, h mcp.ToolHandle
 func ServeStdio(ctx context.Context, srv *mcp.Server) error {
 	return srv.Run(ctx, &mcp.StdioTransport{})
 }
+
+// shutdownTimeout bounds ServeHTTP's graceful shutdown: MCP Streamable HTTP
+// clients hold a long-lived SSE stream open, so Shutdown would otherwise
+// wait forever for the connection to go idle. A var so tests can shrink it.
+var shutdownTimeout = 5 * time.Second
 
 // ServeHTTP runs srv as a Streamable HTTP server listening on addr, until
 // ctx is cancelled.
@@ -73,13 +101,11 @@ func ServeHTTP(ctx context.Context, srv *mcp.Server, addr string) error {
 
 	select {
 	case <-ctx.Done():
-		// Bound the graceful shutdown: MCP Streamable HTTP clients hold a
-		// long-lived SSE stream open, so Shutdown would otherwise wait
-		// forever for the connection to go idle.
-		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := httpServer.Shutdown(sctx); err != nil {
-			return httpServer.Close()
+			_ = httpServer.Close() // force-close whatever Shutdown couldn't drain in time
+			return fmt.Errorf("graceful shutdown timed out: %w", err)
 		}
 		return nil
 	case err := <-errCh:

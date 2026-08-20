@@ -146,6 +146,54 @@ func TestServerCommand_StdioShutdownIsClean(t *testing.T) {
 	}
 }
 
+// TestServerCommand_ListenerFailureCancelsOthers checks that when one
+// listener fails immediately (here, the HTTP listener can't bind its port),
+// runServer cancels the other listener instead of blocking on it forever.
+func TestServerCommand_ListenerFailureCancelsOthers(t *testing.T) {
+	// Swap stdin so ServeStdio blocks on a pipe nothing writes to, instead
+	// of the test process's real stdin. Must not run with t.Parallel().
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("creating stdin pipe: %v", err)
+	}
+	origStdin := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() {
+		os.Stdin = origStdin
+		_ = w.Close()
+		_ = r.Close()
+	})
+
+	// Occupy a port so listen.http fails to bind immediately.
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	defer func() { _ = occupied.Close() }()
+
+	configPath := writeConfig(t, fmt.Sprintf(`
+listen:
+  stdio: true
+  http: %q
+
+backends: []
+`, occupied.Addr().String()))
+
+	execErr := make(chan error, 1)
+	go func() {
+		execErr <- cli.Execute(context.Background(), []string{"server", "--config", configPath})
+	}()
+
+	select {
+	case err := <-execErr:
+		if err == nil {
+			t.Fatal("Execute: expected an error from the failed HTTP listener, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Execute did not return within 5s of the HTTP listener failing to bind; the stdio listener was not cancelled")
+	}
+}
+
 func TestServerCommand_NoListenerConfigured(t *testing.T) {
 	configPath := writeConfig(t, "backends: []\n")
 

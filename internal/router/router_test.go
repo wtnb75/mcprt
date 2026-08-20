@@ -42,6 +42,9 @@ func TestResolve_CollisionFirstListedWins(t *testing.T) {
 	if len(table.Conflicts) != 1 || table.Conflicts[0].Winner != "first" || len(table.Conflicts[0].Losers) != 1 || table.Conflicts[0].Losers[0] != "second" {
 		t.Fatalf("Conflicts = %+v, want one conflict won by \"first\", hiding \"second\"", table.Conflicts)
 	}
+	if len(got.Fallbacks) != 1 || got.Fallbacks[0].BackendName != "second" || got.Fallbacks[0].Tool.Name != "search" {
+		t.Fatalf("Tools[search].Fallbacks = %+v, want one fallback candidate from \"second\"", got.Fallbacks)
+	}
 }
 
 func TestResolve_OverrideWinsOverListOrder(t *testing.T) {
