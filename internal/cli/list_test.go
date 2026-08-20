@@ -74,9 +74,12 @@ backends:
 
 	var parsed struct {
 		Tools []struct {
-			Name         string `json:"name"`
 			Backend      string `json:"backend"`
 			OriginalName string `json:"original_name"`
+			Tool         struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+			} `json:"tool"`
 		} `json:"tools"`
 		Conflicts []struct {
 			Name   string   `json:"name"`
@@ -87,8 +90,11 @@ backends:
 	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
 		t.Fatalf("unmarshal JSON output: %v\noutput: %s", err, out.String())
 	}
-	if len(parsed.Tools) != 1 || parsed.Tools[0].Name != "search" || parsed.Tools[0].Backend != "backend-a" || parsed.Tools[0].OriginalName != "search" {
+	if len(parsed.Tools) != 1 || parsed.Tools[0].Tool.Name != "search" || parsed.Tools[0].Backend != "backend-a" || parsed.Tools[0].OriginalName != "search" {
 		t.Fatalf("Tools = %+v, want one entry {search, backend-a, search}", parsed.Tools)
+	}
+	if parsed.Tools[0].Tool.Description != "fake tool search" {
+		t.Fatalf("Tools[0].Tool.Description = %q, want %q", parsed.Tools[0].Tool.Description, "fake tool search")
 	}
 	if len(parsed.Conflicts) != 0 {
 		t.Fatalf("Conflicts = %+v, want none", parsed.Conflicts)

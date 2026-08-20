@@ -8,17 +8,27 @@ import (
 	"sort"
 	"text/tabwriter"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/spf13/cobra"
 
 	"github.com/wtnb75/mcprt/internal/config"
 	"github.com/wtnb75/mcprt/internal/router"
 )
 
-// listEntry is one resolved tool, in the shape printed by `mcprt list`.
+// listEntry is one resolved tool, in the shape printed by the text table.
 type listEntry struct {
 	Name         string `json:"name"`
 	Backend      string `json:"backend"`
 	OriginalName string `json:"original_name"`
+}
+
+// listToolDetail is one resolved tool with its full backend-reported
+// definition (description, input/output schema, annotations, ...), in the
+// shape printed by `mcprt list --json`.
+type listToolDetail struct {
+	Backend      string    `json:"backend"`
+	OriginalName string    `json:"original_name"`
+	Tool         *mcp.Tool `json:"tool"`
 }
 
 // listConflict is one exposed-name conflict, in the shape printed by
@@ -74,15 +84,15 @@ func runList(ctx context.Context, cmd *cobra.Command, configPath string, jsonOut
 
 	table := router.Resolve(entries, cfg.Overrides)
 
-	entriesOut, conflictsOut := listTable(table)
 	if jsonOutput {
-		return printListJSON(cmd, entriesOut, conflictsOut)
+		return printListJSON(cmd, listToolDetails(table), listConflicts(table))
 	}
+	entriesOut, conflictsOut := listTable(table)
 	return printListText(cmd, entriesOut, conflictsOut)
 }
 
-// listTable converts table into the sorted, JSON/text-friendly shapes
-// printed by `mcprt list`.
+// listTable converts table into the sorted, text-friendly shapes printed by
+// `mcprt list`.
 func listTable(table *router.Table) ([]listEntry, []listConflict) {
 	entries := make([]listEntry, 0, len(table.Tools))
 	for name, resolved := range table.Tools {
@@ -90,20 +100,34 @@ func listTable(table *router.Table) ([]listEntry, []listConflict) {
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 
+	return entries, listConflicts(table)
+}
+
+// listToolDetails converts table into the sorted, full-detail shape printed
+// by `mcprt list --json`.
+func listToolDetails(table *router.Table) []listToolDetail {
+	details := make([]listToolDetail, 0, len(table.Tools))
+	for _, resolved := range table.Tools {
+		details = append(details, listToolDetail{Backend: resolved.BackendName, OriginalName: resolved.OriginalName, Tool: resolved.Tool})
+	}
+	sort.Slice(details, func(i, j int) bool { return details[i].Tool.Name < details[j].Tool.Name })
+	return details
+}
+
+func listConflicts(table *router.Table) []listConflict {
 	conflicts := make([]listConflict, 0, len(table.Conflicts))
 	for _, c := range table.Conflicts {
 		conflicts = append(conflicts, listConflict{Name: c.ExposedName, Winner: c.Winner, Hidden: c.Losers})
 	}
 	sort.Slice(conflicts, func(i, j int) bool { return conflicts[i].Name < conflicts[j].Name })
-
-	return entries, conflicts
+	return conflicts
 }
 
-func printListJSON(cmd *cobra.Command, entries []listEntry, conflicts []listConflict) error {
+func printListJSON(cmd *cobra.Command, tools []listToolDetail, conflicts []listConflict) error {
 	out := struct {
-		Tools     []listEntry    `json:"tools"`
-		Conflicts []listConflict `json:"conflicts"`
-	}{Tools: entries, Conflicts: conflicts}
+		Tools     []listToolDetail `json:"tools"`
+		Conflicts []listConflict   `json:"conflicts"`
+	}{Tools: tools, Conflicts: conflicts}
 
 	enc := json.NewEncoder(cmd.OutOrStdout())
 	enc.SetIndent("", "  ")
