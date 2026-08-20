@@ -2,8 +2,12 @@ package backend_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
+	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -28,8 +32,57 @@ func TestConnect_Stdio(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
-	if len(tools) != 1 || tools[0].Name != "echo" {
-		t.Fatalf("ListTools = %v, want a single tool named \"echo\"", tools)
+	var names []string
+	for _, tool := range tools {
+		names = append(names, tool.Name)
+	}
+	if len(tools) != 2 || !slices.Contains(names, "echo") || !slices.Contains(names, "cwd") {
+		t.Fatalf("ListTools = %v, want tools named \"echo\" and \"cwd\"", names)
+	}
+}
+
+func TestConnect_Stdio_Dir(t *testing.T) {
+	ctx := context.Background()
+	wantDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+
+	// Build the echoserver into a plain binary first: with cmd.Dir pointing
+	// outside the module, "go run" can't resolve go.mod for the package.
+	binPath := filepath.Join(t.TempDir(), "echoserver")
+	build := exec.Command("go", "build", "-o", binPath, "./testdata/echoserver")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("go build echoserver: %v\n%s", err, out)
+	}
+
+	b, err := backend.Connect(ctx, config.BackendConfig{
+		Name:      "echo",
+		Transport: "stdio",
+		Command:   []string{binPath},
+		Dir:       wantDir,
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	res, err := b.Session.CallTool(ctx, &mcp.CallToolParams{Name: "cwd"})
+	if err != nil {
+		t.Fatalf("CallTool(cwd): %v", err)
+	}
+	raw, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var out struct {
+		Dir string `json:"dir"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if out.Dir != wantDir {
+		t.Fatalf("cwd = %q, want %q", out.Dir, wantDir)
 	}
 }
 

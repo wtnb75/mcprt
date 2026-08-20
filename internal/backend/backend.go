@@ -28,6 +28,7 @@ func Connect(ctx context.Context, cfg config.BackendConfig) (*Backend, error) {
 	switch cfg.Transport {
 	case "stdio":
 		cmd := exec.Command(cfg.Command[0], cfg.Command[1:]...)
+		cmd.Dir = cfg.Dir
 		cmd.Env = envWithOverrides(cfg.Env)
 		transport = &mcp.CommandTransport{Command: cmd}
 	case "http":

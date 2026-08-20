@@ -22,6 +22,8 @@ Minimal example:
       - name: filesystem
         transport: stdio
         command: ["mcp-server-filesystem", "--root", "/data"]
+        dir: "/data"
+        env_file: ".env"   # .env-format file, merged into env (env: takes precedence on conflicts)
 
       - name: github
         transport: http

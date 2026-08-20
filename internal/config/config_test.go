@@ -1,10 +1,20 @@
 package config_test
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/wtnb75/mcprt/internal/config"
 )
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q): %v", path, err)
+	}
+}
 
 func TestParse_ValidConfig(t *testing.T) {
 	data := []byte(`
@@ -16,6 +26,7 @@ backends:
   - name: filesystem
     transport: stdio
     command: ["mcp-server-filesystem", "--root", "/data"]
+    dir: /data
     env:
       FOO: bar
   - name: github
@@ -42,7 +53,7 @@ overrides:
 		t.Fatalf("len(Backends) = %d, want 2", len(cfg.Backends))
 	}
 	fs := cfg.Backends[0]
-	if fs.Name != "filesystem" || fs.Transport != "stdio" || len(fs.Command) != 3 || fs.Env["FOO"] != "bar" {
+	if fs.Name != "filesystem" || fs.Transport != "stdio" || len(fs.Command) != 3 || fs.Dir != "/data" || fs.Env["FOO"] != "bar" {
 		t.Fatalf("Backends[0] = %+v, unexpected", fs)
 	}
 	gh := cfg.Backends[1]
@@ -99,6 +110,49 @@ backends:
 `)
 	if _, err := config.Parse(data); err == nil {
 		t.Fatal("Parse: expected error for http backend with no url, got nil")
+	}
+}
+
+func TestParse_EnvFile(t *testing.T) {
+	// BAR references FOO within the file itself: godotenv expands ${VAR}
+	// refs against vars already parsed from the same file, not the host
+	// process environment.
+	envFile := filepath.Join(t.TempDir(), ".env")
+	writeFile(t, envFile, "FOO=from-file\nBAR=${FOO}\n")
+
+	data := []byte(fmt.Sprintf(`
+backends:
+  - name: filesystem
+    transport: stdio
+    command: ["a"]
+    env_file: %q
+    env:
+      FOO: from-config
+`, envFile))
+
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	env := cfg.Backends[0].Env
+	if env["FOO"] != "from-config" {
+		t.Fatalf("Env[FOO] = %q, want %q (explicit env: should win over env_file)", env["FOO"], "from-config")
+	}
+	if env["BAR"] != "from-file" {
+		t.Fatalf("Env[BAR] = %q, want %q (env_file's own ${VAR} refs resolve within the file)", env["BAR"], "from-file")
+	}
+}
+
+func TestParse_EnvFileMissing(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: stdio
+    command: ["a"]
+    env_file: /nonexistent/does-not-exist.env
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for missing env_file, got nil")
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v3"
 )
 
@@ -25,6 +26,8 @@ type BackendConfig struct {
 	Name      string            `yaml:"name"`
 	Transport string            `yaml:"transport"` // "stdio" or "http"
 	Command   []string          `yaml:"command"`
+	Dir       string            `yaml:"dir"`      // working directory for the stdio subprocess
+	EnvFile   string            `yaml:"env_file"` // .env-format file merged under Env
 	Env       map[string]string `yaml:"env"`
 	URL       string            `yaml:"url"`
 	Headers   map[string]string `yaml:"headers"`
@@ -47,11 +50,34 @@ func Parse(data []byte) (*Config, error) {
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing yaml: %w", err)
 	}
+	if err := mergeEnvFiles(&cfg); err != nil {
+		return nil, err
+	}
 	expandEnvRefs(&cfg)
 	if err := validate(&cfg); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// mergeEnvFiles reads each backend's EnvFile (if set) and merges it into
+// Env, with existing Env entries taking precedence over the file.
+func mergeEnvFiles(cfg *Config) error {
+	for i := range cfg.Backends {
+		b := &cfg.Backends[i]
+		if b.EnvFile == "" {
+			continue
+		}
+		fileEnv, err := godotenv.Read(b.EnvFile)
+		if err != nil {
+			return fmt.Errorf("backend %q: env_file: %w", b.Name, err)
+		}
+		for k, v := range b.Env {
+			fileEnv[k] = v
+		}
+		b.Env = fileEnv
+	}
+	return nil
 }
 
 func expandEnvRefs(cfg *Config) {
