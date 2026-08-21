@@ -2,13 +2,16 @@
 package gateway_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -55,7 +58,7 @@ func TestGateway_CallOnDeadBackendReturnsError(t *testing.T) {
 	}
 
 	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-dead", Items: tools}}, toolNameOf, toolRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, gateway.Tables{Tools: table})
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, gateway.Tables{Tools: table}, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 	defer gw.Close()
@@ -119,7 +122,7 @@ func TestGateway_FallsBackWhenWinnerSchemaInvalid(t *testing.T) {
 		},
 	}
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-b": connB}, gateway.Tables{Tools: table})
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-b": connB}, gateway.Tables{Tools: table}, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 	defer gw.Close()
@@ -182,7 +185,7 @@ func TestGateway_RoutesByPriorityAndExposesUniqueTools(t *testing.T) {
 		t.Fatalf("unexpected conflicts: %+v", table.Conflicts)
 	}
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA, "backend-b": connB}, gateway.Tables{Tools: table})
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA, "backend-b": connB}, gateway.Tables{Tools: table}, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 	defer gw.Close()
@@ -304,7 +307,7 @@ func TestGateway_ResourceReadExact(t *testing.T) {
 		{BackendName: "backend-a", Items: resources},
 	}, resourceNameOf, resourceRename, nil)
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Resources: table})
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Resources: table}, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 	defer gw.Close()
@@ -357,7 +360,7 @@ func TestGateway_ResourceTemplateReadForwardsActualURI(t *testing.T) {
 		{BackendName: "backend-a", Items: templates},
 	}, templateNameOf, templateRename, nil)
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{ResourceTemplates: table})
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{ResourceTemplates: table}, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 	defer gw.Close()
@@ -419,7 +422,7 @@ func TestGateway_ResourceFallsBackWhenWinnerURIInvalid(t *testing.T) {
 		},
 	}
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-b": connB}, gateway.Tables{Resources: table})
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-b": connB}, gateway.Tables{Resources: table}, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 	defer gw.Close()
@@ -469,7 +472,7 @@ func TestGateway_PromptGetForwardsArgumentsAndResult(t *testing.T) {
 	}
 
 	table := router.Resolve([]router.Entry[*mcp.Prompt]{{BackendName: "backend", Items: prompts}}, promptNameOf, promptRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend": conn}, gateway.Tables{Prompts: table})
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend": conn}, gateway.Tables{Prompts: table}, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 	defer gw.Close()
@@ -538,7 +541,7 @@ func TestGateway_PromptRoutesByPriorityAndExposesUniquePrompts(t *testing.T) {
 		t.Fatalf("unexpected conflicts: %+v", table.Conflicts)
 	}
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA, "backend-b": connB}, gateway.Tables{Prompts: table})
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA, "backend-b": connB}, gateway.Tables{Prompts: table}, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 	defer gw.Close()
@@ -604,7 +607,7 @@ func TestGateway_PromptGetOnDeadBackendReturnsError(t *testing.T) {
 	}
 
 	table := router.Resolve([]router.Entry[*mcp.Prompt]{{BackendName: "backend-dead", Items: prompts}}, promptNameOf, promptRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, gateway.Tables{Prompts: table})
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, gateway.Tables{Prompts: table}, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 	defer gw.Close()
@@ -624,4 +627,132 @@ func TestGateway_PromptGetOnDeadBackendReturnsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("GetPrompt(boom) on dead backend: got no error, want one")
 	}
+}
+
+// TestGateway_CallLogsSuccessWithMaskedArguments checks the core behavior
+// change: a successful tool call now logs one Info line (previously none),
+// carrying caller identity and masked arguments.
+func TestGateway_CallLogsSuccessWithMaskedArguments(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	backendServer := newFakeBackendServer("backend-a", "secure")
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpA.Close()
+
+	ctx := context.Background()
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = connA.Close() }()
+
+	toolsA, err := connA.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a tools: %v", err)
+	}
+	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-a", Items: toolsA}}, toolNameOf, toolRename, nil)
+
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Tools: table}, []string{"secret_value"})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	_, err = session.CallTool(ctx, &mcp.CallToolParams{Name: "secure", Arguments: map[string]any{"user": "alice", "secret_value": "hunter2"}})
+	if err != nil {
+		t.Fatalf("call secure: %v", err)
+	}
+
+	rec := findLogLine(t, buf.String(), "tool call")
+	if rec["backend"] != "backend-a" || rec["tool"] != "secure" {
+		t.Fatalf("backend/tool = %v/%v, want backend-a/secure", rec["backend"], rec["tool"])
+	}
+	if rec["session_id"] == "" || rec["session_id"] == nil {
+		t.Fatalf("session_id = %v, want non-empty", rec["session_id"])
+	}
+	if rec["client_name"] != "test-client" || rec["client_version"] != "v1" {
+		t.Fatalf("client_name/client_version = %v/%v, want test-client/v1", rec["client_name"], rec["client_version"])
+	}
+	args, ok := rec["arguments"].(map[string]any)
+	if !ok {
+		t.Fatalf("arguments = %v, want a map", rec["arguments"])
+	}
+	if args["user"] != "alice" {
+		t.Fatalf("arguments.user = %v, want alice (unmasked)", args["user"])
+	}
+	if args["secret_value"] != "***" {
+		t.Fatalf("arguments.secret_value = %v, want *** (masked via config-supplied maskKeys)", args["secret_value"])
+	}
+}
+
+// TestGateway_CallLogsFailure checks that a failed tool call logs one Error
+// line with the failure reason, alongside the same caller-identity fields
+// the success path carries.
+func TestGateway_CallLogsFailure(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	backendServer := newFakeBackendServer("backend-dead", "boom")
+	httpBackend := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpBackend.Close()
+
+	ctx := context.Background()
+	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-dead", Transport: "http", URL: httpBackend.URL})
+	if err != nil {
+		t.Fatalf("connect backend-dead: %v", err)
+	}
+	tools, err := conn.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("list backend-dead tools: %v", err)
+	}
+	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-dead", Items: tools}}, toolNameOf, toolRename, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, gateway.Tables{Tools: table}, nil)
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close backend-dead: %v", err)
+	}
+
+	_, _ = session.CallTool(ctx, &mcp.CallToolParams{Name: "boom", Arguments: map[string]any{}})
+
+	rec := findLogLine(t, buf.String(), "tool call failed")
+	if rec["level"] != "ERROR" {
+		t.Fatalf("level = %v, want ERROR", rec["level"])
+	}
+	if rec["error"] == "" || rec["error"] == nil {
+		t.Fatalf("error field = %v, want non-empty", rec["error"])
+	}
+}
+
+// findLogLine returns the first JSON log line in out whose "msg" equals
+// wantMsg, failing the test if none matches.
+func findLogLine(t *testing.T, out, wantMsg string) map[string]any {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err == nil && rec["msg"] == wantMsg {
+			return rec
+		}
+	}
+	t.Fatalf("log output = %q, want a line with msg=%q", out, wantMsg)
+	return nil
 }

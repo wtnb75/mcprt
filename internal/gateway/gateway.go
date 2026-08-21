@@ -28,27 +28,27 @@ type Tables struct {
 // tools/resources/prompts, forwarding each call to the backend that owns
 // it. backends must contain an entry for every BackendName referenced in
 // tables (the caller builds both from the same set of connected backends).
-func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Tables) *mcp.Server {
+func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Tables, maskKeys []string) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{Logger: logger})
 
 	if tables.Tools != nil {
 		for _, resolved := range tables.Tools.Items {
-			registerTool(srv, logger, backends, resolved)
+			registerTool(srv, logger, backends, resolved, maskKeys)
 		}
 	}
 	if tables.Resources != nil {
 		for _, resolved := range tables.Resources.Items {
-			registerResource(srv, logger, backends, resolved)
+			registerResource(srv, logger, backends, resolved, maskKeys)
 		}
 	}
 	if tables.ResourceTemplates != nil {
 		for _, resolved := range tables.ResourceTemplates.Items {
-			registerResourceTemplate(srv, logger, backends, resolved)
+			registerResourceTemplate(srv, logger, backends, resolved, maskKeys)
 		}
 	}
 	if tables.Prompts != nil {
 		for _, resolved := range tables.Prompts.Items {
-			registerPrompt(srv, logger, backends, resolved)
+			registerPrompt(srv, logger, backends, resolved, maskKeys)
 		}
 	}
 
@@ -59,7 +59,7 @@ func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Table
 // lower-priority backend's definition (if any) when one turns out to be
 // unregisterable, so a conflict's winner having a malformed schema doesn't
 // need to take a validly-defined loser down with it.
-func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Tool]) {
+func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Tool], maskKeys []string) {
 	candidates := append([]router.Candidate[*mcp.Tool]{{
 		Item:         resolved.Item,
 		BackendName:  resolved.BackendName,
@@ -68,7 +68,7 @@ func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*bac
 
 	for _, c := range candidates {
 		b := backends[c.BackendName]
-		if addTool(srv, logger, c.Item, callHandler(logger, b, c.OriginalName)) {
+		if addTool(srv, logger, c.Item, callHandler(logger, maskKeys, b, c.OriginalName)) {
 			return
 		}
 	}
@@ -79,7 +79,7 @@ func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*bac
 // lower-priority backend's definition (if any) when one turns out to have
 // an invalid URI, so a conflict's winner having a malformed URI doesn't
 // need to take a validly-defined loser down with it.
-func registerResource(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Resource]) {
+func registerResource(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Resource], maskKeys []string) {
 	candidates := append([]router.Candidate[*mcp.Resource]{{
 		Item:         resolved.Item,
 		BackendName:  resolved.BackendName,
@@ -88,7 +88,7 @@ func registerResource(srv *mcp.Server, logger *slog.Logger, backends map[string]
 
 	for _, c := range candidates {
 		b := backends[c.BackendName]
-		if addResource(srv, logger, c.Item, resourceReadHandler(logger, b, c.OriginalName)) {
+		if addResource(srv, logger, c.Item, resourceReadHandler(logger, maskKeys, b, c.OriginalName)) {
 			return
 		}
 	}
@@ -99,12 +99,11 @@ func registerResource(srv *mcp.Server, logger *slog.Logger, backends map[string]
 // originalURI is the fixed URI this exact resource was registered under:
 // prefix is never applied to resource URIs, so it equals the exposed URI,
 // and every call for this resource reads the same URI.
-func resourceReadHandler(logger *slog.Logger, b *backend.Backend, originalURI string) mcp.ResourceHandler {
+func resourceReadHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, originalURI string) mcp.ResourceHandler {
 	return func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		start := time.Now()
 		result, err := b.Session.ReadResource(ctx, &mcp.ReadResourceParams{URI: originalURI})
-		if err != nil {
-			logger.Error("backend call failed", "backend", b.Name, "uri", originalURI, "error", err)
-		}
+		logCall(ctx, logger, "resource", "uri", originalURI, b.Name, req.Session, nil, maskKeys, start, err)
 		return result, err
 	}
 }
@@ -127,7 +126,7 @@ func addResource(srv *mcp.Server, logger *slog.Logger, r *mcp.Resource, h mcp.Re
 // registerResourceTemplate is registerResource's counterpart for resource
 // templates: same panic-recovery/fallback structure, but its read handler
 // forwards the caller's actual matched URI instead of a fixed one.
-func registerResourceTemplate(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.ResourceTemplate]) {
+func registerResourceTemplate(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.ResourceTemplate], maskKeys []string) {
 	candidates := append([]router.Candidate[*mcp.ResourceTemplate]{{
 		Item:         resolved.Item,
 		BackendName:  resolved.BackendName,
@@ -136,7 +135,7 @@ func registerResourceTemplate(srv *mcp.Server, logger *slog.Logger, backends map
 
 	for _, c := range candidates {
 		b := backends[c.BackendName]
-		if addResourceTemplate(srv, logger, c.Item, resourceTemplateReadHandler(logger, b)) {
+		if addResourceTemplate(srv, logger, c.Item, resourceTemplateReadHandler(logger, maskKeys, b)) {
 			return
 		}
 	}
@@ -148,12 +147,11 @@ func registerResourceTemplate(srv *mcp.Server, logger *slog.Logger, backends map
 // template) on backend b -- unlike an exact resource, a template serves a
 // different URI on every call, so the fixed-URI approach resourceReadHandler
 // uses doesn't apply here.
-func resourceTemplateReadHandler(logger *slog.Logger, b *backend.Backend) mcp.ResourceHandler {
+func resourceTemplateReadHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend) mcp.ResourceHandler {
 	return func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		start := time.Now()
 		result, err := b.Session.ReadResource(ctx, &mcp.ReadResourceParams{URI: req.Params.URI})
-		if err != nil {
-			logger.Error("backend call failed", "backend", b.Name, "uri", req.Params.URI, "error", err)
-		}
+		logCall(ctx, logger, "resource template", "uri", req.Params.URI, b.Name, req.Session, nil, maskKeys, start, err)
 		return result, err
 	}
 }
@@ -177,38 +175,37 @@ func addResourceTemplate(srv *mcp.Server, logger *slog.Logger, t *mcp.ResourceTe
 // mcp.Server.AddPrompt performs no schema validation and cannot panic (a
 // Prompt has no JSON-Schema-bearing field for it to reject), so the winner
 // is always registerable.
-func registerPrompt(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Prompt]) {
+func registerPrompt(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Prompt], maskKeys []string) {
 	b := backends[resolved.BackendName]
-	srv.AddPrompt(resolved.Item, promptGetHandler(logger, b, resolved.OriginalName))
+	srv.AddPrompt(resolved.Item, promptGetHandler(logger, maskKeys, b, resolved.OriginalName))
 }
 
 // promptGetHandler forwards prompts/get to originalName on backend b,
 // passing the caller's arguments through unchanged.
-func promptGetHandler(logger *slog.Logger, b *backend.Backend, originalName string) mcp.PromptHandler {
+func promptGetHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, originalName string) mcp.PromptHandler {
 	return func(ctx context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+		start := time.Now()
 		result, err := b.Session.GetPrompt(ctx, &mcp.GetPromptParams{
 			Name:      originalName,
 			Arguments: req.Params.Arguments,
 		})
-		if err != nil {
-			logger.Error("backend call failed", "backend", b.Name, "prompt", originalName, "error", err)
-		}
+		logCall(ctx, logger, "prompt", "prompt", originalName, b.Name, req.Session, req.Params.Arguments, maskKeys, start, err)
 		return result, err
 	}
 }
 
 // callHandler forwards a tools/call to originalName on backend b, passing
-// the raw arguments through unchanged. A failure is returned to the client
-// and logged, so a dead or erroring backend is visible to the operator.
-func callHandler(logger *slog.Logger, b *backend.Backend, originalName string) mcp.ToolHandler {
+// the raw arguments through unchanged. Every call is logged via logCall,
+// success or failure, so a dead or erroring backend — and normal usage — is
+// visible to the operator.
+func callHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, originalName string) mcp.ToolHandler {
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		start := time.Now()
 		result, err := b.Session.CallTool(ctx, &mcp.CallToolParams{
 			Name:      originalName,
 			Arguments: req.Params.Arguments,
 		})
-		if err != nil {
-			logger.Error("backend call failed", "backend", b.Name, "tool", originalName, "error", err)
-		}
+		logCall(ctx, logger, "tool", "tool", originalName, b.Name, req.Session, req.Params.Arguments, maskKeys, start, err)
 		return result, err
 	}
 }

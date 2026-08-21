@@ -117,7 +117,7 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 		Resources:         resourceTable,
 		ResourceTemplates: resourceTemplateTable,
 		Prompts:           promptTable,
-	})
+	}, cfg.Logging.MaskKeys)
 
 	running := 0
 	errCh := make(chan error, 2)
