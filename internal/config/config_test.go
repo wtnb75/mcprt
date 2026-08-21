@@ -263,6 +263,92 @@ backends:
 	}
 }
 
+func TestParse_Docker(t *testing.T) {
+	t.Setenv("TEST_DOCKER_HOST", "ssh://user@example.com")
+	data := []byte(`
+backends:
+  - name: containerized
+    transport: stdio
+    command: ["mcp-server-filesystem"]
+    docker:
+      bin: podman
+      image: your/mcp-image
+      args: ["-v", "/data:/data"]
+      env:
+        DOCKER_HOST: "${TEST_DOCKER_HOST}"
+`)
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	d := cfg.Backends[0].Docker
+	if d == nil {
+		t.Fatal("Backends[0].Docker = nil, want non-nil")
+	}
+	if d.Bin != "podman" || d.Image != "your/mcp-image" || len(d.Args) != 2 || d.Env["DOCKER_HOST"] != "ssh://user@example.com" {
+		t.Fatalf("Backends[0].Docker = %+v, unexpected", d)
+	}
+}
+
+func TestParse_DockerMissingImage(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: stdio
+    command: ["a"]
+    docker: {}
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for docker with no image, got nil")
+	}
+}
+
+func TestParse_DockerRequiresStdioTransport(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: http
+    url: "http://localhost:9090/mcp"
+    docker:
+      image: your/mcp-image
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for docker on a non-stdio transport, got nil")
+	}
+}
+
+func TestParse_DockerAndSSHMutuallyExclusive(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: stdio
+    command: ["a"]
+    ssh:
+      host: user@example.com
+    docker:
+      image: your/mcp-image
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for ssh and docker both set, got nil")
+	}
+}
+
+func TestParse_DockerEnvInvalidKey(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: stdio
+    command: ["a"]
+    docker:
+      image: your/mcp-image
+      env:
+        "not valid": x
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for invalid docker env key, got nil")
+	}
+}
+
 func TestParse_Proxy(t *testing.T) {
 	t.Setenv("TEST_PROXY_TOKEN", "secret")
 	data := []byte(`

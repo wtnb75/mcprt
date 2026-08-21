@@ -38,6 +38,16 @@ Minimal example:
           identity_file: "/home/me/.ssh/id_ed25519" # optional, passed as -i
           args: ["-o", "StrictHostKeyChecking=no"]  # optional, appended to the ssh invocation
 
+      - name: containerized
+        transport: stdio
+        command: ["mcp-server-filesystem", "--root", "/data"]
+        docker:
+          bin: podman            # docker-compatible CLI to invoke; defaults to "docker" ("podman", "nerdctl", ...)
+          image: "your/mcp-image"
+          args: ["-v", "/data:/data"]  # extra arguments appended to "run"
+          env:
+            DOCKER_HOST: "ssh://user@example.com" # env for the CLI process itself, not the container
+
       - name: github
         transport: http
         url: "http://localhost:9090/mcp"
@@ -81,6 +91,16 @@ When `ssh` is set on a stdio backend, mcprt runs `command` on the remote host
 by shelling out to the local `ssh` binary (so `~/.ssh/config`, `ssh-agent`,
 and `known_hosts` all apply as usual); `dir` and `env`/`env_file` are applied
 on the remote side, not the local one.
+
+When `docker` is set on a stdio backend, mcprt runs `command` inside a
+container by shelling out to `docker.bin` (default `"docker"`; set it to
+`"podman"`, `"nerdctl"`, etc. for another docker-compatible CLI) as
+`<bin> run -i --rm ... <image> <command>`. `dir` and `env`/`env_file` are
+applied inside the container (as `-w` and `-e`), same as the plain local
+case; `docker.env` is separate and applies to the local CLI process itself
+(e.g. `DOCKER_HOST` to point it at a remote daemon), not the container.
+`docker.args` is appended to `run` verbatim for anything else (volumes,
+networks, resource limits, ...). `ssh` and `docker` are mutually exclusive.
 
 For an http backend, `proxy` controls outbound proxying per backend: unset
 follows the usual `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment

@@ -11,10 +11,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// envKeyRE matches a POSIX portable environment variable name. Backend env
-// keys are interpolated unquoted into a shell "export NAME=..." statement
-// when run over ssh (see backend.remoteScript), so a key outside this set
-// could inject arbitrary shell syntax.
+// envKeyRE matches a POSIX portable environment variable name, used to
+// validate backends[].env and backends[].docker.env keys. It matters most
+// for ssh backends: those keys are interpolated unquoted into a shell
+// "export NAME=..." statement (see backend.remoteScript), so a key outside
+// this set could inject arbitrary shell syntax.
 var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // Config is the top-level gateway configuration, loaded from a YAML file.
@@ -41,7 +42,8 @@ type BackendConfig struct {
 	Dir       string            `yaml:"dir,omitempty"`      // working directory for the stdio subprocess
 	EnvFile   string            `yaml:"env_file,omitempty"` // .env-format file merged under Env
 	Env       map[string]string `yaml:"env,omitempty"`
-	SSH       *SSHConfig        `yaml:"ssh,omitempty"` // if set, run the stdio Command on a remote host via ssh
+	SSH       *SSHConfig        `yaml:"ssh,omitempty"`    // if set, run the stdio Command on a remote host via ssh
+	Docker    *DockerConfig     `yaml:"docker,omitempty"` // if set, run the stdio Command inside a container
 	URL       string            `yaml:"url,omitempty"`
 	Headers   map[string]string `yaml:"headers,omitempty"`
 	Proxy     string            `yaml:"proxy,omitempty"` // proxy URL for http transport; "none" disables proxying even if HTTP_PROXY etc. are set; unset follows HTTP_PROXY/HTTPS_PROXY/NO_PROXY
@@ -55,6 +57,15 @@ type SSHConfig struct {
 	Port         int      `yaml:"port,omitempty"`
 	IdentityFile string   `yaml:"identity_file,omitempty"` // passed as -i
 	Args         []string `yaml:"args,omitempty"`          // extra ssh arguments, e.g. ["-J", "jumphost"]
+}
+
+// DockerConfig describes how to run a stdio backend's Command inside a
+// container via a docker-compatible CLI.
+type DockerConfig struct {
+	Bin   string            `yaml:"bin,omitempty"`  // docker-compatible CLI to invoke; defaults to "docker" (e.g. "podman", "nerdctl")
+	Image string            `yaml:"image"`          // required
+	Args  []string          `yaml:"args,omitempty"` // extra arguments appended to "run", e.g. ["-v", "/data:/data"]
+	Env   map[string]string `yaml:"env,omitempty"`  // env vars for the local CLI process itself (e.g. DOCKER_HOST), not the container; backends[].env is the container's env
 }
 
 // Load reads and parses the config file at path.
@@ -116,6 +127,11 @@ func expandEnvRefs(cfg *Config) {
 			cfg.Backends[i].Headers[k] = os.Expand(v, os.Getenv)
 		}
 		cfg.Backends[i].Proxy = os.Expand(cfg.Backends[i].Proxy, os.Getenv)
+		if cfg.Backends[i].Docker != nil {
+			for k, v := range cfg.Backends[i].Docker.Env {
+				cfg.Backends[i].Docker.Env[k] = os.Expand(v, os.Getenv)
+			}
+		}
 	}
 }
 
@@ -145,6 +161,23 @@ func validate(cfg *Config) error {
 			}
 			if b.SSH.Port < 0 || b.SSH.Port > 65535 {
 				return fmt.Errorf("backend %q: ssh port %d out of range", b.Name, b.SSH.Port)
+			}
+		}
+
+		if b.Docker != nil {
+			if b.Transport != "stdio" {
+				return fmt.Errorf("backend %q: docker is only valid for stdio transport", b.Name)
+			}
+			if b.SSH != nil {
+				return fmt.Errorf("backend %q: ssh and docker are mutually exclusive", b.Name)
+			}
+			if b.Docker.Image == "" {
+				return fmt.Errorf("backend %q: docker requires image", b.Name)
+			}
+			for k := range b.Docker.Env {
+				if !envKeyRE.MatchString(k) {
+					return fmt.Errorf("backend %q: invalid docker env key %q (must match %s)", b.Name, k, envKeyRE.String())
+				}
 			}
 		}
 

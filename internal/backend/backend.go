@@ -32,9 +32,12 @@ func Connect(ctx context.Context, cfg config.BackendConfig) (*Backend, error) {
 	switch cfg.Transport {
 	case "stdio":
 		var cmd *exec.Cmd
-		if cfg.SSH != nil {
+		switch {
+		case cfg.SSH != nil:
 			cmd = sshCommand(cfg)
-		} else {
+		case cfg.Docker != nil:
+			cmd = dockerCommand(cfg)
+		default:
 			cmd = exec.Command(cfg.Command[0], cfg.Command[1:]...)
 			cmd.Dir = cfg.Dir
 			cmd.Env = envWithOverrides(cfg.Env)
@@ -142,6 +145,40 @@ func sshCommand(cfg config.BackendConfig) *exec.Cmd {
 	args = append(args, cfg.SSH.Args...)
 	args = append(args, cfg.SSH.Host, remoteScript(cfg))
 	return exec.Command("ssh", args...)
+}
+
+// dockerCommand builds the "<bin> run ... <image> <command>" invocation that
+// runs cfg.Command inside a container. Unlike sshCommand, the target program
+// is exec'd directly via argv (no intermediate shell), so cfg.Dir and
+// cfg.Env need no shell quoting: they become "-w" and "-e" flags. The local
+// CLI process's own environment comes from cfg.Docker.Env, not cfg.Env,
+// since cfg.Env describes the containerized command's environment, not the
+// host-side docker/podman/nerdctl process's.
+func dockerCommand(cfg config.BackendConfig) *exec.Cmd {
+	bin := cfg.Docker.Bin
+	if bin == "" {
+		bin = "docker"
+	}
+
+	args := []string{"run", "-i", "--rm"}
+	keys := make([]string, 0, len(cfg.Env))
+	for k := range cfg.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		args = append(args, "-e", k+"="+cfg.Env[k])
+	}
+	if cfg.Dir != "" {
+		args = append(args, "-w", cfg.Dir)
+	}
+	args = append(args, cfg.Docker.Args...)
+	args = append(args, cfg.Docker.Image)
+	args = append(args, cfg.Command...)
+
+	cmd := exec.Command(bin, args...)
+	cmd.Env = envWithOverrides(cfg.Docker.Env)
+	return cmd
 }
 
 // remoteScript builds a single POSIX shell command string that cds into

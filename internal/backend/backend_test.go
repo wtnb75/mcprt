@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -106,6 +107,119 @@ func TestConnect_Stdio_SSH(t *testing.T) {
 	}
 }
 
+func TestConnect_Stdio_Docker(t *testing.T) {
+	ctx := context.Background()
+	wantDir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	installFakeDocker(t, "docker")
+
+	dumpPath := filepath.Join(t.TempDir(), "docker-env.txt")
+	t.Setenv("MCPRT_TEST_DOCKER_ENV_DUMP", dumpPath)
+
+	b, err := backend.Connect(ctx, config.BackendConfig{
+		Name:      "echo",
+		Transport: "stdio",
+		Command:   []string{buildEchoserver(t)},
+		Dir:       wantDir,
+		Env:       map[string]string{"MCPRT_TEST_CONTAINER_VAR": "in-container"},
+		Docker: &config.DockerConfig{
+			Image: "irrelevant-image",
+			Env:   map[string]string{"MCPRT_TEST_HOST_VAR": "host-only"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	if got := callCwd(t, ctx, b); got != wantDir {
+		t.Fatalf("cwd = %q, want %q", got, wantDir)
+	}
+
+	// backends[].env must reach the containerized command (passed as -e).
+	if got := callEnv(t, ctx, b, "MCPRT_TEST_CONTAINER_VAR"); got != "in-container" {
+		t.Fatalf("env(MCPRT_TEST_CONTAINER_VAR) = %q, want %q", got, "in-container")
+	}
+
+	// backends[].docker.env must NOT leak into the containerized command.
+	if got := callEnv(t, ctx, b, "MCPRT_TEST_HOST_VAR"); got != "" {
+		t.Fatalf("env(MCPRT_TEST_HOST_VAR) = %q, want empty (docker.env must not reach the container)", got)
+	}
+
+	// ...but it must reach the local docker CLI process itself.
+	dump, err := os.ReadFile(dumpPath)
+	if err != nil {
+		t.Fatalf("ReadFile(dump): %v", err)
+	}
+	if !strings.Contains(string(dump), "MCPRT_TEST_HOST_VAR=host-only") {
+		t.Fatalf("docker CLI env dump = %q, want it to contain MCPRT_TEST_HOST_VAR=host-only", dump)
+	}
+}
+
+func TestConnect_Stdio_Docker_Bin(t *testing.T) {
+	ctx := context.Background()
+	installFakeDocker(t, "podman")
+
+	b, err := backend.Connect(ctx, config.BackendConfig{
+		Name:      "echo",
+		Transport: "stdio",
+		Command:   []string{buildEchoserver(t)},
+		Docker: &config.DockerConfig{
+			Bin:   "podman",
+			Image: "irrelevant-image",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	if _, err := b.ListTools(ctx); err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+}
+
+// installFakeDocker puts a fake docker-compatible CLI named binName on PATH.
+// It mimics just enough of "docker run" to exercise backend.Connect's
+// dockerCommand wiring without a real container runtime: it dumps its own
+// process environment (to verify docker.Env reaches the CLI process, not the
+// container), then re-execs the trailing command with only the explicit "-e"
+// pairs as its environment (mimicking container isolation) after applying
+// "-w" as its working directory.
+func installFakeDocker(t *testing.T, binName string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker script requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	script := `#!/bin/sh
+env > "$MCPRT_TEST_DOCKER_ENV_DUMP"
+[ "$1" = "run" ] && shift
+envargs=""
+workdir=""
+while :; do
+  case "$1" in
+    -i|--rm) shift ;;
+    -e) envargs="$envargs $2"; shift 2 ;;
+    -w) workdir="$2"; shift 2 ;;
+    *) break ;;
+  esac
+done
+shift
+if [ -n "$workdir" ]; then cd "$workdir" || exit 1; fi
+exec env -i $envargs "$@"
+`
+	if err := os.WriteFile(filepath.Join(dir, binName), []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(fake %s): %v", binName, err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if os.Getenv("MCPRT_TEST_DOCKER_ENV_DUMP") == "" {
+		t.Setenv("MCPRT_TEST_DOCKER_ENV_DUMP", filepath.Join(t.TempDir(), "docker-env.txt"))
+	}
+}
+
 // buildEchoserver builds the echoserver test fixture into a plain binary and
 // returns its path. Tests that set Dir (or ssh, which behaves the same way)
 // can't use "go run": with cmd.Dir pointing outside the module, "go run"
@@ -149,6 +263,19 @@ func callCwd(t *testing.T, ctx context.Context, b *backend.Backend) string {
 	}
 	unmarshalStructured(t, res, &out)
 	return out.Dir
+}
+
+func callEnv(t *testing.T, ctx context.Context, b *backend.Backend, name string) string {
+	t.Helper()
+	res, err := b.Session.CallTool(ctx, &mcp.CallToolParams{Name: "env", Arguments: map[string]any{"name": name}})
+	if err != nil {
+		t.Fatalf("CallTool(env, %q): %v", name, err)
+	}
+	var out struct {
+		Value string `json:"value"`
+	}
+	unmarshalStructured(t, res, &out)
+	return out.Value
 }
 
 func unmarshalStructured(t *testing.T, res *mcp.CallToolResult, out any) {
