@@ -300,6 +300,32 @@ func TestListResourcesAndResourceTemplates(t *testing.T) {
 	}
 }
 
+func TestListPrompts(t *testing.T) {
+	fakeServer := mcp.NewServer(&mcp.Implementation{Name: "fake", Version: "v1"}, nil)
+	fakeServer.AddPrompt(&mcp.Prompt{Name: "greet", Description: "say hello"},
+		func(context.Context, *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{Messages: []*mcp.PromptMessage{}}, nil
+		})
+
+	srv := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return fakeServer }, nil))
+	defer srv.Close()
+
+	ctx := context.Background()
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	prompts, err := b.ListPrompts(ctx)
+	if err != nil {
+		t.Fatalf("ListPrompts: %v", err)
+	}
+	if len(prompts) != 1 || prompts[0].Name != "greet" {
+		t.Fatalf("ListPrompts = %+v, want one prompt named \"greet\"", prompts)
+	}
+}
+
 func TestConnect_UnknownTransport(t *testing.T) {
 	_, err := backend.Connect(context.Background(), config.BackendConfig{Name: "bad", Transport: "carrier-pigeon"})
 	if err == nil {

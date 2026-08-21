@@ -99,6 +99,18 @@ func (b *Backend) ListResourceTemplates(ctx context.Context) ([]*mcp.ResourceTem
 	return templates, nil
 }
 
+// ListPrompts fetches the backend's full prompt list, following pagination.
+func (b *Backend) ListPrompts(ctx context.Context) ([]*mcp.Prompt, error) {
+	var prompts []*mcp.Prompt
+	for p, err := range b.Session.Prompts(ctx, nil) {
+		if err != nil {
+			return nil, fmt.Errorf("backend %q: list prompts: %w", b.Name, err)
+		}
+		prompts = append(prompts, p)
+	}
+	return prompts, nil
+}
+
 // Close closes the connection to the backend.
 func (b *Backend) Close() error {
 	return b.Session.Close()
