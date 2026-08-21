@@ -85,6 +85,9 @@ func runExport(cmd *cobra.Command, configPath, outPath string, force bool) error
 	if len(src.ResourceTemplateOverrides) > 0 {
 		warn("resource_template_overrides: dropped (mcp.json has no equivalent for resolving conflicting URI templates)")
 	}
+	if len(src.PromptOverrides) > 0 {
+		warn("prompt_overrides: dropped (mcp.json has no equivalent for resolving conflicting prompt names)")
+	}
 
 	servers := make(map[string]mcpJSONServer, len(src.Backends))
 	for _, b := range src.Backends {

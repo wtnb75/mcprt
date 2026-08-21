@@ -45,6 +45,9 @@ func exampleConfig() *config.Config {
 		ResourceTemplateOverrides: map[string]string{
 			"file:///example/{path}": "example-stdio",
 		},
+		PromptOverrides: map[string]string{
+			"example_prompt": "example-stdio",
+		},
 	}
 }
 

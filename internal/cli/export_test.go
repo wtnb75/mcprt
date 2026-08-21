@@ -286,6 +286,37 @@ resource_template_overrides:
 	}
 }
 
+func TestExportCommand_PromptOverridesWarnedAndDropped(t *testing.T) {
+	configPath := writeExportConfig(t, `
+backends:
+  - name: srv
+    transport: http
+    url: https://example.com/mcp
+prompt_overrides:
+  code-review: srv
+`)
+	outPath := filepath.Join(t.TempDir(), "mcp.json")
+
+	var errOut bytes.Buffer
+	root := cli.NewRootCmd()
+	root.SetErr(&errOut)
+	root.SetArgs([]string{"export", "--config", configPath, outPath})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("Execute: unexpected error: %v", err)
+	}
+	if !strings.Contains(errOut.String(), "prompt_overrides") {
+		t.Fatalf("stderr = %q, want a warning about prompt_overrides being dropped", errOut.String())
+	}
+
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("reading generated mcp.json: %v", err)
+	}
+	if strings.Contains(string(data), "prompt_overrides") {
+		t.Fatalf("generated mcp.json = %s, must not contain a prompt_overrides field", data)
+	}
+}
+
 func TestExportCommand_NoBackendsExported(t *testing.T) {
 	configPath := writeExportConfig(t, `
 backends:

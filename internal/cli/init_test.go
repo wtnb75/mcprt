@@ -32,6 +32,9 @@ func TestInitCommand_WritesParsableConfig(t *testing.T) {
 	if len(cfg.ResourceTemplateOverrides) == 0 {
 		t.Fatalf("generated config has no resource_template_overrides example:\n%s", data)
 	}
+	if len(cfg.PromptOverrides) == 0 {
+		t.Fatalf("generated config has no prompt_overrides example:\n%s", data)
+	}
 }
 
 func TestInitCommand_DefaultPath(t *testing.T) {
