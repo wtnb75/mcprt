@@ -22,8 +22,15 @@ func TestInitCommand_WritesParsableConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading generated config: %v", err)
 	}
-	if _, err := config.Parse(data); err != nil {
+	cfg, err := config.Parse(data)
+	if err != nil {
 		t.Fatalf("generated config did not parse: %v\ncontent:\n%s", err, data)
+	}
+	if len(cfg.ResourceOverrides) == 0 {
+		t.Fatalf("generated config has no resource_overrides example:\n%s", data)
+	}
+	if len(cfg.ResourceTemplateOverrides) == 0 {
+		t.Fatalf("generated config has no resource_template_overrides example:\n%s", data)
 	}
 }
 

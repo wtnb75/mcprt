@@ -167,6 +167,96 @@ backends:
 	}
 }
 
+// TestServerCommand_PrefixNotAppliedToResources checks the feature's central
+// invariant: a backend's `prefix` renames its tools but must never be
+// applied to resource URIs or resource template URI templates, since a URI
+// already carries a backend-specific namespace and string-concatenating a
+// prefix onto one would produce an invalid URI.
+func TestServerCommand_PrefixNotAppliedToResources(t *testing.T) {
+	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	mcp.AddTool(backendSrv, &mcp.Tool{Name: "ping", Description: "ping"},
+		func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
+			return nil, struct{}{}, nil
+		})
+	backendSrv.AddResource(&mcp.Resource{URI: "file:///a", Name: "a"},
+		func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+			return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: req.Params.URI, Text: "hello"}}}, nil
+		})
+	backendHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil))
+	defer backendHTTP.Close()
+
+	gatewayAddr := freePort(t)
+	configPath := writeConfig(t, fmt.Sprintf(`
+listen:
+  http: %q
+
+backends:
+  - name: fake
+    transport: http
+    url: %q
+    prefix: "gh__"
+`, gatewayAddr, backendHTTP.URL))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	execErr := make(chan error, 1)
+	go func() {
+		execErr <- cli.Execute(ctx, []string{"server", "--config", configPath})
+	}()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	var session *mcp.ClientSession
+	var connectErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		session, connectErr = client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: "http://" + gatewayAddr}, nil)
+		if connectErr == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if connectErr != nil {
+		t.Fatalf("connecting to gateway: %v", connectErr)
+	}
+
+	var toolNames []string
+	for tool, err := range session.Tools(ctx, nil) {
+		if err != nil {
+			t.Fatalf("listing tools: %v", err)
+		}
+		toolNames = append(toolNames, tool.Name)
+	}
+	sort.Strings(toolNames)
+	if len(toolNames) != 1 || toolNames[0] != "gh__ping" {
+		t.Fatalf("tools/list = %v, want [gh__ping] (prefix must be applied to tool names)", toolNames)
+	}
+
+	var resourceURIs []string
+	for resource, err := range session.Resources(ctx, nil) {
+		if err != nil {
+			t.Fatalf("listing resources: %v", err)
+		}
+		resourceURIs = append(resourceURIs, resource.URI)
+	}
+	sort.Strings(resourceURIs)
+	if len(resourceURIs) != 1 || resourceURIs[0] != "file:///a" {
+		t.Fatalf("resources/list = %v, want [file:///a] (prefix must never be applied to resource URIs)", resourceURIs)
+	}
+
+	res, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: "file:///a"})
+	if err != nil {
+		t.Fatalf("ReadResource(file:///a): %v", err)
+	}
+	if len(res.Contents) != 1 || res.Contents[0].Text != "hello" {
+		t.Fatalf("ReadResource(file:///a) = %+v, want text \"hello\"", res.Contents)
+	}
+	_ = session.Close()
+
+	cancel()
+	if err := <-execErr; err != nil {
+		t.Fatalf("server exited with error: %v", err)
+	}
+}
+
 // TestServerCommand_StdioShutdownIsClean covers the stdio listener's
 // shutdown path: gateway.ServeStdio returns ctx.Err() when the context is
 // cancelled, and a cancelled context is a clean shutdown, not a failure the

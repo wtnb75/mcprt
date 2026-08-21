@@ -39,6 +39,12 @@ func exampleConfig() *config.Config {
 		Overrides: map[string]string{
 			"example_tool": "example-stdio",
 		},
+		ResourceOverrides: map[string]string{
+			"file:///example/data.txt": "example-stdio",
+		},
+		ResourceTemplateOverrides: map[string]string{
+			"file:///example/{path}": "example-stdio",
+		},
 	}
 }
 

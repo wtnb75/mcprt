@@ -18,8 +18,9 @@ import (
 )
 
 // backendConnectTimeout bounds how long connectBackends waits on any single
-// backend's Connect+ListTools, so one hung backend can't stall the whole
-// gateway's startup (see connectBackends). A var so tests can shrink it.
+// backend's Connect plus its ListTools/ListResources/ListResourceTemplates
+// calls, so one hung backend can't stall the whole gateway's startup (see
+// connectBackends). A var so tests can shrink it.
 var backendConnectTimeout = 30 * time.Second
 
 func newServerCmd() *cobra.Command {
@@ -159,9 +160,15 @@ type connected struct {
 
 // connectBackends connects to every configured backend concurrently and
 // lists its tools, resources, and resource templates. A backend that fails
-// to connect, fails any of those listings, or exceeds backendConnectTimeout
-// is logged and excluded (best-effort); it does not fail or stall the whole
-// startup.
+// to connect, fails to list tools, or exceeds backendConnectTimeout is
+// logged and excluded entirely (best-effort); it does not fail or stall the
+// whole startup. A backend that fails to list resources or resource
+// templates is kept with its tools intact and treated as having none: many
+// non-Go-SDK MCP servers answer resources/list (or
+// resources/templates/list) with a JSON-RPC "method not found" error when
+// they don't implement the resources capability at all, rather than an
+// empty list, and that must not take down an otherwise-working tools-only
+// backend.
 func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.BackendConfig) connected {
 	type outcome struct {
 		backend               *backend.Backend
@@ -192,15 +199,13 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 			}
 			resources, err := b.ListResources(ctx)
 			if err != nil {
-				logger.Error("skipping backend: list resources failed", "backend", bc.Name, "error", err)
-				_ = b.Close()
-				return
+				logger.Warn("backend lists no resources", "backend", bc.Name, "error", err)
+				resources = nil
 			}
 			resourceTemplates, err := b.ListResourceTemplates(ctx)
 			if err != nil {
-				logger.Error("skipping backend: list resource templates failed", "backend", bc.Name, "error", err)
-				_ = b.Close()
-				return
+				logger.Warn("backend lists no resource templates", "backend", bc.Name, "error", err)
+				resourceTemplates = nil
 			}
 			outcomes[i] = &outcome{
 				backend: b,

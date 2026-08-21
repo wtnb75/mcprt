@@ -250,6 +250,42 @@ overrides:
 	}
 }
 
+func TestExportCommand_ResourceOverridesWarnedAndDropped(t *testing.T) {
+	configPath := writeExportConfig(t, `
+backends:
+  - name: srv
+    transport: http
+    url: https://example.com/mcp
+resource_overrides:
+  "file:///data.txt": srv
+resource_template_overrides:
+  "file:///{path}": srv
+`)
+	outPath := filepath.Join(t.TempDir(), "mcp.json")
+
+	var errOut bytes.Buffer
+	root := cli.NewRootCmd()
+	root.SetErr(&errOut)
+	root.SetArgs([]string{"export", "--config", configPath, outPath})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("Execute: unexpected error: %v", err)
+	}
+	if !strings.Contains(errOut.String(), "resource_overrides") {
+		t.Fatalf("stderr = %q, want a warning about resource_overrides being dropped", errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "resource_template_overrides") {
+		t.Fatalf("stderr = %q, want a warning about resource_template_overrides being dropped", errOut.String())
+	}
+
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("reading generated mcp.json: %v", err)
+	}
+	if strings.Contains(string(data), "resource_overrides") || strings.Contains(string(data), "resource_template_overrides") {
+		t.Fatalf("generated mcp.json = %s, must not contain resource_overrides/resource_template_overrides fields", data)
+	}
+}
+
 func TestExportCommand_NoBackendsExported(t *testing.T) {
 	configPath := writeExportConfig(t, `
 backends:
