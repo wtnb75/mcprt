@@ -12,3 +12,6 @@ backends:
 
 overrides:
   example_tool: example
+
+resource_overrides:
+  "file:///example/data.txt": example

@@ -1,7 +1,8 @@
 # mcprt
 
 mcprt aggregates multiple MCP servers (local stdio subprocesses and remote
-HTTP servers) behind a single MCP gateway endpoint.
+HTTP servers) behind a single MCP gateway endpoint, relaying `tools/*` and
+`resources/*` calls to whichever backend serves them.
 
 ## Usage
 
@@ -52,6 +53,20 @@ Minimal example:
 
     overrides:
       gh__search: github
+
+    resource_overrides:
+      "file:///data/README.md": filesystem
+
+    resource_template_overrides:
+      "file:///data/{path}": filesystem
+
+`overrides` resolves conflicting **tool** names (after each backend's
+`prefix` is applied). `resource_overrides` and `resource_template_overrides`
+resolve conflicting resource URIs and URI templates the same way, but
+`prefix` is never applied to resources: a URI already carries a
+backend-specific namespace (`scheme://host/path`), and string-concatenating
+a prefix onto one would produce an invalid URI. `resources/subscribe` and
+`notifications/resources/updated` are not relayed.
 
 When `ssh` is set on a stdio backend, mcprt runs `command` on the remote host
 by shelling out to the local `ssh` binary (so `~/.ssh/config`, `ssh-agent`,
