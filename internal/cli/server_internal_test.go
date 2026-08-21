@@ -169,3 +169,41 @@ func TestConnectBackends_ResourceListFailureKeepsBackendTools(t *testing.T) {
 		t.Fatalf("resourceTemplateEntries = %+v, want one entry with no items", conn.resourceTemplateEntries)
 	}
 }
+
+// TestConnectBackends_PromptListFailureKeepsBackendTools is
+// TestConnectBackends_ResourceListFailureKeepsBackendTools's counterpart for
+// prompts/list: a backend whose prompts/list errors out must still be
+// connected, with its tools intact, instead of being dropped entirely.
+func TestConnectBackends_PromptListFailureKeepsBackendTools(t *testing.T) {
+	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	mcp.AddTool(backendSrv, &mcp.Tool{Name: "ping", Description: "ping"},
+		func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
+			return nil, struct{}{}, nil
+		})
+
+	realHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil)
+	backendHTTP := httptest.NewServer(denyMethodHandler(realHandler, "prompts/list"))
+	defer backendHTTP.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	configs := []config.BackendConfig{
+		{Name: "fake", Transport: "http", URL: backendHTTP.URL},
+	}
+
+	conn := connectBackends(context.Background(), logger, configs)
+	defer func() {
+		for _, b := range conn.backends {
+			_ = b.Close()
+		}
+	}()
+
+	if _, ok := conn.backends["fake"]; !ok {
+		t.Fatalf("backends = %v, want backend \"fake\" to still be connected despite its prompts/list failing", conn.backends)
+	}
+	if len(conn.toolEntries) != 1 || len(conn.toolEntries[0].Items) != 1 || conn.toolEntries[0].Items[0].Name != "ping" {
+		t.Fatalf("toolEntries = %+v, want one entry with tool \"ping\"", conn.toolEntries)
+	}
+	if len(conn.promptEntries) != 1 || len(conn.promptEntries[0].Items) != 0 {
+		t.Fatalf("promptEntries = %+v, want one entry with no items (a prompts/list failure is treated as an empty list, not dropped)", conn.promptEntries)
+	}
+}

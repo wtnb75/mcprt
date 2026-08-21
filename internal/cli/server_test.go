@@ -257,6 +257,154 @@ backends:
 	}
 }
 
+func TestServerCommand_ServesAggregatedPrompts(t *testing.T) {
+	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	backendSrv.AddPrompt(&mcp.Prompt{Name: "greet", Description: "say hello"},
+		func(ctx context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{Messages: []*mcp.PromptMessage{{
+				Role:    "user",
+				Content: &mcp.TextContent{Text: "hello " + req.Params.Arguments["name"]},
+			}}}, nil
+		})
+	backendHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil))
+	defer backendHTTP.Close()
+
+	gatewayAddr := freePort(t)
+	configPath := writeConfig(t, fmt.Sprintf(`
+listen:
+  http: %q
+
+backends:
+  - name: fake
+    transport: http
+    url: %q
+`, gatewayAddr, backendHTTP.URL))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	execErr := make(chan error, 1)
+	go func() {
+		execErr <- cli.Execute(ctx, []string{"server", "--config", configPath})
+	}()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	var session *mcp.ClientSession
+	var connectErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		session, connectErr = client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: "http://" + gatewayAddr}, nil)
+		if connectErr == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if connectErr != nil {
+		t.Fatalf("connecting to gateway: %v", connectErr)
+	}
+
+	var names []string
+	for prompt, err := range session.Prompts(ctx, nil) {
+		if err != nil {
+			t.Fatalf("listing prompts: %v", err)
+		}
+		names = append(names, prompt.Name)
+	}
+	if len(names) != 1 || names[0] != "greet" {
+		t.Fatalf("prompts/list = %v, want [greet]", names)
+	}
+
+	res, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "greet", Arguments: map[string]string{"name": "world"}})
+	if err != nil {
+		t.Fatalf("GetPrompt(greet): %v", err)
+	}
+	text, ok := res.Messages[0].Content.(*mcp.TextContent)
+	if !ok || text.Text != "hello world" {
+		t.Fatalf("GetPrompt(greet) content = %+v, want text \"hello world\"", res.Messages[0].Content)
+	}
+	_ = session.Close()
+
+	cancel()
+	if err := <-execErr; err != nil {
+		t.Fatalf("server exited with error: %v", err)
+	}
+}
+
+// TestServerCommand_PrefixAppliedToPrompts checks the mirror-image
+// invariant of TestServerCommand_PrefixNotAppliedToResources: a backend's
+// `prefix` DOES apply to prompt names, exactly like tool names, because
+// prompt names live in the same kind of flat namespace tool names do
+// (unlike resource URIs).
+func TestServerCommand_PrefixAppliedToPrompts(t *testing.T) {
+	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	backendSrv.AddPrompt(&mcp.Prompt{Name: "greet"},
+		func(ctx context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{Messages: []*mcp.PromptMessage{{
+				Role:    "user",
+				Content: &mcp.TextContent{Text: "hello"},
+			}}}, nil
+		})
+	backendHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil))
+	defer backendHTTP.Close()
+
+	gatewayAddr := freePort(t)
+	configPath := writeConfig(t, fmt.Sprintf(`
+listen:
+  http: %q
+
+backends:
+  - name: fake
+    transport: http
+    url: %q
+    prefix: "gh__"
+`, gatewayAddr, backendHTTP.URL))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	execErr := make(chan error, 1)
+	go func() {
+		execErr <- cli.Execute(ctx, []string{"server", "--config", configPath})
+	}()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	var session *mcp.ClientSession
+	var connectErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		session, connectErr = client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: "http://" + gatewayAddr}, nil)
+		if connectErr == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if connectErr != nil {
+		t.Fatalf("connecting to gateway: %v", connectErr)
+	}
+
+	var names []string
+	for prompt, err := range session.Prompts(ctx, nil) {
+		if err != nil {
+			t.Fatalf("listing prompts: %v", err)
+		}
+		names = append(names, prompt.Name)
+	}
+	if len(names) != 1 || names[0] != "gh__greet" {
+		t.Fatalf("prompts/list = %v, want [gh__greet] (prefix must be applied to prompt names)", names)
+	}
+
+	res, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "gh__greet"})
+	if err != nil {
+		t.Fatalf("GetPrompt(gh__greet): %v", err)
+	}
+	text, ok := res.Messages[0].Content.(*mcp.TextContent)
+	if !ok || text.Text != "hello" {
+		t.Fatalf("GetPrompt(gh__greet) content = %+v, want text \"hello\"", res.Messages[0].Content)
+	}
+	_ = session.Close()
+
+	cancel()
+	if err := <-execErr; err != nil {
+		t.Fatalf("server exited with error: %v", err)
+	}
+}
+
 // TestServerCommand_StdioShutdownIsClean covers the stdio listener's
 // shutdown path: gateway.ServeStdio returns ctx.Err() when the context is
 // cancelled, and a cancelled context is a clean shutdown, not a failure the

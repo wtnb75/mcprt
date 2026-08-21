@@ -18,8 +18,9 @@ import (
 )
 
 // backendConnectTimeout bounds how long connectBackends waits on any single
-// backend's Connect plus its ListTools/ListResources/ListResourceTemplates
-// calls, so one hung backend can't stall the whole gateway's startup (see
+// backend's Connect plus its
+// ListTools/ListResources/ListResourceTemplates/ListPrompts calls, so one
+// hung backend can't stall the whole gateway's startup (see
 // connectBackends). A var so tests can shrink it.
 var backendConnectTimeout = 30 * time.Second
 
@@ -106,10 +107,16 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 		logger.Warn("resource template URI conflict", "uriTemplate", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
 
+	promptTable := router.Resolve(conn.promptEntries, promptNameOf, promptRename, cfg.PromptOverrides)
+	for _, c := range promptTable.Conflicts {
+		logger.Warn("prompt name conflict", "prompt", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
+	}
+
 	srv := gateway.New(logger, conn.backends, gateway.Tables{
 		Tools:             toolTable,
 		Resources:         resourceTable,
 		ResourceTemplates: resourceTemplateTable,
+		Prompts:           promptTable,
 	})
 
 	running := 0
@@ -156,25 +163,27 @@ type connected struct {
 	toolEntries             []router.Entry[*mcp.Tool]
 	resourceEntries         []router.Entry[*mcp.Resource]
 	resourceTemplateEntries []router.Entry[*mcp.ResourceTemplate]
+	promptEntries           []router.Entry[*mcp.Prompt]
 }
 
 // connectBackends connects to every configured backend concurrently and
-// lists its tools, resources, and resource templates. A backend that fails
-// to connect, fails to list tools, or exceeds backendConnectTimeout is
-// logged and excluded entirely (best-effort); it does not fail or stall the
-// whole startup. A backend that fails to list resources or resource
-// templates is kept with its tools intact and treated as having none: many
-// non-Go-SDK MCP servers answer resources/list (or
-// resources/templates/list) with a JSON-RPC "method not found" error when
-// they don't implement the resources capability at all, rather than an
-// empty list, and that must not take down an otherwise-working tools-only
-// backend.
+// lists its tools, resources, resource templates, and prompts. A backend
+// that fails to connect, fails to list tools, or exceeds
+// backendConnectTimeout is logged and excluded entirely (best-effort); it
+// does not fail or stall the whole startup. A backend that fails to list
+// resources, resource templates, or prompts is kept with its tools intact
+// and treated as having none of that kind: many non-Go-SDK MCP servers
+// answer resources/list, resources/templates/list, or prompts/list with a
+// JSON-RPC "method not found" error when they don't implement that
+// capability at all, rather than an empty list, and that must not take down
+// an otherwise-working tools-only backend.
 func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.BackendConfig) connected {
 	type outcome struct {
 		backend               *backend.Backend
 		toolEntry             router.Entry[*mcp.Tool]
 		resourceEntry         router.Entry[*mcp.Resource]
 		resourceTemplateEntry router.Entry[*mcp.ResourceTemplate]
+		promptEntry           router.Entry[*mcp.Prompt]
 	}
 	outcomes := make([]*outcome, len(configs))
 
@@ -207,6 +216,11 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 				logger.Warn("backend lists no resource templates", "backend", bc.Name, "error", err)
 				resourceTemplates = nil
 			}
+			prompts, err := b.ListPrompts(ctx)
+			if err != nil {
+				logger.Warn("backend lists no prompts", "backend", bc.Name, "error", err)
+				prompts = nil
+			}
 			outcomes[i] = &outcome{
 				backend: b,
 				toolEntry: router.Entry[*mcp.Tool]{
@@ -222,6 +236,11 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 				resourceTemplateEntry: router.Entry[*mcp.ResourceTemplate]{
 					BackendName: bc.Name, Items: resourceTemplates,
 				},
+				// prompt entries DO carry a prefix, like tools: prompt
+				// names are a flat namespace, not a URI.
+				promptEntry: router.Entry[*mcp.Prompt]{
+					BackendName: bc.Name, Prefix: bc.Prefix, Items: prompts,
+				},
 			}
 		}(i, bc)
 	}
@@ -236,6 +255,7 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 		result.toolEntries = append(result.toolEntries, o.toolEntry)
 		result.resourceEntries = append(result.resourceEntries, o.resourceEntry)
 		result.resourceTemplateEntries = append(result.resourceTemplateEntries, o.resourceTemplateEntry)
+		result.promptEntries = append(result.promptEntries, o.promptEntry)
 	}
 	return result
 }
@@ -261,5 +281,13 @@ func resourceTemplateNameOf(t *mcp.ResourceTemplate) string { return t.URITempla
 func resourceTemplateRename(t *mcp.ResourceTemplate, name string) *mcp.ResourceTemplate {
 	c := *t
 	c.URITemplate = name
+	return &c
+}
+
+func promptNameOf(p *mcp.Prompt) string { return p.Name }
+
+func promptRename(p *mcp.Prompt, name string) *mcp.Prompt {
+	c := *p
+	c.Name = name
 	return &c
 }
