@@ -24,6 +24,7 @@ type Config struct {
 	Overrides                 map[string]string `yaml:"overrides,omitempty"`
 	ResourceOverrides         map[string]string `yaml:"resource_overrides,omitempty"`
 	ResourceTemplateOverrides map[string]string `yaml:"resource_template_overrides,omitempty"`
+	PromptOverrides           map[string]string `yaml:"prompt_overrides,omitempty"`
 }
 
 // ListenConfig controls which client-facing transports the gateway serves.
@@ -180,6 +181,11 @@ func validate(cfg *Config) error {
 	for uriTemplate, backendName := range cfg.ResourceTemplateOverrides {
 		if !names[backendName] {
 			return fmt.Errorf("resource_template_overrides %q references unknown backend %q", uriTemplate, backendName)
+		}
+	}
+	for promptName, backendName := range cfg.PromptOverrides {
+		if !names[backendName] {
+			return fmt.Errorf("prompt_overrides %q references unknown backend %q", promptName, backendName)
 		}
 	}
 

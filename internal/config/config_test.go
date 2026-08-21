@@ -373,3 +373,40 @@ resource_template_overrides:
 		t.Fatal("Parse: expected error for resource_template_overrides referencing unknown backend, got nil")
 	}
 }
+
+func TestParse_PromptOverrides(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: linter
+    transport: stdio
+    command: ["a"]
+  - name: linter-strict
+    transport: stdio
+    command: ["b"]
+
+prompt_overrides:
+  code-review: linter-strict
+`)
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.PromptOverrides["code-review"] != "linter-strict" {
+		t.Fatalf("PromptOverrides[...] = %q, want %q", cfg.PromptOverrides["code-review"], "linter-strict")
+	}
+}
+
+func TestParse_PromptOverrideReferencesUnknownBackend(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: known
+    transport: stdio
+    command: ["a"]
+
+prompt_overrides:
+  code-review: nonexistent
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for prompt_overrides referencing unknown backend, got nil")
+	}
+}
