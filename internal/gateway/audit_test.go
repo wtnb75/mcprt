@@ -1,9 +1,19 @@
 package gateway
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestMaskArguments(t *testing.T) {
@@ -69,4 +79,115 @@ func TestMaskArguments(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLogCall_Success(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	sess := &mcp.ServerSession{}
+	start := time.Now().Add(-5 * time.Millisecond)
+
+	logCall(context.Background(), logger, "tool", "tool", "mytool", "backend-a", sess,
+		json.RawMessage(`{"user":"alice"}`), nil, start, nil)
+
+	rec := decodeLastLogLine(t, buf.String())
+	if rec["msg"] != "tool call" {
+		t.Fatalf("msg = %v, want %q", rec["msg"], "tool call")
+	}
+	if rec["level"] != "INFO" {
+		t.Fatalf("level = %v, want INFO", rec["level"])
+	}
+	if rec["backend"] != "backend-a" || rec["tool"] != "mytool" {
+		t.Fatalf("backend/tool = %v/%v, want backend-a/mytool", rec["backend"], rec["tool"])
+	}
+	if _, ok := rec["duration_ms"]; !ok {
+		t.Fatalf("log line %v missing duration_ms", rec)
+	}
+	if _, ok := rec["client_name"]; ok {
+		t.Fatalf("log line %v has client_name, want it omitted (zero-value session has no InitializeParams)", rec)
+	}
+	if _, ok := rec["remote_addr"]; ok {
+		t.Fatalf("log line %v has remote_addr, want it omitted (no value in context)", rec)
+	}
+	args, ok := rec["arguments"].(map[string]any)
+	if !ok || args["user"] != "alice" {
+		t.Fatalf("arguments = %v, want map with user=alice", rec["arguments"])
+	}
+}
+
+func TestLogCall_Failure(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	sess := &mcp.ServerSession{}
+
+	logCall(context.Background(), logger, "tool", "tool", "mytool", "backend-a", sess,
+		nil, nil, time.Now(), errors.New("boom"))
+
+	rec := decodeLastLogLine(t, buf.String())
+	if rec["msg"] != "tool call failed" {
+		t.Fatalf("msg = %v, want %q", rec["msg"], "tool call failed")
+	}
+	if rec["level"] != "ERROR" {
+		t.Fatalf("level = %v, want ERROR", rec["level"])
+	}
+	if rec["error"] != "boom" {
+		t.Fatalf("error = %v, want boom", rec["error"])
+	}
+	if _, ok := rec["arguments"]; ok {
+		t.Fatalf("log line %v has arguments, want it omitted (nil args)", rec)
+	}
+}
+
+func TestLogCall_RemoteAddrFromContext(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	sess := &mcp.ServerSession{}
+	ctx := context.WithValue(context.Background(), remoteAddrKey{}, "127.0.0.1:5555")
+
+	logCall(ctx, logger, "resource", "uri", "file:///a", "backend-a", sess, nil, nil, time.Now(), nil)
+
+	rec := decodeLastLogLine(t, buf.String())
+	if rec["remote_addr"] != "127.0.0.1:5555" {
+		t.Fatalf("remote_addr = %v, want 127.0.0.1:5555", rec["remote_addr"])
+	}
+	if rec["uri"] != "file:///a" {
+		t.Fatalf("uri = %v, want file:///a", rec["uri"])
+	}
+}
+
+func TestRemoteAddrMiddleware(t *testing.T) {
+	var gotAddr string
+	var gotOK bool
+	downstream := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAddr, gotOK = remoteAddrFromContext(r.Context())
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "192.0.2.1:1234"
+	rec := httptest.NewRecorder()
+
+	remoteAddrMiddleware(downstream).ServeHTTP(rec, req)
+
+	if !gotOK || gotAddr != "192.0.2.1:1234" {
+		t.Fatalf("remoteAddrFromContext = (%q, %v), want (192.0.2.1:1234, true)", gotAddr, gotOK)
+	}
+
+	// Without the middleware, the value isn't there.
+	gotAddr, gotOK = "", false
+	downstream.ServeHTTP(rec, req)
+	if gotOK {
+		t.Fatalf("remoteAddrFromContext on an unwrapped request = (%q, true), want ok=false", gotAddr)
+	}
+}
+
+// decodeLastLogLine decodes the last non-empty line of a slog JSON handler's
+// output into a generic map, for asserting on individual fields.
+func decodeLastLogLine(t *testing.T, out string) map[string]any {
+	t.Helper()
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	var rec map[string]any
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &rec); err != nil {
+		t.Fatalf("decoding log line %q: %v", lines[len(lines)-1], err)
+	}
+	return rec
 }

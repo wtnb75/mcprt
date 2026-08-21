@@ -1,9 +1,15 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"net/http"
 	"strings"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // defaultMaskKeyPatterns are matched case-insensitively as substrings
@@ -78,4 +84,57 @@ func shouldMask(key string, extraKeys []string) bool {
 		}
 	}
 	return false
+}
+
+// logCall logs one backend call's outcome — success or failure — in a
+// consistent shape, so investigating an incident doesn't require treating
+// the success and error paths as separate log formats.
+// kind labels the log message ("tool"/"resource"/"resource template"/"prompt");
+// nameKey is the field name for name ("tool"/"uri"/"prompt" — resource and
+// resource template both use "uri"). args is nil for resource reads, which
+// have no call arguments.
+func logCall(ctx context.Context, logger *slog.Logger, kind, nameKey, name, backend string, sess *mcp.ServerSession, args any, maskKeys []string, start time.Time, err error) {
+	attrs := []any{
+		"backend", backend,
+		nameKey, name,
+		"session_id", sess.ID(),
+		"duration_ms", time.Since(start).Milliseconds(),
+	}
+	if ip := sess.InitializeParams(); ip != nil && ip.ClientInfo != nil {
+		attrs = append(attrs, "client_name", ip.ClientInfo.Name, "client_version", ip.ClientInfo.Version)
+	}
+	if addr, ok := remoteAddrFromContext(ctx); ok {
+		attrs = append(attrs, "remote_addr", addr)
+	}
+	if args != nil {
+		attrs = append(attrs, "arguments", maskArguments(args, maskKeys))
+	}
+	if err != nil {
+		logger.Error(kind+" call failed", append(attrs, "error", err)...)
+		return
+	}
+	logger.Info(kind+" call", attrs...)
+}
+
+// remoteAddrKey is the context key ServeHTTP's remoteAddrMiddleware uses to
+// carry the client's TCP address to every logCall for that session.
+type remoteAddrKey struct{}
+
+// remoteAddrMiddleware stashes r.RemoteAddr in the request context before
+// calling next. The MCP SDK reuses the request context that establishes a
+// session as that session's base context for every later call on it, so
+// this value stays reachable from logCall for the whole session's lifetime,
+// not just its first request.
+func remoteAddrMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), remoteAddrKey{}, r.RemoteAddr)))
+	})
+}
+
+// remoteAddrFromContext retrieves the value remoteAddrMiddleware stashed, if
+// any. It reports ok=false for stdio sessions (no middleware ever runs) or
+// any context that didn't come from an HTTP request through it.
+func remoteAddrFromContext(ctx context.Context) (string, bool) {
+	addr, ok := ctx.Value(remoteAddrKey{}).(string)
+	return addr, ok
 }
