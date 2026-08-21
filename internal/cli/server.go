@@ -83,19 +83,33 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	backends, entries := connectBackends(ctx, logger, cfg.Backends)
+	conn := connectBackends(ctx, logger, cfg.Backends)
 	defer func() {
-		for _, b := range backends {
+		for _, b := range conn.backends {
 			_ = b.Close()
 		}
 	}()
 
-	table := router.Resolve(entries, toolNameOf, toolRename, cfg.Overrides)
-	for _, c := range table.Conflicts {
+	toolTable := router.Resolve(conn.toolEntries, toolNameOf, toolRename, cfg.Overrides)
+	for _, c := range toolTable.Conflicts {
 		logger.Warn("tool name conflict", "tool", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
 
-	srv := gateway.New(logger, backends, gateway.Tables{Tools: table})
+	resourceTable := router.Resolve(conn.resourceEntries, resourceNameOf, resourceRename, cfg.ResourceOverrides)
+	for _, c := range resourceTable.Conflicts {
+		logger.Warn("resource URI conflict", "uri", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
+	}
+
+	resourceTemplateTable := router.Resolve(conn.resourceTemplateEntries, resourceTemplateNameOf, resourceTemplateRename, cfg.ResourceTemplateOverrides)
+	for _, c := range resourceTemplateTable.Conflicts {
+		logger.Warn("resource template URI conflict", "uriTemplate", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
+	}
+
+	srv := gateway.New(logger, conn.backends, gateway.Tables{
+		Tools:             toolTable,
+		Resources:         resourceTable,
+		ResourceTemplates: resourceTemplateTable,
+	})
 
 	running := 0
 	errCh := make(chan error, 2)
@@ -132,16 +146,28 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	return firstErr
 }
 
+// connected is the outcome of connectBackends: the live backend
+// connections, plus each kind of item list gathered from them, ready to
+// pass to router.Resolve. Entries preserve configs' order, since
+// router.Resolve treats that order as priority (index 0 = highest).
+type connected struct {
+	backends                map[string]*backend.Backend
+	toolEntries             []router.Entry[*mcp.Tool]
+	resourceEntries         []router.Entry[*mcp.Resource]
+	resourceTemplateEntries []router.Entry[*mcp.ResourceTemplate]
+}
+
 // connectBackends connects to every configured backend concurrently and
-// lists its tools. A backend that fails to connect, list tools, or exceed
-// backendConnectTimeout is logged and excluded (best-effort); it does not
-// fail or stall the whole startup. The returned entries preserve configs'
-// order, since router.Resolve treats that order as priority (index 0 =
-// highest).
-func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.BackendConfig) (map[string]*backend.Backend, []router.Entry[*mcp.Tool]) {
+// lists its tools, resources, and resource templates. A backend that fails
+// to connect, fails any of those listings, or exceeds backendConnectTimeout
+// is logged and excluded (best-effort); it does not fail or stall the whole
+// startup.
+func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.BackendConfig) connected {
 	type outcome struct {
-		backend *backend.Backend
-		entry   router.Entry[*mcp.Tool]
+		backend               *backend.Backend
+		toolEntry             router.Entry[*mcp.Tool]
+		resourceEntry         router.Entry[*mcp.Resource]
+		resourceTemplateEntry router.Entry[*mcp.ResourceTemplate]
 	}
 	outcomes := make([]*outcome, len(configs))
 
@@ -164,24 +190,49 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 				_ = b.Close()
 				return
 			}
+			resources, err := b.ListResources(ctx)
+			if err != nil {
+				logger.Error("skipping backend: list resources failed", "backend", bc.Name, "error", err)
+				_ = b.Close()
+				return
+			}
+			resourceTemplates, err := b.ListResourceTemplates(ctx)
+			if err != nil {
+				logger.Error("skipping backend: list resource templates failed", "backend", bc.Name, "error", err)
+				_ = b.Close()
+				return
+			}
 			outcomes[i] = &outcome{
 				backend: b,
-				entry:   router.Entry[*mcp.Tool]{BackendName: bc.Name, Prefix: bc.Prefix, Items: tools},
+				toolEntry: router.Entry[*mcp.Tool]{
+					BackendName: bc.Name, Prefix: bc.Prefix, Items: tools,
+				},
+				// resource/resource template entries never carry a prefix:
+				// URIs already encode a backend-specific namespace, and
+				// string-concatenating a prefix onto one would produce an
+				// invalid URI.
+				resourceEntry: router.Entry[*mcp.Resource]{
+					BackendName: bc.Name, Items: resources,
+				},
+				resourceTemplateEntry: router.Entry[*mcp.ResourceTemplate]{
+					BackendName: bc.Name, Items: resourceTemplates,
+				},
 			}
 		}(i, bc)
 	}
 	wg.Wait()
 
-	backends := make(map[string]*backend.Backend, len(configs))
-	entries := make([]router.Entry[*mcp.Tool], 0, len(configs))
+	result := connected{backends: make(map[string]*backend.Backend, len(configs))}
 	for _, o := range outcomes {
 		if o == nil {
 			continue
 		}
-		backends[o.entry.BackendName] = o.backend
-		entries = append(entries, o.entry)
+		result.backends[o.toolEntry.BackendName] = o.backend
+		result.toolEntries = append(result.toolEntries, o.toolEntry)
+		result.resourceEntries = append(result.resourceEntries, o.resourceEntry)
+		result.resourceTemplateEntries = append(result.resourceTemplateEntries, o.resourceTemplateEntry)
 	}
-	return backends, entries
+	return result
 }
 
 func toolNameOf(t *mcp.Tool) string { return t.Name }
@@ -189,5 +240,21 @@ func toolNameOf(t *mcp.Tool) string { return t.Name }
 func toolRename(t *mcp.Tool, name string) *mcp.Tool {
 	c := *t
 	c.Name = name
+	return &c
+}
+
+func resourceNameOf(r *mcp.Resource) string { return r.URI }
+
+func resourceRename(r *mcp.Resource, name string) *mcp.Resource {
+	c := *r
+	c.URI = name
+	return &c
+}
+
+func resourceTemplateNameOf(t *mcp.ResourceTemplate) string { return t.URITemplate }
+
+func resourceTemplateRename(t *mcp.ResourceTemplate, name string) *mcp.ResourceTemplate {
+	c := *t
+	c.URITemplate = name
 	return &c
 }

@@ -61,19 +61,19 @@ func runCall(ctx context.Context, cmd *cobra.Command, configPath, toolName, args
 	// (prefix/overrides applied), so it exercises the exact path a client
 	// would.
 	logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil))
-	backends, entries := connectBackends(ctx, logger, cfg.Backends)
+	conn := connectBackends(ctx, logger, cfg.Backends)
 	defer func() {
-		for _, b := range backends {
+		for _, b := range conn.backends {
 			_ = b.Close()
 		}
 	}()
 
-	table := router.Resolve(entries, toolNameOf, toolRename, cfg.Overrides)
+	table := router.Resolve(conn.toolEntries, toolNameOf, toolRename, cfg.Overrides)
 	resolved, ok := table.Items[toolName]
 	if !ok {
 		return fmt.Errorf("unknown tool %q", toolName)
 	}
-	b := backends[resolved.BackendName]
+	b := conn.backends[resolved.BackendName]
 
 	result, err := b.Session.CallTool(ctx, &mcp.CallToolParams{Name: resolved.OriginalName, Arguments: arguments})
 	if err != nil {

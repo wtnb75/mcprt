@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wtnb75/mcprt/internal/backend"
 	"github.com/wtnb75/mcprt/internal/config"
 )
 
@@ -59,9 +58,9 @@ func TestConnectBackends_TimesOutHungBackend(t *testing.T) {
 	}
 
 	done := make(chan struct{})
-	var backends map[string]*backend.Backend
+	var conn connected
 	go func() {
-		backends, _ = connectBackends(context.Background(), logger, configs)
+		conn = connectBackends(context.Background(), logger, configs)
 		close(done)
 	}()
 
@@ -70,7 +69,7 @@ func TestConnectBackends_TimesOutHungBackend(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("connectBackends did not return within 10s of backendConnectTimeout elapsing")
 	}
-	if len(backends) != 0 {
-		t.Fatalf("backends = %v, want none (the hung backend should be excluded)", backends)
+	if len(conn.backends) != 0 {
+		t.Fatalf("backends = %v, want none (the hung backend should be excluded)", conn.backends)
 	}
 }

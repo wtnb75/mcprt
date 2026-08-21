@@ -75,14 +75,14 @@ func runList(ctx context.Context, cmd *cobra.Command, configPath string, jsonOut
 	// and print the routing table; it never starts a listener, so every
 	// connection is closed again before returning.
 	logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil))
-	backends, entries := connectBackends(ctx, logger, cfg.Backends)
+	conn := connectBackends(ctx, logger, cfg.Backends)
 	defer func() {
-		for _, b := range backends {
+		for _, b := range conn.backends {
 			_ = b.Close()
 		}
 	}()
 
-	table := router.Resolve(entries, toolNameOf, toolRename, cfg.Overrides)
+	table := router.Resolve(conn.toolEntries, toolNameOf, toolRename, cfg.Overrides)
 
 	if jsonOutput {
 		return printListJSON(cmd, listToolDetails(table), listConflicts(table))

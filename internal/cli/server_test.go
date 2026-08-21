@@ -99,6 +99,74 @@ backends:
 	}
 }
 
+func TestServerCommand_ServesAggregatedResources(t *testing.T) {
+	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	backendSrv.AddResource(&mcp.Resource{URI: "file:///a", Name: "a"},
+		func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+			return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: req.Params.URI, Text: "hello"}}}, nil
+		})
+	backendSrv.AddResourceTemplate(&mcp.ResourceTemplate{URITemplate: "file:///dir/{f}", Name: "dir"},
+		func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+			return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: req.Params.URI, Text: req.Params.URI}}}, nil
+		})
+	backendHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil))
+	defer backendHTTP.Close()
+
+	gatewayAddr := freePort(t)
+	configPath := writeConfig(t, fmt.Sprintf(`
+listen:
+  http: %q
+
+backends:
+  - name: fake
+    transport: http
+    url: %q
+`, gatewayAddr, backendHTTP.URL))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	execErr := make(chan error, 1)
+	go func() {
+		execErr <- cli.Execute(ctx, []string{"server", "--config", configPath})
+	}()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	var session *mcp.ClientSession
+	var connectErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		session, connectErr = client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: "http://" + gatewayAddr}, nil)
+		if connectErr == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if connectErr != nil {
+		t.Fatalf("connecting to gateway: %v", connectErr)
+	}
+
+	res, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: "file:///a"})
+	if err != nil {
+		t.Fatalf("ReadResource(file:///a): %v", err)
+	}
+	if len(res.Contents) != 1 || res.Contents[0].Text != "hello" {
+		t.Fatalf("ReadResource(file:///a) = %+v, want text \"hello\"", res.Contents)
+	}
+
+	res, err = session.ReadResource(ctx, &mcp.ReadResourceParams{URI: "file:///dir/x"})
+	if err != nil {
+		t.Fatalf("ReadResource(file:///dir/x): %v", err)
+	}
+	if len(res.Contents) != 1 || res.Contents[0].Text != "file:///dir/x" {
+		t.Fatalf("ReadResource(file:///dir/x) = %+v, want text \"file:///dir/x\" (template match forwards actual URI)", res.Contents)
+	}
+	_ = session.Close()
+
+	cancel()
+	if err := <-execErr; err != nil {
+		t.Fatalf("server exited with error: %v", err)
+	}
+}
+
 // TestServerCommand_StdioShutdownIsClean covers the stdio listener's
 // shutdown path: gateway.ServeStdio returns ctx.Err() when the context is
 // cancelled, and a cancelled context is a clean shutdown, not a failure the
