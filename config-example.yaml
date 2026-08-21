@@ -15,3 +15,6 @@ overrides:
 
 resource_overrides:
   "file:///example/data.txt": example
+
+prompt_overrides:
+  example_prompt: example
