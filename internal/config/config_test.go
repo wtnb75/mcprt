@@ -496,3 +496,38 @@ prompt_overrides:
 		t.Fatal("Parse: expected error for prompt_overrides referencing unknown backend, got nil")
 	}
 }
+
+func TestParse_LoggingMaskKeys(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+logging:
+  mask_keys: ["internal_id", "session_token"]
+`)
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.Logging.MaskKeys) != 2 || cfg.Logging.MaskKeys[0] != "internal_id" || cfg.Logging.MaskKeys[1] != "session_token" {
+		t.Fatalf("Logging.MaskKeys = %v, want [internal_id session_token]", cfg.Logging.MaskKeys)
+	}
+}
+
+func TestParse_LoggingMaskKeysDefaultEmpty(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+`)
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.Logging.MaskKeys) != 0 {
+		t.Fatalf("Logging.MaskKeys = %v, want empty", cfg.Logging.MaskKeys)
+	}
+}

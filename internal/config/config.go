@@ -26,6 +26,7 @@ type Config struct {
 	ResourceOverrides         map[string]string `yaml:"resource_overrides,omitempty"`
 	ResourceTemplateOverrides map[string]string `yaml:"resource_template_overrides,omitempty"`
 	PromptOverrides           map[string]string `yaml:"prompt_overrides,omitempty"`
+	Logging                   LoggingConfig     `yaml:"logging,omitempty"`
 }
 
 // ListenConfig controls which client-facing transports the gateway serves.
@@ -66,6 +67,15 @@ type DockerConfig struct {
 	Image string            `yaml:"image"`          // required
 	Args  []string          `yaml:"args,omitempty"` // extra arguments appended to "run", e.g. ["-v", "/data:/data"]
 	Env   map[string]string `yaml:"env,omitempty"`  // env vars for the local CLI process itself (e.g. DOCKER_HOST), not the container; backends[].env is the container's env
+}
+
+// LoggingConfig controls audit-log behavior beyond what --log-level/--log-format
+// (CLI flags) cover.
+type LoggingConfig struct {
+	// MaskKeys are extra case-insensitive substrings matched against
+	// argument key names, in addition to the built-in defaultMaskKeyPatterns
+	// ("key", "auth", "pass", "cred", "token") gateway.maskArguments uses.
+	MaskKeys []string `yaml:"mask_keys,omitempty"`
 }
 
 // Load reads and parses the config file at path.
