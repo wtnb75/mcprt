@@ -254,6 +254,28 @@ func newFakeResourceTemplateBackendServer(name, uriTemplate string) *mcp.Server 
 	return srv
 }
 
+func newFakePromptBackendServer(name string, promptNames ...string) *mcp.Server {
+	srv := mcp.NewServer(&mcp.Implementation{Name: name, Version: "v1"}, nil)
+	for _, promptName := range promptNames {
+		srv.AddPrompt(&mcp.Prompt{Name: promptName, Description: "fake prompt " + promptName},
+			func(ctx context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+				return &mcp.GetPromptResult{Messages: []*mcp.PromptMessage{{
+					Role:    "user",
+					Content: &mcp.TextContent{Text: name + ":" + req.Params.Name},
+				}}}, nil
+			})
+	}
+	return srv
+}
+
+func promptNameOf(p *mcp.Prompt) string { return p.Name }
+
+func promptRename(p *mcp.Prompt, name string) *mcp.Prompt {
+	c := *p
+	c.Name = name
+	return &c
+}
+
 // TestGateway_ResourceReadExact checks that resources/read for an exact
 // registered URI is forwarded to the owning backend and its result
 // returned unchanged.
@@ -415,5 +437,191 @@ func TestGateway_ResourceFallsBackWhenWinnerURIInvalid(t *testing.T) {
 	}
 	if len(res.Contents) != 1 || res.Contents[0].Text != "backend-b" {
 		t.Fatalf("ReadResource result = %+v, want text \"backend-b\" (the fallback)", res.Contents)
+	}
+}
+
+// TestGateway_PromptGetForwardsArgumentsAndResult checks that prompts/get
+// for a registered prompt is forwarded to the owning backend with the
+// caller's arguments, and the backend's result is returned unchanged.
+func TestGateway_PromptGetForwardsArgumentsAndResult(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendServer := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	backendServer.AddPrompt(&mcp.Prompt{Name: "greet"},
+		func(ctx context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{Messages: []*mcp.PromptMessage{{
+				Role:    "user",
+				Content: &mcp.TextContent{Text: "hello " + req.Params.Arguments["name"]},
+			}}}, nil
+		})
+	httpBackend := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpBackend.Close()
+
+	ctx := context.Background()
+	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "backend", Transport: "http", URL: httpBackend.URL})
+	if err != nil {
+		t.Fatalf("connect backend: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	prompts, err := conn.ListPrompts(ctx)
+	if err != nil {
+		t.Fatalf("list backend prompts: %v", err)
+	}
+
+	table := router.Resolve([]router.Entry[*mcp.Prompt]{{BackendName: "backend", Items: prompts}}, promptNameOf, promptRename, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend": conn}, gateway.Tables{Prompts: table})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "greet", Arguments: map[string]string{"name": "world"}})
+	if err != nil {
+		t.Fatalf("GetPrompt(greet): %v", err)
+	}
+	if len(res.Messages) != 1 {
+		t.Fatalf("GetPrompt(greet) messages = %+v, want 1", res.Messages)
+	}
+	text, ok := res.Messages[0].Content.(*mcp.TextContent)
+	if !ok || text.Text != "hello world" {
+		t.Fatalf("GetPrompt(greet) content = %+v, want text \"hello world\"", res.Messages[0].Content)
+	}
+}
+
+// TestGateway_PromptRoutesByPriorityAndExposesUniquePrompts checks
+// conflict resolution and prompts/list for two backends that share one
+// prompt name and each also expose a unique one.
+func TestGateway_PromptRoutesByPriorityAndExposesUniquePrompts(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendAServer := newFakePromptBackendServer("backend-a", "review", "unique_a")
+	backendBServer := newFakePromptBackendServer("backend-b", "review", "unique_b")
+
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendAServer }, nil))
+	defer httpA.Close()
+	httpB := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendBServer }, nil))
+	defer httpB.Close()
+
+	ctx := context.Background()
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = connA.Close() }()
+	connB, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-b", Transport: "http", URL: httpB.URL})
+	if err != nil {
+		t.Fatalf("connect backend-b: %v", err)
+	}
+	defer func() { _ = connB.Close() }()
+
+	promptsA, err := connA.ListPrompts(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a prompts: %v", err)
+	}
+	promptsB, err := connB.ListPrompts(ctx)
+	if err != nil {
+		t.Fatalf("list backend-b prompts: %v", err)
+	}
+
+	table := router.Resolve([]router.Entry[*mcp.Prompt]{
+		{BackendName: "backend-a", Items: promptsA},
+		{BackendName: "backend-b", Items: promptsB},
+	}, promptNameOf, promptRename, nil)
+
+	if len(table.Conflicts) != 1 || table.Conflicts[0].ExposedName != "review" || table.Conflicts[0].Winner != "backend-a" {
+		t.Fatalf("unexpected conflicts: %+v", table.Conflicts)
+	}
+
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA, "backend-b": connB}, gateway.Tables{Prompts: table})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	var names []string
+	for prompt, err := range session.Prompts(ctx, nil) {
+		if err != nil {
+			t.Fatalf("list gateway prompts: %v", err)
+		}
+		names = append(names, prompt.Name)
+	}
+	sort.Strings(names)
+	want := []string{"review", "unique_a", "unique_b"}
+	if !slices.Equal(names, want) {
+		t.Fatalf("prompts/list = %v, want %v", names, want)
+	}
+
+	res, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "review"})
+	if err != nil {
+		t.Fatalf("GetPrompt(review): %v", err)
+	}
+	text, ok := res.Messages[0].Content.(*mcp.TextContent)
+	if !ok || text.Text != "backend-a:review" {
+		t.Fatalf("GetPrompt(review) content = %+v, want text \"backend-a:review\" (the conflict winner)", res.Messages[0].Content)
+	}
+
+	res, err = session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "unique_b"})
+	if err != nil {
+		t.Fatalf("GetPrompt(unique_b): %v", err)
+	}
+	text, ok = res.Messages[0].Content.(*mcp.TextContent)
+	if !ok || text.Text != "backend-b:unique_b" {
+		t.Fatalf("GetPrompt(unique_b) content = %+v, want text \"backend-b:unique_b\"", res.Messages[0].Content)
+	}
+}
+
+// TestGateway_PromptGetOnDeadBackendReturnsError checks that a prompts/get
+// call to a backend that is no longer reachable surfaces the error to the
+// client, the same way TestGateway_CallOnDeadBackendReturnsError already
+// checks for tools/call.
+func TestGateway_PromptGetOnDeadBackendReturnsError(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendServer := newFakePromptBackendServer("backend-dead", "boom")
+	httpBackend := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpBackend.Close()
+
+	ctx := context.Background()
+	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-dead", Transport: "http", URL: httpBackend.URL})
+	if err != nil {
+		t.Fatalf("connect backend-dead: %v", err)
+	}
+	prompts, err := conn.ListPrompts(ctx)
+	if err != nil {
+		t.Fatalf("list backend-dead prompts: %v", err)
+	}
+
+	table := router.Resolve([]router.Entry[*mcp.Prompt]{{BackendName: "backend-dead", Items: prompts}}, promptNameOf, promptRename, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, gateway.Tables{Prompts: table})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close backend-dead: %v", err)
+	}
+
+	_, err = session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "boom"})
+	if err == nil {
+		t.Fatal("GetPrompt(boom) on dead backend: got no error, want one")
 	}
 }

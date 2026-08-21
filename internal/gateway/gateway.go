@@ -15,18 +15,19 @@ import (
 )
 
 // Tables bundles the independent routing tables the gateway serves: tools,
-// resources, and resource templates. They are built once at startup and
-// never change while the gateway runs.
+// resources, resource templates, and prompts. They are built once at startup
+// and never change while the gateway runs.
 type Tables struct {
 	Tools             *router.Table[*mcp.Tool]
 	Resources         *router.Table[*mcp.Resource]
 	ResourceTemplates *router.Table[*mcp.ResourceTemplate]
+	Prompts           *router.Table[*mcp.Prompt]
 }
 
-// New builds an mcp.Server that exposes tables' resolved tools/resources,
-// forwarding each call to the backend that owns it. backends must contain
-// an entry for every BackendName referenced in tables (the caller builds
-// both from the same set of connected backends).
+// New builds an mcp.Server that exposes tables' resolved
+// tools/resources/prompts, forwarding each call to the backend that owns
+// it. backends must contain an entry for every BackendName referenced in
+// tables (the caller builds both from the same set of connected backends).
 func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Tables) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{Logger: logger})
 
@@ -43,6 +44,11 @@ func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Table
 	if tables.ResourceTemplates != nil {
 		for _, resolved := range tables.ResourceTemplates.Items {
 			registerResourceTemplate(srv, logger, backends, resolved)
+		}
+	}
+	if tables.Prompts != nil {
+		for _, resolved := range tables.Prompts.Items {
+			registerPrompt(srv, logger, backends, resolved)
 		}
 	}
 
@@ -164,6 +170,31 @@ func addResourceTemplate(srv *mcp.Server, logger *slog.Logger, t *mcp.ResourceTe
 	}()
 	srv.AddResourceTemplate(t, h)
 	return true
+}
+
+// registerPrompt registers resolved.Item on srv. Unlike registerTool and
+// registerResource, there is no panic-recovery/fallback loop here:
+// mcp.Server.AddPrompt performs no schema validation and cannot panic (a
+// Prompt has no JSON-Schema-bearing field for it to reject), so the winner
+// is always registerable.
+func registerPrompt(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Prompt]) {
+	b := backends[resolved.BackendName]
+	srv.AddPrompt(resolved.Item, promptGetHandler(logger, b, resolved.OriginalName))
+}
+
+// promptGetHandler forwards prompts/get to originalName on backend b,
+// passing the caller's arguments through unchanged.
+func promptGetHandler(logger *slog.Logger, b *backend.Backend, originalName string) mcp.PromptHandler {
+	return func(ctx context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+		result, err := b.Session.GetPrompt(ctx, &mcp.GetPromptParams{
+			Name:      originalName,
+			Arguments: req.Params.Arguments,
+		})
+		if err != nil {
+			logger.Error("backend call failed", "backend", b.Name, "prompt", originalName, "error", err)
+		}
+		return result, err
+	}
 }
 
 // callHandler forwards a tools/call to originalName on backend b, passing
