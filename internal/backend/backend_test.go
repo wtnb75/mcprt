@@ -16,6 +16,9 @@ import (
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/wtnb75/mcprt/internal/backend"
 	"github.com/wtnb75/mcprt/internal/config"
@@ -457,5 +460,84 @@ func TestConnect_UnknownTransport(t *testing.T) {
 	_, err := backend.Connect(context.Background(), config.BackendConfig{Name: "bad", Transport: "carrier-pigeon"})
 	if err == nil {
 		t.Fatal("Connect: expected error for unknown transport, got nil")
+	}
+}
+
+func TestConnect_HTTP_InjectsTraceparentWhenSpanActive(t *testing.T) {
+	prevTP := otel.GetTracerProvider()
+	prevProp := otel.GetTextMapPropagator()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider())
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+		otel.SetTextMapPropagator(prevProp)
+	})
+
+	var gotHeader string
+	seen := false
+	mcpHandler := newFakeMCPHandler()
+	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !seen {
+			gotHeader = r.Header.Get("traceparent")
+			seen = true
+		}
+		mcpHandler.ServeHTTP(w, r)
+	})
+	srv := httptest.NewServer(wrapped)
+	defer srv.Close()
+
+	tracer := otel.Tracer("test")
+	ctx, span := tracer.Start(context.Background(), "test-call")
+	defer span.End()
+
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	if _, err := b.ListTools(ctx); err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	if gotHeader == "" {
+		t.Fatal("no traceparent header was injected on the outbound request despite an active span in ctx")
+	}
+}
+
+func TestConnect_HTTP_NoTraceparentWithoutActiveSpan(t *testing.T) {
+	prevTP := otel.GetTracerProvider()
+	prevProp := otel.GetTextMapPropagator()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider())
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+		otel.SetTextMapPropagator(prevProp)
+	})
+
+	var gotHeader string
+	seen := false
+	mcpHandler := newFakeMCPHandler()
+	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !seen {
+			gotHeader = r.Header.Get("traceparent")
+			seen = true
+		}
+		mcpHandler.ServeHTTP(w, r)
+	})
+	srv := httptest.NewServer(wrapped)
+	defer srv.Close()
+
+	ctx := context.Background()
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	if _, err := b.ListTools(ctx); err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	if gotHeader != "" {
+		t.Fatalf("traceparent = %q, want none for a ctx with no active span", gotHeader)
 	}
 }

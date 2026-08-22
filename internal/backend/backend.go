@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/wtnb75/mcprt/internal/config"
 )
@@ -50,7 +52,7 @@ func Connect(ctx context.Context, cfg config.BackendConfig) (*Backend, error) {
 		}
 		transport = &mcp.StreamableClientTransport{
 			Endpoint:   cfg.URL,
-			HTTPClient: &http.Client{Transport: headerRoundTripper{headers: cfg.Headers, base: base}},
+			HTTPClient: &http.Client{Transport: tracingRoundTripper{base: headerRoundTripper{headers: cfg.Headers, base: base}}},
 		}
 	default:
 		return nil, fmt.Errorf("backend %q: unknown transport %q", cfg.Name, cfg.Transport)
@@ -261,4 +263,19 @@ func (h headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 		req.Header.Set(k, v)
 	}
 	return h.base.RoundTrip(req)
+}
+
+// tracingRoundTripper injects the current span's trace context into
+// outbound requests to an HTTP backend, so a call that arrived over HTTP
+// (and therefore has an active span in ctx) continues the same trace on the
+// backend side. It does not start its own span -- the handler's span
+// already covers the call's duration; a bare stdio-originated ctx carries
+// no span, so Inject is a no-op and no traceparent header is sent.
+type tracingRoundTripper struct {
+	base http.RoundTripper
+}
+
+func (t tracingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	otel.GetTextMapPropagator().Inject(req.Context(), propagation.HeaderCarrier(req.Header))
+	return t.base.RoundTrip(req)
 }
