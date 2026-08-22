@@ -239,7 +239,7 @@ var shutdownTimeout = 5 * time.Second
 // ServeHTTP runs srv as a Streamable HTTP server listening on addr, until
 // ctx is cancelled.
 func ServeHTTP(ctx context.Context, srv *mcp.Server, addr string) error {
-	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil)
+	handler := remoteAddrMiddleware(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 	httpServer := &http.Server{Addr: addr, Handler: handler}
 
 	errCh := make(chan error, 1)

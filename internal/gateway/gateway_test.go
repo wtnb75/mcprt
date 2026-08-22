@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -806,4 +808,76 @@ func findLogLine(t *testing.T, out, wantMsg string) map[string]any {
 	}
 	t.Fatalf("log output = %q, want a line with msg=%q", out, wantMsg)
 	return nil
+}
+
+// TestGateway_ServeHTTP_LogsRemoteAddr checks that a call served through the
+// real ServeHTTP (unlike the other tests in this file, which wrap srv in a
+// bare mcp.NewStreamableHTTPHandler) carries a remote_addr field in its
+// audit log line, via ServeHTTP's remoteAddrMiddleware.
+func TestGateway_ServeHTTP_LogsRemoteAddr(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	backendServer := newFakeBackendServer("backend-a", "ping")
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpA.Close()
+
+	ctx := context.Background()
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = connA.Close() }()
+
+	toolsA, err := connA.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a tools: %v", err)
+	}
+	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-a", Items: toolsA}}, toolNameOf, toolRename, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Tools: table}, nil)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("closing probe listener: %v", err)
+	}
+
+	gwCtx, cancel := context.WithCancel(context.Background())
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- gateway.ServeHTTP(gwCtx, srv, addr) }()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	var session *mcp.ClientSession
+	var connectErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		session, connectErr = client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: "http://" + addr}, nil)
+		if connectErr == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if connectErr != nil {
+		t.Fatalf("connecting to gateway: %v", connectErr)
+	}
+
+	_, err = session.CallTool(ctx, &mcp.CallToolParams{Name: "ping", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatalf("call ping: %v", err)
+	}
+	_ = session.Close()
+
+	cancel()
+	if err := <-serveErr; err != nil {
+		t.Fatalf("ServeHTTP exited with error: %v", err)
+	}
+
+	rec := findLogLine(t, buf.String(), "tool call")
+	addrField, ok := rec["remote_addr"].(string)
+	if !ok || !strings.HasPrefix(addrField, "127.0.0.1:") {
+		t.Fatalf("remote_addr = %v, want a 127.0.0.1:<port> string", rec["remote_addr"])
+	}
 }
