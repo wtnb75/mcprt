@@ -250,12 +250,6 @@ func TestConnectBackends_LogsSuccessfulConnect(t *testing.T) {
 	}
 }
 
-// TestRunServer_LogsListening checks runServer logs its listener
-// configuration once at startup, before any listener goroutine starts. It
-// swaps os.Stdin the same way TestServerCommand_StdioShutdownIsClean
-// (server_test.go) does, so ServeStdio blocks on a pipe instead of the real
-// stdin; this must not run with t.Parallel() (nor alongside another test
-// touching os.Stdin).
 func TestParseLogFormat(t *testing.T) {
 	if _, err := parseLogFormat("text"); err != nil {
 		t.Fatalf("parseLogFormat(\"text\"): %v", err)
@@ -282,6 +276,12 @@ func TestParseLogFormat(t *testing.T) {
 	}
 }
 
+// TestRunServer_LogsListening checks runServer logs its listener
+// configuration once at startup, before any listener goroutine starts. It
+// swaps os.Stdin the same way TestServerCommand_StdioShutdownIsClean
+// (server_test.go) does, so ServeStdio blocks on a pipe instead of the real
+// stdin; this must not run with t.Parallel() (nor alongside another test
+// touching os.Stdin).
 func TestRunServer_LogsListening(t *testing.T) {
 	r, w, err := os.Pipe()
 	if err != nil {
