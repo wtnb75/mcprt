@@ -6,7 +6,7 @@ HTTP servers) behind a single MCP gateway endpoint, relaying `tools/*`,
 
 ## Usage
 
-    mcprt server --config config.yaml [--log-level info]
+    mcprt server --config config.yaml [--log-level info] [--log-format text]
 
 ## Configuration
 

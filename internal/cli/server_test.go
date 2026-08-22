@@ -508,3 +508,11 @@ func TestServerCommand_NoListenerConfigured(t *testing.T) {
 		t.Fatal("Execute: expected error when no listener is configured, got nil")
 	}
 }
+
+func TestServerCommand_LogFormatInvalid(t *testing.T) {
+	configPath := writeConfig(t, "listen:\n  stdio: true\n\nbackends: []\n")
+	err := cli.Execute(context.Background(), []string{"server", "--config", configPath, "--log-format", "bogus"})
+	if err == nil {
+		t.Fatal("Execute: expected error for invalid --log-format, got nil")
+	}
+}

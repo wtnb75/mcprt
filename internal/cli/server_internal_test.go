@@ -256,6 +256,32 @@ func TestConnectBackends_LogsSuccessfulConnect(t *testing.T) {
 // (server_test.go) does, so ServeStdio blocks on a pipe instead of the real
 // stdin; this must not run with t.Parallel() (nor alongside another test
 // touching os.Stdin).
+func TestParseLogFormat(t *testing.T) {
+	if _, err := parseLogFormat("text"); err != nil {
+		t.Fatalf("parseLogFormat(\"text\"): %v", err)
+	}
+	if _, err := parseLogFormat("json"); err != nil {
+		t.Fatalf("parseLogFormat(\"json\"): %v", err)
+	}
+	if _, err := parseLogFormat("bogus"); err == nil {
+		t.Fatal("parseLogFormat(\"bogus\"): expected error, got nil")
+	}
+
+	newHandler, err := parseLogFormat("json")
+	if err != nil {
+		t.Fatalf("parseLogFormat(\"json\"): %v", err)
+	}
+	var buf bytes.Buffer
+	logger := slog.New(newHandler(&buf, nil))
+	logger.Info("hello")
+	var rec struct {
+		Msg string `json:"msg"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil || rec.Msg != "hello" {
+		t.Fatalf("json handler output = %q, want a JSON line with msg=hello", buf.String())
+	}
+}
+
 func TestRunServer_LogsListening(t *testing.T) {
 	r, w, err := os.Pipe()
 	if err != nil {

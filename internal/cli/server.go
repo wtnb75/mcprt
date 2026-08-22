@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"time"
@@ -27,6 +28,7 @@ var backendConnectTimeout = 30 * time.Second
 func newServerCmd() *cobra.Command {
 	var configPath string
 	var logLevel string
+	var logFormat string
 
 	// SilenceUsage/SilenceErrors: don't dump flag usage on a runtime error
 	// (bad config, backend failure, etc.), and let cli.Execute's caller
@@ -41,13 +43,18 @@ func newServerCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), &slog.HandlerOptions{Level: level}))
+			newHandler, err := parseLogFormat(logFormat)
+			if err != nil {
+				return err
+			}
+			logger := slog.New(newHandler(cmd.ErrOrStderr(), &slog.HandlerOptions{Level: level}))
 			return runServer(cmd.Context(), logger, configPath)
 		},
 	}
 
 	cmd.Flags().StringVar(&configPath, "config", "", "path to the gateway config file (required)")
 	cmd.Flags().StringVar(&logLevel, "log-level", "info", "log level: debug, info, warn, error")
+	cmd.Flags().StringVar(&logFormat, "log-format", "text", "log format: text or json")
 	if err := cmd.MarkFlagRequired("config"); err != nil {
 		panic(err) // programmer error: "config" flag name must match Flags().StringVar above
 	}
@@ -67,6 +74,17 @@ func parseLogLevel(s string) (slog.Level, error) {
 		return slog.LevelError, nil
 	default:
 		return 0, fmt.Errorf("unknown log level %q (want debug, info, warn, or error)", s)
+	}
+}
+
+func parseLogFormat(s string) (func(io.Writer, *slog.HandlerOptions) slog.Handler, error) {
+	switch s {
+	case "text":
+		return func(w io.Writer, o *slog.HandlerOptions) slog.Handler { return slog.NewTextHandler(w, o) }, nil
+	case "json":
+		return func(w io.Writer, o *slog.HandlerOptions) slog.Handler { return slog.NewJSONHandler(w, o) }, nil
+	default:
+		return nil, fmt.Errorf("unknown log format %q (want text or json)", s)
 	}
 }
 
