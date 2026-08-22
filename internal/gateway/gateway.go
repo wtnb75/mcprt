@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/wtnb75/mcprt/internal/backend"
 	"github.com/wtnb75/mcprt/internal/router"
@@ -102,7 +103,13 @@ func registerResource(srv *mcp.Server, logger *slog.Logger, backends map[string]
 func resourceReadHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, originalURI string) mcp.ResourceHandler {
 	return func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
 		start := time.Now()
+		ctx, span := startCallSpan(ctx, req.Extra, "resources/read",
+			attribute.String("mcp.backend", b.Name),
+			attribute.String("mcp.resource.uri", originalURI))
+		defer span.End()
+
 		result, err := b.Session.ReadResource(ctx, &mcp.ReadResourceParams{URI: originalURI})
+		recordOutcome(span, err)
 		logCall(ctx, logger, "resource", "uri", originalURI, b.Name, req.Session, nil, maskKeys, start, err)
 		return result, err
 	}
@@ -150,7 +157,13 @@ func registerResourceTemplate(srv *mcp.Server, logger *slog.Logger, backends map
 func resourceTemplateReadHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend) mcp.ResourceHandler {
 	return func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
 		start := time.Now()
+		ctx, span := startCallSpan(ctx, req.Extra, "resources/templates/read",
+			attribute.String("mcp.backend", b.Name),
+			attribute.String("mcp.resource.uri", req.Params.URI))
+		defer span.End()
+
 		result, err := b.Session.ReadResource(ctx, &mcp.ReadResourceParams{URI: req.Params.URI})
+		recordOutcome(span, err)
 		logCall(ctx, logger, "resource template", "uri", req.Params.URI, b.Name, req.Session, nil, maskKeys, start, err)
 		return result, err
 	}
@@ -185,26 +198,39 @@ func registerPrompt(srv *mcp.Server, logger *slog.Logger, backends map[string]*b
 func promptGetHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, originalName string) mcp.PromptHandler {
 	return func(ctx context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
 		start := time.Now()
+		ctx, span := startCallSpan(ctx, req.Extra, "prompts/get",
+			attribute.String("mcp.backend", b.Name),
+			attribute.String("mcp.prompt.name", originalName))
+		defer span.End()
+
 		result, err := b.Session.GetPrompt(ctx, &mcp.GetPromptParams{
 			Name:      originalName,
 			Arguments: req.Params.Arguments,
 		})
+		recordOutcome(span, err)
 		logCall(ctx, logger, "prompt", "prompt", originalName, b.Name, req.Session, req.Params.Arguments, maskKeys, start, err)
 		return result, err
 	}
 }
 
 // callHandler forwards a tools/call to originalName on backend b, passing
-// the raw arguments through unchanged. Every call is logged via logCall,
-// success or failure, so a dead or erroring backend — and normal usage — is
-// visible to the operator.
+// the raw arguments through unchanged. It wraps the call in a span
+// (startCallSpan is a no-op for stdio-originated calls) and logs it via
+// logCall, success or failure, so a dead or erroring backend — and normal
+// usage — is visible to the operator.
 func callHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, originalName string) mcp.ToolHandler {
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		start := time.Now()
+		ctx, span := startCallSpan(ctx, req.Extra, "tools/call",
+			attribute.String("mcp.backend", b.Name),
+			attribute.String("mcp.tool.name", originalName))
+		defer span.End()
+
 		result, err := b.Session.CallTool(ctx, &mcp.CallToolParams{
 			Name:      originalName,
 			Arguments: req.Params.Arguments,
 		})
+		recordOutcome(span, err)
 		logCall(ctx, logger, "tool", "tool", originalName, b.Name, req.Session, req.Params.Arguments, maskKeys, start, err)
 		return result, err
 	}

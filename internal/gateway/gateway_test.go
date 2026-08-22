@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -17,12 +18,33 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/wtnb75/mcprt/internal/backend"
 	"github.com/wtnb75/mcprt/internal/config"
 	"github.com/wtnb75/mcprt/internal/gateway"
 	"github.com/wtnb75/mcprt/internal/router"
 )
+
+// testSpanExporter is the single, shared in-memory span exporter for this
+// whole test binary -- see TestMain and the Task 3 plan note above for why
+// each test that checks spans must Reset() it rather than installing its
+// own fresh TracerProvider.
+var testSpanExporter = tracetest.NewInMemoryExporter()
+
+// TestMain installs testSpanExporter's TracerProvider exactly once, before
+// any test runs, and sets a TraceContext propagator. This is the only
+// otel.SetTracerProvider call in this test binary.
+func TestMain(m *testing.M) {
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(testSpanExporter))
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	os.Exit(m.Run())
+}
 
 type sourceOutput struct {
 	Source string `json:"source"`
@@ -879,5 +901,158 @@ func TestGateway_ServeHTTP_LogsRemoteAddr(t *testing.T) {
 	addrField, ok := rec["remote_addr"].(string)
 	if !ok || !strings.HasPrefix(addrField, "127.0.0.1:") {
 		t.Fatalf("remote_addr = %v, want a 127.0.0.1:<port> string", rec["remote_addr"])
+	}
+}
+
+// TestGateway_CallCreatesSpanWithParentFromTraceparent checks the core
+// behavior change: a tool call arriving over HTTP with a traceparent
+// header now produces one span, continuing that trace, with the expected
+// name and attributes.
+func TestGateway_CallCreatesSpanWithParentFromTraceparent(t *testing.T) {
+	testSpanExporter.Reset()
+	exp := testSpanExporter
+
+	backendServer := newFakeBackendServer("backend-a", "ping")
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpA.Close()
+
+	ctx := context.Background()
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = connA.Close() }()
+
+	toolsA, err := connA.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a tools: %v", err)
+	}
+	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-a", Items: toolsA}}, toolNameOf, toolRename, nil)
+
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Tools: table}, nil)
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	defer gw.Close()
+
+	// Every outbound request from this client (including the tools/call
+	// POST) carries a fixed traceparent, simulating an already-traced
+	// upstream caller.
+	traceHeaders := http.Header{}
+	traceHeaders.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{
+		Endpoint:   gw.URL,
+		HTTPClient: &http.Client{Transport: headerSetRoundTripper{headers: traceHeaders, base: http.DefaultTransport}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "ping", Arguments: map[string]any{}}); err != nil {
+		t.Fatalf("call ping: %v", err)
+	}
+
+	var callSpan *tracetest.SpanStub
+	for i, s := range exp.GetSpans() {
+		if s.Name == "tools/call" {
+			callSpan = &exp.GetSpans()[i]
+			break
+		}
+	}
+	if callSpan == nil {
+		t.Fatalf("no \"tools/call\" span recorded; spans = %+v", exp.GetSpans())
+	}
+	if callSpan.Parent.TraceID().String() != "4bf92f3577b34da6a3ce929d0e0e4736" {
+		t.Fatalf("parent trace id = %s, want 4bf92f3577b34da6a3ce929d0e0e4736", callSpan.Parent.TraceID().String())
+	}
+	attrs := attribute.NewSet(callSpan.Attributes...)
+	if v, ok := attrs.Value("mcp.backend"); !ok || v.AsString() != "backend-a" {
+		t.Fatalf("mcp.backend attribute = %v (ok=%v), want backend-a", v, ok)
+	}
+	if v, ok := attrs.Value("mcp.tool.name"); !ok || v.AsString() != "ping" {
+		t.Fatalf("mcp.tool.name attribute = %v (ok=%v), want ping", v, ok)
+	}
+}
+
+// headerSetRoundTripper sets fixed headers on every outbound request,
+// simulating a client that already carries trace context (or any other
+// fixed header) on every request it sends — distinct from
+// internal/backend's headerRoundTripper, which is production code for
+// injecting configured backend-auth headers; this is test-only and lives
+// in the gateway_test package, testing the gateway's inbound side.
+type headerSetRoundTripper struct {
+	headers http.Header
+	base    http.RoundTripper
+}
+
+func (h headerSetRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	req = req.Clone(req.Context())
+	for k, vs := range h.headers {
+		for _, v := range vs {
+			req.Header.Set(k, v)
+		}
+	}
+	return h.base.RoundTrip(req)
+}
+
+// TestGateway_ResourceReadCreatesSpan checks that the resource-read
+// handler (a different attribute set than the tool handler) also produces
+// a span when called over HTTP, without a traceparent header this time
+// (exercising the "no inbound parent, so a new root span starts" path).
+func TestGateway_ResourceReadCreatesSpan(t *testing.T) {
+	testSpanExporter.Reset()
+	exp := testSpanExporter
+
+	backendServer := newFakeResourceBackendServer("backend-a", "file:///a.txt")
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpA.Close()
+
+	ctx := context.Background()
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = connA.Close() }()
+
+	resourcesA, err := connA.ListResources(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a resources: %v", err)
+	}
+	resourceNameOf := func(r *mcp.Resource) string { return r.URI }
+	resourceRename := func(r *mcp.Resource, name string) *mcp.Resource { c := *r; c.URI = name; return &c }
+	table := router.Resolve([]router.Entry[*mcp.Resource]{{BackendName: "backend-a", Items: resourcesA}}, resourceNameOf, resourceRename, nil)
+
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Resources: table}, nil)
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if _, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: "file:///a.txt"}); err != nil {
+		t.Fatalf("read resource: %v", err)
+	}
+
+	var readSpan *tracetest.SpanStub
+	for i, s := range exp.GetSpans() {
+		if s.Name == "resources/read" {
+			readSpan = &exp.GetSpans()[i]
+			break
+		}
+	}
+	if readSpan == nil {
+		t.Fatalf("no \"resources/read\" span recorded; spans = %+v", exp.GetSpans())
+	}
+	attrs := attribute.NewSet(readSpan.Attributes...)
+	if v, ok := attrs.Value("mcp.resource.uri"); !ok || v.AsString() != "file:///a.txt" {
+		t.Fatalf("mcp.resource.uri attribute = %v (ok=%v), want file:///a.txt", v, ok)
 	}
 }
