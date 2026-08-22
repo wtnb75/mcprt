@@ -16,6 +16,79 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+func TestHasArgs(t *testing.T) {
+	cases := []struct {
+		name string
+		args any
+		want bool
+	}{
+		{
+			name: "nil args",
+			args: nil,
+			want: false,
+		},
+		{
+			name: "empty json.RawMessage (typed nil from wire)",
+			args: json.RawMessage(nil),
+			want: false,
+		},
+		{
+			name: "json.RawMessage containing empty object {}",
+			args: json.RawMessage(`{}`),
+			want: false,
+		},
+		{
+			name: "json.RawMessage containing empty array []",
+			args: json.RawMessage(`[]`),
+			want: false,
+		},
+		{
+			name: "non-empty json.RawMessage",
+			args: json.RawMessage(`{"user":"alice"}`),
+			want: true,
+		},
+		{
+			name: "empty map[string]string",
+			args: map[string]string{},
+			want: false,
+		},
+		{
+			name: "nil map[string]string (typed nil)",
+			args: func() map[string]string { var m map[string]string; return m }(),
+			want: false,
+		},
+		{
+			name: "non-empty map[string]string",
+			args: map[string]string{"name": "world"},
+			want: true,
+		},
+		{
+			name: "empty map[string]any (tool call with empty Arguments)",
+			args: map[string]any{},
+			want: false,
+		},
+		{
+			name: "non-empty map[string]any",
+			args: map[string]any{"user": "alice"},
+			want: true,
+		},
+		{
+			name: "other types return true",
+			args: "string",
+			want: true,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := hasArgs(c.args)
+			if got != c.want {
+				t.Fatalf("hasArgs(%#v) = %v, want %v", c.args, got, c.want)
+			}
+		})
+	}
+}
+
 func TestMaskArguments(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -135,6 +208,42 @@ func TestLogCall_Failure(t *testing.T) {
 	}
 	if _, ok := rec["arguments"]; ok {
 		t.Fatalf("log line %v has arguments, want it omitted (nil args)", rec)
+	}
+}
+
+func TestLogCall_ToolCallNoArguments(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	sess := &mcp.ServerSession{}
+
+	// Tool call with no Arguments set (typed-nil json.RawMessage on wire)
+	logCall(context.Background(), logger, "tool", "tool", "mytool", "backend-a", sess,
+		json.RawMessage(nil), nil, time.Now(), nil)
+
+	rec := decodeLastLogLine(t, buf.String())
+	if rec["msg"] != "tool call" {
+		t.Fatalf("msg = %v, want %q", rec["msg"], "tool call")
+	}
+	if _, ok := rec["arguments"]; ok {
+		t.Fatalf("log line %v has arguments field, want it omitted for typed-nil json.RawMessage", rec)
+	}
+}
+
+func TestLogCall_PromptCallNoArguments(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	sess := &mcp.ServerSession{}
+
+	// Prompt call with no Arguments (empty map[string]string)
+	logCall(context.Background(), logger, "prompt", "prompt", "myprompt", "backend-a", sess,
+		map[string]string{}, nil, time.Now(), nil)
+
+	rec := decodeLastLogLine(t, buf.String())
+	if rec["msg"] != "prompt call" {
+		t.Fatalf("msg = %v, want %q", rec["msg"], "prompt call")
+	}
+	if _, ok := rec["arguments"]; ok {
+		t.Fatalf("log line %v has arguments field, want it omitted for empty map[string]string", rec)
 	}
 }
 

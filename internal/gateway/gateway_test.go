@@ -692,6 +692,57 @@ func TestGateway_CallLogsSuccessWithMaskedArguments(t *testing.T) {
 	}
 }
 
+// TestGateway_CallLogsNoArguments checks that a tool call with no arguments
+// passed omits the "arguments" field entirely, rather than logging an empty
+// or typed-nil value.
+func TestGateway_CallLogsNoArguments(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	backendServer := newFakeBackendServer("backend-a", "noargs")
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpA.Close()
+
+	ctx := context.Background()
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = connA.Close() }()
+
+	toolsA, err := connA.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a tools: %v", err)
+	}
+	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-a", Items: toolsA}}, toolNameOf, toolRename, nil)
+
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Tools: table}, nil)
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	// Call with no Arguments supplied (nil on wire)
+	_, err = session.CallTool(ctx, &mcp.CallToolParams{Name: "noargs"})
+	if err != nil {
+		t.Fatalf("call noargs: %v", err)
+	}
+
+	rec := findLogLine(t, buf.String(), "tool call")
+	if rec["backend"] != "backend-a" || rec["tool"] != "noargs" {
+		t.Fatalf("backend/tool = %v/%v, want backend-a/noargs", rec["backend"], rec["tool"])
+	}
+	if _, ok := rec["arguments"]; ok {
+		t.Fatalf("log line has arguments field, want it omitted for tool call with no Arguments")
+	}
+}
+
 // TestGateway_CallLogsFailure checks that a failed tool call logs one Error
 // line with the failure reason, alongside the same caller-identity fields
 // the success path carries.

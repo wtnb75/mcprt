@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -86,6 +87,30 @@ func shouldMask(key string, extraKeys []string) bool {
 	return false
 }
 
+// hasArgs reports whether args carries meaningful call arguments. args is
+// nil for resource reads; a typed-nil json.RawMessage or map[string]string
+// — which a plain `args != nil` interface check would not catch — also
+// means "no arguments" (e.g. a tool/prompt call that never set Arguments).
+func hasArgs(args any) bool {
+	switch t := args.(type) {
+	case nil:
+		return false
+	case json.RawMessage:
+		if len(t) == 0 {
+			return false
+		}
+		// Check if it's an empty JSON object {} or array []
+		trimmed := bytes.TrimSpace(t)
+		return len(trimmed) != 2 || (trimmed[0] != '{' && trimmed[0] != '[')
+	case map[string]string:
+		return len(t) > 0
+	case map[string]any:
+		return len(t) > 0
+	default:
+		return true
+	}
+}
+
 // logCall logs one backend call's outcome — success or failure — in a
 // consistent shape, so investigating an incident doesn't require treating
 // the success and error paths as separate log formats.
@@ -106,7 +131,7 @@ func logCall(ctx context.Context, logger *slog.Logger, kind, nameKey, name, back
 	if addr, ok := remoteAddrFromContext(ctx); ok {
 		attrs = append(attrs, "remote_addr", addr)
 	}
-	if args != nil {
+	if hasArgs(args) {
 		attrs = append(attrs, "arguments", maskArguments(args, maskKeys))
 	}
 	if err != nil {
