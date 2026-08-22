@@ -73,6 +73,9 @@ Minimal example:
     prompt_overrides:
       code-review: filesystem
 
+    logging:
+      mask_keys: ["internal_id"] # extra key-name substrings to mask in the audit log, in addition to the built-in key/auth/pass/cred/token patterns
+
 `overrides` resolves conflicting **tool** names (after each backend's
 `prefix` is applied). `resource_overrides` and `resource_template_overrides`
 resolve conflicting resource URIs and URI templates the same way, but
@@ -86,6 +89,14 @@ prompt names before conflict resolution, exactly like tool names (unlike
 resource/resource-template URIs, which never get a prefix).
 `notifications/prompts/list_changed` and `completion/complete` are not
 relayed.
+
+Every backend call (`tools/call`, `resources/read`, `prompts/get`) is logged
+one line per call, success or failure, at `info`/`error` level respectively,
+with the calling MCP client's name/version, session ID, HTTP remote address
+(HTTP sessions only), call duration, and the call's arguments. Any argument
+object key matching (case-insensitively, by substring) `key`, `auth`,
+`pass`, `cred`, `token`, or an entry in `logging.mask_keys` has its value
+replaced with `***` before logging.
 
 When `ssh` is set on a stdio backend, mcprt runs `command` on the remote host
 by shelling out to the local `ssh` binary (so `~/.ssh/config`, `ssh-agent`,

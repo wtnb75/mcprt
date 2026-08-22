@@ -8,6 +8,9 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -205,5 +208,105 @@ func TestConnectBackends_PromptListFailureKeepsBackendTools(t *testing.T) {
 	}
 	if len(conn.promptEntries) != 1 || len(conn.promptEntries[0].Items) != 0 {
 		t.Fatalf("promptEntries = %+v, want one entry with no items (a prompts/list failure is treated as an empty list, not dropped)", conn.promptEntries)
+	}
+}
+
+func TestConnectBackends_LogsSuccessfulConnect(t *testing.T) {
+	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	mcp.AddTool(backendSrv, &mcp.Tool{Name: "ping", Description: "ping"},
+		func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
+			return nil, struct{}{}, nil
+		})
+	backendHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil))
+	defer backendHTTP.Close()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	configs := []config.BackendConfig{{Name: "fake", Transport: "http", URL: backendHTTP.URL}}
+
+	conn := connectBackends(context.Background(), logger, configs)
+	defer func() {
+		for _, b := range conn.backends {
+			_ = b.Close()
+		}
+	}()
+
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var rec struct {
+			Msg       string `json:"msg"`
+			Backend   string `json:"backend"`
+			Transport string `json:"transport"`
+		}
+		if json.Unmarshal([]byte(line), &rec) == nil && rec.Msg == "backend connected" {
+			found = true
+			if rec.Backend != "fake" || rec.Transport != "http" {
+				t.Fatalf("backend connected log = %+v, want backend=fake transport=http", rec)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("log output = %q, want a \"backend connected\" entry", buf.String())
+	}
+}
+
+// TestRunServer_LogsListening checks runServer logs its listener
+// configuration once at startup, before any listener goroutine starts. It
+// swaps os.Stdin the same way TestServerCommand_StdioShutdownIsClean
+// (server_test.go) does, so ServeStdio blocks on a pipe instead of the real
+// stdin; this must not run with t.Parallel() (nor alongside another test
+// touching os.Stdin).
+func TestRunServer_LogsListening(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("creating stdin pipe: %v", err)
+	}
+	origStdin := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() {
+		os.Stdin = origStdin
+		_ = w.Close()
+		_ = r.Close()
+	})
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("listen:\n  stdio: true\n\nbackends: []\n"), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runServer(ctx, logger, configPath) }()
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runServer exited with error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runServer did not exit within 5s of context cancellation")
+	}
+
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var rec struct {
+			Msg   string `json:"msg"`
+			Stdio bool   `json:"stdio"`
+		}
+		if json.Unmarshal([]byte(line), &rec) == nil && rec.Msg == "listening" {
+			found = true
+			if !rec.Stdio {
+				t.Fatalf("listening log stdio = %v, want true", rec.Stdio)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("log output = %q, want a \"listening\" entry", buf.String())
 	}
 }

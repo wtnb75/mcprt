@@ -119,6 +119,8 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 		Prompts:           promptTable,
 	}, cfg.Logging.MaskKeys)
 
+	logger.Info("listening", "stdio", cfg.Listen.Stdio, "http", cfg.Listen.HTTP)
+
 	running := 0
 	errCh := make(chan error, 2)
 	if cfg.Listen.Stdio {
@@ -200,6 +202,7 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 				logger.Error("skipping backend: connect failed", "backend", bc.Name, "error", err)
 				return
 			}
+			logger.Info("backend connected", "backend", bc.Name, "transport", bc.Transport)
 			tools, err := b.ListTools(ctx)
 			if err != nil {
 				logger.Error("skipping backend: list tools failed", "backend", bc.Name, "error", err)
