@@ -15,9 +15,25 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel"
 
 	"github.com/wtnb75/mcprt/internal/config"
 )
+
+// TestMain forces OTEL_TRACES_EXPORTER=none for every test in this
+// package's test binary: once runServer wires internal/telemetry.Setup,
+// every test that calls runServer (directly, or via cli.Execute) would
+// otherwise attempt the OTel SDK's default OTLP/HTTP export target
+// (http://localhost:4318), which nothing here listens on -- Setup itself
+// wouldn't fail (BatchSpanProcessor exports asynchronously), but its
+// background goroutine would log periodic connection-refused noise into
+// test output. Setting "none" makes autoexport.NewSpanExporter return a
+// genuine no-op exporter, keeping every test in this package fast,
+// deterministic, and independent of network access.
+func TestMain(m *testing.M) {
+	_ = os.Setenv("OTEL_TRACES_EXPORTER", "none")
+	os.Exit(m.Run())
+}
 
 func TestParseLogLevel(t *testing.T) {
 	cases := map[string]slog.Level{
@@ -334,5 +350,54 @@ func TestRunServer_LogsListening(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("log output = %q, want a \"listening\" entry", buf.String())
+	}
+}
+
+// TestRunServer_ConfiguresGlobalTracerProvider checks that runServer wires
+// internal/telemetry.Setup: after it starts, a span started via the
+// package-level otel.Tracer (which delegates to whatever global provider
+// is currently installed) is recording -- the default, pre-Setup global
+// provider always returns a non-recording no-op span, so recording=true
+// is only possible once Setup has installed a real SDK TracerProvider.
+func TestRunServer_ConfiguresGlobalTracerProvider(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("creating stdin pipe: %v", err)
+	}
+	origStdin := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() {
+		os.Stdin = origStdin
+		_ = w.Close()
+		_ = r.Close()
+	})
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("listen:\n  stdio: true\n\nbackends: []\n"), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runServer(ctx, logger, configPath) }()
+
+	time.Sleep(200 * time.Millisecond)
+	_, span := otel.Tracer("probe").Start(context.Background(), "probe")
+	recording := span.IsRecording()
+	span.End()
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runServer exited with error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runServer did not exit within 5s of context cancellation")
+	}
+
+	if !recording {
+		t.Fatal("global TracerProvider was not configured by runServer (span.IsRecording() = false)")
 	}
 }

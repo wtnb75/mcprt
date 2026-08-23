@@ -16,6 +16,7 @@ import (
 	"github.com/wtnb75/mcprt/internal/config"
 	"github.com/wtnb75/mcprt/internal/gateway"
 	"github.com/wtnb75/mcprt/internal/router"
+	"github.com/wtnb75/mcprt/internal/telemetry"
 )
 
 // backendConnectTimeout bounds how long connectBackends waits on any single
@@ -24,6 +25,11 @@ import (
 // hung backend can't stall the whole gateway's startup (see
 // connectBackends). A var so tests can shrink it.
 var backendConnectTimeout = 30 * time.Second
+
+// telemetryShutdownTimeout bounds internal/telemetry.Setup's returned
+// shutdown func, which flushes buffered spans to the configured OTLP
+// exporter. A var so tests can shrink it.
+var telemetryShutdownTimeout = 5 * time.Second
 
 func newServerCmd() *cobra.Command {
 	var configPath string
@@ -89,6 +95,18 @@ func parseLogFormat(s string) (func(io.Writer, *slog.HandlerOptions) slog.Handle
 }
 
 func runServer(ctx context.Context, logger *slog.Logger, configPath string) error {
+	shutdownTelemetry, err := telemetry.Setup(ctx)
+	if err != nil {
+		return fmt.Errorf("configuring tracing: %w", err)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), telemetryShutdownTimeout)
+		defer cancel()
+		if err := shutdownTelemetry(sctx); err != nil {
+			logger.Error("tracer shutdown failed", "error", err)
+		}
+	}()
+
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
