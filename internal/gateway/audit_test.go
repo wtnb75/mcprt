@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func TestHasArgs(t *testing.T) {
@@ -299,4 +300,55 @@ func decodeLastLogLine(t *testing.T, out string) map[string]any {
 		t.Fatalf("decoding log line %q: %v", lines[len(lines)-1], err)
 	}
 	return rec
+}
+
+func TestLogCall_IncludesTraceIDAndSpanIDWhenSpanValid(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	traceID, err := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
+	if err != nil {
+		t.Fatalf("TraceIDFromHex: %v", err)
+	}
+	spanID, err := trace.SpanIDFromHex("00f067aa0ba902b7")
+	if err != nil {
+		t.Fatalf("SpanIDFromHex: %v", err)
+	}
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     spanID,
+		TraceFlags: trace.FlagsSampled,
+	})
+	ctx := trace.ContextWithSpanContext(context.Background(), sc)
+
+	logCall(ctx, logger, "tool", "tool", "x", "backend-a", &mcp.ServerSession{}, nil, nil, time.Now(), nil)
+
+	var rec map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+		t.Fatalf("unmarshal log line: %v", err)
+	}
+	if rec["trace_id"] != "4bf92f3577b34da6a3ce929d0e0e4736" {
+		t.Fatalf("trace_id = %v, want 4bf92f3577b34da6a3ce929d0e0e4736", rec["trace_id"])
+	}
+	if rec["span_id"] != "00f067aa0ba902b7" {
+		t.Fatalf("span_id = %v, want 00f067aa0ba902b7", rec["span_id"])
+	}
+}
+
+func TestLogCall_OmitsTraceIDAndSpanIDWhenNoSpan(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	logCall(context.Background(), logger, "tool", "tool", "x", "backend-a", &mcp.ServerSession{}, nil, nil, time.Now(), nil)
+
+	var rec map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+		t.Fatalf("unmarshal log line: %v", err)
+	}
+	if _, ok := rec["trace_id"]; ok {
+		t.Fatalf("trace_id present = %v, want omitted for a ctx with no span", rec["trace_id"])
+	}
+	if _, ok := rec["span_id"]; ok {
+		t.Fatalf("span_id present = %v, want omitted for a ctx with no span", rec["span_id"])
+	}
 }

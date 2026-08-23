@@ -98,6 +98,19 @@ object key matching (case-insensitively, by substring) `key`, `auth`,
 `pass`, `cred`, `token`, or an entry in `logging.mask_keys` has its value
 replaced with `***` before logging.
 
+mcprt also participates in distributed tracing via OpenTelemetry: a call
+served over the HTTP transport gets wrapped in a span (continuing an
+inbound `traceparent` header if present), and if the routed backend is
+itself an HTTP backend, the active span's trace context is injected into
+the outbound request, so the trace continues across the hop. Tracing is
+configured entirely through standard `OTEL_*` environment variables
+(`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_EXPORTER`, `OTEL_SERVICE_NAME`,
+...) — there is no mcprt-specific config for it. Set
+`OTEL_TRACES_EXPORTER=none` to disable it entirely. Calls made over the
+stdio transport are never traced (there is no out-of-band channel to carry
+trace context on stdio). When a call is traced, its audit log line (see
+above) also carries `trace_id`/`span_id` fields.
+
 When `ssh` is set on a stdio backend, mcprt runs `command` on the remote host
 by shelling out to the local `ssh` binary (so `~/.ssh/config`, `ssh-agent`,
 and `known_hosts` all apply as usual); `dir` and `env`/`env_file` are applied

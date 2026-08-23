@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // defaultMaskKeyPatterns are matched case-insensitively as substrings
@@ -130,6 +131,9 @@ func logCall(ctx context.Context, logger *slog.Logger, kind, nameKey, name, back
 	}
 	if addr, ok := remoteAddrFromContext(ctx); ok {
 		attrs = append(attrs, "remote_addr", addr)
+	}
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+		attrs = append(attrs, "trace_id", sc.TraceID().String(), "span_id", sc.SpanID().String())
 	}
 	if hasArgs(args) {
 		attrs = append(attrs, "arguments", maskArguments(args, maskKeys))
