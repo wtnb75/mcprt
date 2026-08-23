@@ -102,14 +102,22 @@ mcprt also participates in distributed tracing via OpenTelemetry: a call
 served over the HTTP transport gets wrapped in a span (continuing an
 inbound `traceparent` header if present), and if the routed backend is
 itself an HTTP backend, the active span's trace context is injected into
-the outbound request, so the trace continues across the hop. Tracing is
-configured entirely through standard `OTEL_*` environment variables
-(`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_EXPORTER`, `OTEL_SERVICE_NAME`,
-...) — there is no mcprt-specific config for it. Set
-`OTEL_TRACES_EXPORTER=none` to disable it entirely. Calls made over the
-stdio transport are never traced (there is no out-of-band channel to carry
-trace context on stdio). When a call is traced, its audit log line (see
-above) also carries `trace_id`/`span_id` fields.
+the outbound request, so the trace continues across the hop. Only trace
+context is forwarded to backends, never OpenTelemetry baggage, since
+baggage would otherwise carry client-controlled data past the audit log's
+redaction. Tracing is configured entirely through standard `OTEL_*`
+environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_TRACES_EXPORTER`,
+`OTEL_SERVICE_NAME`, ...) — there is no mcprt-specific config for it. Set
+`OTEL_TRACES_EXPORTER=none` to disable tracing entirely; the unconfigured
+default target is `https://localhost:4318`, so a connection-refused error on
+an https URL is expected when nothing is configured, and should not be
+treated as a startup failure. Calls made over the stdio transport are never
+traced (there is no out-of-band channel to carry trace context on stdio).
+When a call is traced, its audit log line (see above) also carries
+`trace_id`/`span_id` fields. Resource-template reads use the distinct span
+name `resources/templates/read` rather than `resources/read`, even though
+both serve the same MCP method (`resources/read`), so a trace search for
+`resources/read` alone will miss template reads.
 
 When `ssh` is set on a stdio backend, mcprt runs `command` on the remote host
 by shelling out to the local `ssh` binary (so `~/.ssh/config`, `ssh-agent`,

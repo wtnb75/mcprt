@@ -9,13 +9,17 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // tracer is the package-wide Tracer every handler's startCallSpan call
-// uses. It is bound to whatever global TracerProvider is installed at the
-// time each Start call happens (otel.Tracer's delegation semantics), so
-// this can be initialized before internal/telemetry.Setup runs — or before
-// a test's own TracerProvider is installed, in tests that reassign it.
+// uses. It is bound via a one-shot delegate to the FIRST TracerProvider
+// ever installed via otel.SetTracerProvider in this process; later
+// SetTracerProvider calls do NOT retarget an already-obtained tracer like
+// this one. That's why tests must either share one TracerProvider (see
+// gateway_test.go's TestMain) or reassign this var directly and restore it
+// (see tracing_test.go's setTestTracerProvider) rather than installing a
+// second provider and expecting this var to follow it.
 var tracer = otel.Tracer("github.com/wtnb75/mcprt/internal/gateway")
 
 // startCallSpan starts a span for one backend call if extra carries HTTP
@@ -25,10 +29,10 @@ var tracer = otel.Tracer("github.com/wtnb75/mcprt/internal/gateway")
 // exactly as before tracing existed.
 func startCallSpan(ctx context.Context, extra *mcp.RequestExtra, spanName string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
 	if extra == nil || len(extra.Header) == 0 {
-		return ctx, trace.SpanFromContext(ctx) // non-recording no-op span
+		return ctx, noop.Span{} // explicitly unowned no-op span; every handler does defer span.End()
 	}
 	ctx = otel.GetTextMapPropagator().Extract(ctx, propagation.HeaderCarrier(extra.Header))
-	return tracer.Start(ctx, spanName, trace.WithAttributes(attrs...))
+	return tracer.Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindServer), trace.WithAttributes(attrs...))
 }
 
 // recordOutcome marks span as failed when err is non-nil; on success it

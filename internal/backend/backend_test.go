@@ -16,7 +16,9 @@ import (
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/contrib/propagators/autoprop"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 
@@ -501,6 +503,61 @@ func TestConnect_HTTP_InjectsTraceparentWhenSpanActive(t *testing.T) {
 	}
 	if gotHeader == "" {
 		t.Fatal("no traceparent header was injected on the outbound request despite an active span in ctx")
+	}
+}
+
+func TestConnect_HTTP_DoesNotForwardBaggage(t *testing.T) {
+	prevTP := otel.GetTracerProvider()
+	prevProp := otel.GetTextMapPropagator()
+	otel.SetTracerProvider(sdktrace.NewTracerProvider())
+	otel.SetTextMapPropagator(autoprop.NewTextMapPropagator()) // production's real propagator: tracecontext+baggage
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+		otel.SetTextMapPropagator(prevProp)
+	})
+
+	var gotTraceparent, gotBaggage string
+	seen := false
+	mcpHandler := newFakeMCPHandler()
+	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !seen {
+			gotTraceparent = r.Header.Get("traceparent")
+			gotBaggage = r.Header.Get("baggage")
+			seen = true
+		}
+		mcpHandler.ServeHTTP(w, r)
+	})
+	srv := httptest.NewServer(wrapped)
+	defer srv.Close()
+
+	tracer := otel.Tracer("test")
+	ctx, span := tracer.Start(context.Background(), "test-call")
+	defer span.End()
+
+	member, err := baggage.NewMember("api_key", "SECRET123")
+	if err != nil {
+		t.Fatalf("baggage.NewMember: %v", err)
+	}
+	bag, err := baggage.New(member)
+	if err != nil {
+		t.Fatalf("baggage.New: %v", err)
+	}
+	ctx = baggage.ContextWithBaggage(ctx, bag)
+
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	if _, err := b.ListTools(ctx); err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	if gotTraceparent == "" {
+		t.Fatal("traceparent was not forwarded even though a real span was active")
+	}
+	if gotBaggage != "" {
+		t.Fatalf("baggage header = %q, want empty: client-controlled baggage must never reach backends", gotBaggage)
 	}
 }
 

@@ -382,10 +382,17 @@ func TestRunServer_ConfiguresGlobalTracerProvider(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runServer(ctx, logger, configPath) }()
 
-	time.Sleep(200 * time.Millisecond)
-	_, span := otel.Tracer("probe").Start(context.Background(), "probe")
-	recording := span.IsRecording()
-	span.End()
+	deadline := time.Now().Add(2 * time.Second)
+	var recording bool
+	for time.Now().Before(deadline) {
+		_, span := otel.Tracer("probe").Start(context.Background(), "probe")
+		recording = span.IsRecording()
+		span.End()
+		if recording {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	cancel()
 	select {

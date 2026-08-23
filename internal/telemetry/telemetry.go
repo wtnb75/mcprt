@@ -30,6 +30,7 @@ func Setup(ctx context.Context) (shutdown func(context.Context) error, err error
 	res, err := resource.New(ctx,
 		resource.WithAttributes(semconv.ServiceName("mcprt")),
 		resource.WithFromEnv(), // OTEL_SERVICE_NAME etc. override the default
+		resource.WithTelemetrySDK(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("building resource: %w", err)

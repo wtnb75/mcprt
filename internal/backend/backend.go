@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/wtnb75/mcprt/internal/config"
@@ -270,12 +269,16 @@ func (h headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 // (and therefore has an active span in ctx) continues the same trace on the
 // backend side. It does not start its own span -- the handler's span
 // already covers the call's duration; a bare stdio-originated ctx carries
-// no span, so Inject is a no-op and no traceparent header is sent.
+// no span, so Inject is a no-op and no traceparent header is sent. Only
+// trace context is forwarded, never baggage: an inbound client fully
+// controls the baggage header, and forwarding it to backends unredacted
+// would bypass the audit log's key-masking entirely.
 type tracingRoundTripper struct {
 	base http.RoundTripper
 }
 
 func (t tracingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	otel.GetTextMapPropagator().Inject(req.Context(), propagation.HeaderCarrier(req.Header))
+	req = req.Clone(req.Context())
+	propagation.TraceContext{}.Inject(req.Context(), propagation.HeaderCarrier(req.Header))
 	return t.base.RoundTrip(req)
 }
