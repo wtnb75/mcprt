@@ -157,8 +157,10 @@ func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Table
 // registerTool registers resolved.Item, falling back to the next
 // lower-priority backend's definition (if any) when one turns out to be
 // unregisterable, so a conflict's winner having a malformed schema doesn't
-// need to take a validly-defined loser down with it.
-func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Tool], maskKeys []string) {
+// need to take a validly-defined loser down with it. It reports whether
+// anything was registered, so a reconcile caller (see reconcile.go) can
+// clean up a stale prior registration when every candidate fails.
+func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Tool], maskKeys []string) (ok bool) {
 	candidates := append([]router.Candidate[*mcp.Tool]{{
 		Item:         resolved.Item,
 		BackendName:  resolved.BackendName,
@@ -168,10 +170,11 @@ func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*bac
 	for _, c := range candidates {
 		b := backends[c.BackendName]
 		if addTool(srv, logger, c.Item, callHandler(logger, maskKeys, b, c.OriginalName)) {
-			return
+			return true
 		}
 	}
 	logger.Error("tool unavailable: every candidate backend had an invalid definition", "tool", resolved.Item.Name)
+	return false
 }
 
 // registerResource registers resolved.Item, falling back to the next

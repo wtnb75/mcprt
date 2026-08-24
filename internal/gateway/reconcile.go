@@ -100,7 +100,15 @@ func (s *Server) UpdateTools(backendName string, items []*mcp.Tool) {
 	}
 	for name, resolved := range newTable.Items {
 		if old, ok := s.toolTable.Items[name]; !ok || !reflect.DeepEqual(old, resolved) {
-			registerTool(s.mcp, s.logger, s.backends, resolved, s.maskKeys)
+			if !registerTool(s.mcp, s.logger, s.backends, resolved, s.maskKeys) {
+				// Every candidate for name was unregisterable (registerTool
+				// already logged this). Without this, a prior successful
+				// registration for the same exposed name would keep serving
+				// its now-superseded definition. RemoveTools on a name that
+				// was never registered is a safe no-op (go-sdk's
+				// featureSet.remove returns false and skips notifying).
+				s.mcp.RemoveTools(name)
+			}
 		}
 	}
 	logNewConflicts(s.logger, "tool name conflict", "tool", s.toolTable.Conflicts, newTable.Conflicts)

@@ -120,6 +120,39 @@ func TestUpdateTools_ConflictFallbackPromotesWhenWinnerRemoved(t *testing.T) {
 	}
 }
 
+// TestUpdateTools_RemovesStaleRegistrationWhenNewWinnerIsInvalid is the
+// regression test for the bug found in this feature's final whole-branch
+// review: when a backend's list_changed reconcile picks a winner whose
+// definition registerTool can't register (invalid schema) and there is no
+// valid fallback, the tool must be REMOVED from the gateway, not left
+// serving its previous (now-stale) definition.
+func TestUpdateTools_RemovesStaleRegistrationWhenNewWinnerIsInvalid(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx := context.Background()
+
+	entries := []router.Entry[*mcp.Tool]{
+		{BackendName: "a", Items: []*mcp.Tool{{Name: "search", Description: "v1", InputSchema: toolSchema}}},
+	}
+	table := router.Resolve(entries, toolNameOf, toolRename, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}},
+		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil)
+
+	if got := downstreamToolNames(t, ctx, srv.MCP()); !equalStrings(got, []string{"search"}) {
+		t.Fatalf("initial tools = %v, want [search]", got)
+	}
+
+	// Backend "a" changes "search" to a definition with no InputSchema --
+	// mcp.Server.AddTool panics on that, registerTool's addTool wrapper
+	// recovers and reports failure, and there is no other backend to fall
+	// back to. The exposed name ("search") is unchanged, so this is a
+	// same-name valid-to-invalid transition, not a brand-new invalid name.
+	srv.UpdateTools("a", []*mcp.Tool{{Name: "search", Description: "v2, broken"}})
+
+	if got := downstreamToolNames(t, ctx, srv.MCP()); len(got) != 0 {
+		t.Fatalf("tools after UpdateTools with an invalid winner and no fallback = %v, want [] (stale registration must be removed, not left serving the old definition)", got)
+	}
+}
+
 func TestUpdateTools_LogsOnlyNewConflicts(t *testing.T) {
 	var buf logBuffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
