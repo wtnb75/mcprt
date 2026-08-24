@@ -61,7 +61,7 @@ func runCall(ctx context.Context, cmd *cobra.Command, configPath, toolName, args
 	// (prefix/overrides applied), so it exercises the exact path a client
 	// would.
 	logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil))
-	conn := connectBackends(ctx, logger, cfg.Backends)
+	conn := connectBackends(ctx, logger, cfg.Backends, nil)
 	defer func() {
 		for _, b := range conn.backends {
 			_ = b.Close()

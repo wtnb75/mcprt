@@ -85,7 +85,7 @@ func TestConnectBackends_TimesOutHungBackend(t *testing.T) {
 	done := make(chan struct{})
 	var conn connected
 	go func() {
-		conn = connectBackends(context.Background(), logger, configs)
+		conn = connectBackends(context.Background(), logger, configs, nil)
 		close(done)
 	}()
 
@@ -168,7 +168,7 @@ func TestConnectBackends_ResourceListFailureKeepsBackendTools(t *testing.T) {
 		{Name: "fake", Transport: "http", URL: backendHTTP.URL},
 	}
 
-	conn := connectBackends(context.Background(), logger, configs)
+	conn := connectBackends(context.Background(), logger, configs, nil)
 	defer func() {
 		for _, b := range conn.backends {
 			_ = b.Close()
@@ -209,7 +209,7 @@ func TestConnectBackends_PromptListFailureKeepsBackendTools(t *testing.T) {
 		{Name: "fake", Transport: "http", URL: backendHTTP.URL},
 	}
 
-	conn := connectBackends(context.Background(), logger, configs)
+	conn := connectBackends(context.Background(), logger, configs, nil)
 	defer func() {
 		for _, b := range conn.backends {
 			_ = b.Close()
@@ -240,7 +240,7 @@ func TestConnectBackends_LogsSuccessfulConnect(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
 	configs := []config.BackendConfig{{Name: "fake", Transport: "http", URL: backendHTTP.URL}}
 
-	conn := connectBackends(context.Background(), logger, configs)
+	conn := connectBackends(context.Background(), logger, configs, nil)
 	defer func() {
 		for _, b := range conn.backends {
 			_ = b.Close()

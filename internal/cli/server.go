@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -121,7 +122,8 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	conn := connectBackends(ctx, logger, cfg.Backends)
+	var gwH gwHolder
+	conn := connectBackends(ctx, logger, cfg.Backends, &gwH)
 	defer func() {
 		for _, b := range conn.backends {
 			_ = b.Close()
@@ -153,7 +155,18 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 		Resources:         resourceTable,
 		ResourceTemplates: resourceTemplateTable,
 		Prompts:           promptTable,
-	}, gateway.Entries{}, gateway.Overrides{}, cfg.Logging.MaskKeys)
+	}, gateway.Entries{
+		Tools:             conn.toolEntries,
+		Resources:         conn.resourceEntries,
+		ResourceTemplates: conn.resourceTemplateEntries,
+		Prompts:           conn.promptEntries,
+	}, gateway.Overrides{
+		Tools:             cfg.Overrides,
+		Resources:         cfg.ResourceOverrides,
+		ResourceTemplates: cfg.ResourceTemplateOverrides,
+		Prompts:           cfg.PromptOverrides,
+	}, cfg.Logging.MaskKeys)
+	gwH.ptr.Store(srv)
 
 	logger.Info("listening", "stdio", cfg.Listen.Stdio, "http", cfg.Listen.HTTP)
 
@@ -192,6 +205,96 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	return firstErr
 }
 
+// gwHolder lets a backend's ChangeCallbacks closures (built inside
+// connectBackends, before the *gateway.Server exists) reference it once
+// runServer finishes building it. A nil Load() means the initial
+// connect-and-list sequence gateway.New's caller runs hasn't completed yet;
+// a notification that fires in that window is dropped -- the pending
+// initial ListTools/ListResources/ListResourceTemplates/ListPrompts that
+// runServer is about to do anyway will reflect the same change, so nothing
+// is permanently lost.
+type gwHolder struct {
+	ptr atomic.Pointer[gateway.Server]
+}
+
+// toolsChangedCallback returns a func to use as backend.ChangeCallbacks.
+// OnToolsChanged for backendName: on fire, it re-lists that backend's tools
+// (bounded by backendConnectTimeout) and reconciles gwH's Server, or logs a
+// warning and keeps the previous list if either isn't ready yet.
+func toolsChangedCallback(ctx context.Context, logger *slog.Logger, backendName string, gwH *gwHolder) func() {
+	return func() {
+		gw := gwH.ptr.Load()
+		if gw == nil {
+			return
+		}
+		b := gw.Backend(backendName)
+		if b == nil {
+			return
+		}
+		lctx, cancel := context.WithTimeout(ctx, backendConnectTimeout)
+		defer cancel()
+		tools, err := b.ListTools(lctx)
+		if err != nil {
+			logger.Warn("list_changed: re-list failed, keeping previous list", "backend", backendName, "kind", "tools", "error", err)
+			return
+		}
+		gw.UpdateTools(backendName, tools)
+	}
+}
+
+// resourcesChangedCallback is toolsChangedCallback's counterpart for
+// notifications/resources/list_changed, which the MCP spec fires for BOTH
+// resources and resource templates -- it re-lists both and reconciles them
+// together via a single UpdateResources call.
+func resourcesChangedCallback(ctx context.Context, logger *slog.Logger, backendName string, gwH *gwHolder) func() {
+	return func() {
+		gw := gwH.ptr.Load()
+		if gw == nil {
+			return
+		}
+		b := gw.Backend(backendName)
+		if b == nil {
+			return
+		}
+		lctx, cancel := context.WithTimeout(ctx, backendConnectTimeout)
+		defer cancel()
+		resources, err := b.ListResources(lctx)
+		if err != nil {
+			logger.Warn("list_changed: re-list failed, keeping previous list", "backend", backendName, "kind", "resources", "error", err)
+			return
+		}
+		templates, err := b.ListResourceTemplates(lctx)
+		if err != nil {
+			logger.Warn("list_changed: re-list failed, keeping previous list", "backend", backendName, "kind", "resource templates", "error", err)
+			return
+		}
+		gw.UpdateResources(backendName, resources, templates)
+	}
+}
+
+// promptsChangedCallback is toolsChangedCallback's counterpart for
+// notifications/prompts/list_changed.
+func promptsChangedCallback(ctx context.Context, logger *slog.Logger, backendName string, gwH *gwHolder) func() {
+	return func() {
+		gw := gwH.ptr.Load()
+		if gw == nil {
+			return
+		}
+		b := gw.Backend(backendName)
+		if b == nil {
+			return
+		}
+		lctx, cancel := context.WithTimeout(ctx, backendConnectTimeout)
+		defer cancel()
+		prompts, err := b.ListPrompts(lctx)
+		if err != nil {
+			logger.Warn("list_changed: re-list failed, keeping previous list", "backend", backendName, "kind", "prompts", "error", err)
+			return
+		}
+		gw.UpdatePrompts(backendName, prompts)
+	}
+}
+
 // connected is the outcome of connectBackends: the live backend
 // connections, plus each kind of item list gathered from them, ready to
 // pass to router.Resolve. Entries preserve configs' order, since
@@ -215,7 +318,7 @@ type connected struct {
 // JSON-RPC "method not found" error when they don't implement that
 // capability at all, rather than an empty list, and that must not take down
 // an otherwise-working tools-only backend.
-func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.BackendConfig) connected {
+func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.BackendConfig, gwH *gwHolder) connected {
 	type outcome struct {
 		backend               *backend.Backend
 		toolEntry             router.Entry[*mcp.Tool]
@@ -228,12 +331,25 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 	var wg sync.WaitGroup
 	for i, bc := range configs {
 		wg.Add(1)
-		go func(i int, bc config.BackendConfig) {
+		// Callbacks are built here, using ctx (this func's own long-lived
+		// context), NOT the timeout-bounded ctx the goroutine below derives
+		// for the initial Connect+List sequence -- a callback captured from
+		// that derived context would already be expired by the time a real
+		// list_changed notification could plausibly arrive.
+		cb := backend.ChangeCallbacks{}
+		if gwH != nil {
+			cb = backend.ChangeCallbacks{
+				OnToolsChanged:     toolsChangedCallback(ctx, logger, bc.Name, gwH),
+				OnResourcesChanged: resourcesChangedCallback(ctx, logger, bc.Name, gwH),
+				OnPromptsChanged:   promptsChangedCallback(ctx, logger, bc.Name, gwH),
+			}
+		}
+		go func(i int, bc config.BackendConfig, cb backend.ChangeCallbacks) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(ctx, backendConnectTimeout)
 			defer cancel()
 
-			b, err := backend.Connect(ctx, bc, backend.ChangeCallbacks{})
+			b, err := backend.Connect(ctx, bc, cb)
 			if err != nil {
 				logger.Error("skipping backend: connect failed", "backend", bc.Name, "error", err)
 				return
@@ -281,7 +397,7 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 					BackendName: bc.Name, Prefix: bc.Prefix, Items: prompts,
 				},
 			}
-		}(i, bc)
+		}(i, bc, cb)
 	}
 	wg.Wait()
 
