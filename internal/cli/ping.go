@@ -58,7 +58,7 @@ func runPing(ctx context.Context, cmd *cobra.Command, configPath, backendName st
 	ctx, cancel := context.WithTimeout(ctx, backendConnectTimeout)
 	defer cancel()
 
-	b, err := backend.Connect(ctx, bc)
+	b, err := backend.Connect(ctx, bc, backend.ChangeCallbacks{})
 	if err != nil {
 		return fmt.Errorf("connecting to backend %q: %w", backendName, err)
 	}

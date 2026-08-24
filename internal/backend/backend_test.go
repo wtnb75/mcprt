@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.opentelemetry.io/contrib/propagators/autoprop"
@@ -32,7 +33,7 @@ func TestConnect_Stdio(t *testing.T) {
 		Name:      "echo",
 		Transport: "stdio",
 		Command:   []string{"go", "run", "./testdata/echoserver"},
-	})
+	}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -63,7 +64,7 @@ func TestConnect_Stdio_Dir(t *testing.T) {
 		Transport: "stdio",
 		Command:   []string{buildEchoserver(t)},
 		Dir:       wantDir,
-	})
+	}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -89,7 +90,7 @@ func TestConnect_Stdio_SSH(t *testing.T) {
 		Dir:       wantDir,
 		Env:       map[string]string{"MCPRT_TEST_SSH_VAR": "via-ssh"},
 		SSH:       &config.SSHConfig{Host: "irrelevant-host"},
-	})
+	}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -133,7 +134,7 @@ func TestConnect_Stdio_Docker(t *testing.T) {
 			Image: "irrelevant-image",
 			Env:   map[string]string{"MCPRT_TEST_HOST_VAR": "host-only"},
 		},
-	})
+	}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -175,7 +176,7 @@ func TestConnect_Stdio_Docker_Bin(t *testing.T) {
 			Bin:   "podman",
 			Image: "irrelevant-image",
 		},
-	})
+	}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -306,6 +307,129 @@ func newFakeMCPHandler() http.Handler {
 	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return fakeServer }, nil)
 }
 
+// TestConnect_ToolListChangedCallback checks that ChangeCallbacks.OnToolsChanged
+// fires when the connected backend sends notifications/tools/list_changed
+// after the initial connection is established.
+func TestConnect_ToolListChangedCallback(t *testing.T) {
+	fakeServer := mcp.NewServer(&mcp.Implementation{Name: "fake", Version: "v1"}, nil)
+	mcp.AddTool(fakeServer, &mcp.Tool{Name: "a", Description: "a"},
+		func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
+			return nil, struct{}{}, nil
+		})
+
+	srv := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return fakeServer }, nil))
+	defer srv.Close()
+
+	ctx := context.Background()
+	fired := make(chan struct{}, 1)
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL},
+		backend.ChangeCallbacks{OnToolsChanged: func() { fired <- struct{}{} }})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	// Registering a second tool on the already-connected fake server makes
+	// the SDK emit notifications/tools/list_changed to b's session.
+	mcp.AddTool(fakeServer, &mcp.Tool{Name: "b", Description: "b"},
+		func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
+			return nil, struct{}{}, nil
+		})
+
+	select {
+	case <-fired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnToolsChanged did not fire within 5s of the backend adding a tool")
+	}
+}
+
+// TestConnect_ResourceListChangedCallback_FiresOnceForOneNotification checks
+// that OnResourcesChanged fires exactly once for a single
+// notifications/resources/list_changed (which the MCP spec fires for both
+// resources AND resource templates -- there is no separate template
+// notification, so this same handler covers both).
+func TestConnect_ResourceListChangedCallback_FiresOnceForOneNotification(t *testing.T) {
+	fakeServer := mcp.NewServer(&mcp.Implementation{Name: "fake", Version: "v1"}, nil)
+	readHandler := func(context.Context, *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{Text: "stub"}}}, nil
+	}
+	fakeServer.AddResource(&mcp.Resource{URI: "file:///a", Name: "a"}, readHandler)
+
+	srv := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return fakeServer }, nil))
+	defer srv.Close()
+
+	ctx := context.Background()
+	var fireCount atomic.Int32
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL},
+		backend.ChangeCallbacks{OnResourcesChanged: func() { fireCount.Add(1) }})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	fakeServer.AddResourceTemplate(&mcp.ResourceTemplate{URITemplate: "file:///dir/{f}", Name: "dir"}, readHandler)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && fireCount.Load() == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if fireCount.Load() != 1 {
+		t.Fatalf("OnResourcesChanged fired %d times, want exactly 1", fireCount.Load())
+	}
+}
+
+// TestConnect_PromptListChangedCallback mirrors
+// TestConnect_ToolListChangedCallback for OnPromptsChanged.
+func TestConnect_PromptListChangedCallback(t *testing.T) {
+	fakeServer := mcp.NewServer(&mcp.Implementation{Name: "fake", Version: "v1"}, nil)
+	fakeServer.AddPrompt(&mcp.Prompt{Name: "greet", Description: "say hello"},
+		func(context.Context, *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{Messages: []*mcp.PromptMessage{}}, nil
+		})
+
+	srv := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return fakeServer }, nil))
+	defer srv.Close()
+
+	ctx := context.Background()
+	fired := make(chan struct{}, 1)
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL},
+		backend.ChangeCallbacks{OnPromptsChanged: func() { fired <- struct{}{} }})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	fakeServer.AddPrompt(&mcp.Prompt{Name: "farewell", Description: "say bye"},
+		func(context.Context, *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{Messages: []*mcp.PromptMessage{}}, nil
+		})
+
+	select {
+	case <-fired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnPromptsChanged did not fire within 5s of the backend adding a prompt")
+	}
+}
+
+// TestConnect_NilChangeCallbacks_NoHandlersRegistered checks that a nil
+// field on ChangeCallbacks leaves the corresponding SDK handler unset
+// (rather than, say, panicking or wiring a no-op that still advertises
+// interest) -- Connect with a zero-value ChangeCallbacks{} must keep working
+// exactly like the pre-list_changed Connect(ctx, cfg) did.
+func TestConnect_NilChangeCallbacks_NoHandlersRegistered(t *testing.T) {
+	b, err := backend.Connect(context.Background(),
+		config.BackendConfig{Name: "fake", Transport: "http", URL: httptest.NewServer(newFakeMCPHandler()).URL},
+		backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	if _, err := b.ListTools(context.Background()); err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+}
+
 func TestConnect_HTTPWithHeaders(t *testing.T) {
 	mcpHandler := newFakeMCPHandler()
 
@@ -323,7 +447,7 @@ func TestConnect_HTTPWithHeaders(t *testing.T) {
 		Transport: "http",
 		URL:       srv.URL,
 		Headers:   map[string]string{"Authorization": "Bearer test-token"},
-	})
+	}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -358,7 +482,7 @@ func TestConnect_HTTP_Proxy(t *testing.T) {
 		Transport: "http",
 		URL:       backendSrv.URL,
 		Proxy:     proxySrv.URL,
-	})
+	}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -386,7 +510,7 @@ func TestConnect_HTTP_ProxyNone(t *testing.T) {
 		Transport: "http",
 		URL:       backendSrv.URL,
 		Proxy:     "none",
-	})
+	}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -409,7 +533,7 @@ func TestListResourcesAndResourceTemplates(t *testing.T) {
 	defer srv.Close()
 
 	ctx := context.Background()
-	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL})
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -443,7 +567,7 @@ func TestListPrompts(t *testing.T) {
 	defer srv.Close()
 
 	ctx := context.Background()
-	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL})
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -459,7 +583,7 @@ func TestListPrompts(t *testing.T) {
 }
 
 func TestConnect_UnknownTransport(t *testing.T) {
-	_, err := backend.Connect(context.Background(), config.BackendConfig{Name: "bad", Transport: "carrier-pigeon"})
+	_, err := backend.Connect(context.Background(), config.BackendConfig{Name: "bad", Transport: "carrier-pigeon"}, backend.ChangeCallbacks{})
 	if err == nil {
 		t.Fatal("Connect: expected error for unknown transport, got nil")
 	}
@@ -492,7 +616,7 @@ func TestConnect_HTTP_InjectsTraceparentWhenSpanActive(t *testing.T) {
 	ctx, span := tracer.Start(context.Background(), "test-call")
 	defer span.End()
 
-	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL})
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -544,7 +668,7 @@ func TestConnect_HTTP_DoesNotForwardBaggage(t *testing.T) {
 	}
 	ctx = baggage.ContextWithBaggage(ctx, bag)
 
-	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL})
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
@@ -585,7 +709,7 @@ func TestConnect_HTTP_NoTraceparentWithoutActiveSpan(t *testing.T) {
 	defer srv.Close()
 
 	ctx := context.Background()
-	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL})
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}

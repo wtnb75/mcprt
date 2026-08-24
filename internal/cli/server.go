@@ -233,7 +233,7 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 			ctx, cancel := context.WithTimeout(ctx, backendConnectTimeout)
 			defer cancel()
 
-			b, err := backend.Connect(ctx, bc)
+			b, err := backend.Connect(ctx, bc, backend.ChangeCallbacks{})
 			if err != nil {
 				logger.Error("skipping backend: connect failed", "backend", bc.Name, "error", err)
 				return

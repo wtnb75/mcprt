@@ -24,10 +24,33 @@ type Backend struct {
 	Session *mcp.ClientSession
 }
 
+// ChangeCallbacks are invoked when a connected backend reports that its
+// tool/prompt/resource list has changed. Each func takes no arguments: MCP's
+// list_changed notifications carry no payload, they only signal "go
+// re-list." A nil field means "not interested" and leaves the corresponding
+// SDK handler unset.
+type ChangeCallbacks struct {
+	OnToolsChanged     func()
+	OnPromptsChanged   func()
+	OnResourcesChanged func() // fires for notifications/resources/list_changed, which covers BOTH resources and resource templates per the MCP spec -- there is no separate resource-template notification
+}
+
 // Connect starts (for stdio) or dials (for http) the backend described by
-// cfg, and performs the MCP initialize handshake.
-func Connect(ctx context.Context, cfg config.BackendConfig) (*Backend, error) {
-	client := mcp.NewClient(&mcp.Implementation{Name: "mcprt", Version: "v1"}, nil)
+// cfg, and performs the MCP initialize handshake. cb's non-nil fields are
+// wired as the corresponding notification handlers on the client, so the
+// caller finds out when the backend's tool/prompt/resource list changes.
+func Connect(ctx context.Context, cfg config.BackendConfig, cb ChangeCallbacks) (*Backend, error) {
+	clientOpts := &mcp.ClientOptions{}
+	if cb.OnToolsChanged != nil {
+		clientOpts.ToolListChangedHandler = func(context.Context, *mcp.ToolListChangedRequest) { cb.OnToolsChanged() }
+	}
+	if cb.OnPromptsChanged != nil {
+		clientOpts.PromptListChangedHandler = func(context.Context, *mcp.PromptListChangedRequest) { cb.OnPromptsChanged() }
+	}
+	if cb.OnResourcesChanged != nil {
+		clientOpts.ResourceListChangedHandler = func(context.Context, *mcp.ResourceListChangedRequest) { cb.OnResourcesChanged() }
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "mcprt", Version: "v1"}, clientOpts)
 
 	var transport mcp.Transport
 	switch cfg.Transport {

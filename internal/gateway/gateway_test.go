@@ -72,7 +72,7 @@ func TestGateway_CallOnDeadBackendReturnsError(t *testing.T) {
 	defer httpBackend.Close()
 
 	ctx := context.Background()
-	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-dead", Transport: "http", URL: httpBackend.URL})
+	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-dead", Transport: "http", URL: httpBackend.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-dead: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestGateway_FallsBackWhenWinnerSchemaInvalid(t *testing.T) {
 	defer httpB.Close()
 
 	ctx := context.Background()
-	connB, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-b", Transport: "http", URL: httpB.URL})
+	connB, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-b", Transport: "http", URL: httpB.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-b: %v", err)
 	}
@@ -180,12 +180,12 @@ func TestGateway_RoutesByPriorityAndExposesUniqueTools(t *testing.T) {
 	defer httpB.Close()
 
 	ctx := context.Background()
-	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-a: %v", err)
 	}
 	defer func() { _ = connA.Close() }()
-	connB, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-b", Transport: "http", URL: httpB.URL})
+	connB, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-b", Transport: "http", URL: httpB.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-b: %v", err)
 	}
@@ -314,7 +314,7 @@ func TestGateway_ResourceReadExact(t *testing.T) {
 	defer httpA.Close()
 
 	ctx := context.Background()
-	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-a: %v", err)
 	}
@@ -363,7 +363,7 @@ func TestGateway_ResourceTemplateReadForwardsActualURI(t *testing.T) {
 	defer httpA.Close()
 
 	ctx := context.Background()
-	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-a: %v", err)
 	}
@@ -417,7 +417,7 @@ func TestGateway_ResourceFallsBackWhenWinnerURIInvalid(t *testing.T) {
 	defer httpB.Close()
 
 	ctx := context.Background()
-	connB, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-b", Transport: "http", URL: httpB.URL})
+	connB, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-b", Transport: "http", URL: httpB.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-b: %v", err)
 	}
@@ -485,7 +485,7 @@ func TestGateway_PromptGetForwardsArgumentsAndResult(t *testing.T) {
 	defer httpBackend.Close()
 
 	ctx := context.Background()
-	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "backend", Transport: "http", URL: httpBackend.URL})
+	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "backend", Transport: "http", URL: httpBackend.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend: %v", err)
 	}
@@ -536,12 +536,12 @@ func TestGateway_PromptRoutesByPriorityAndExposesUniquePrompts(t *testing.T) {
 	defer httpB.Close()
 
 	ctx := context.Background()
-	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-a: %v", err)
 	}
 	defer func() { _ = connA.Close() }()
-	connB, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-b", Transport: "http", URL: httpB.URL})
+	connB, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-b", Transport: "http", URL: httpB.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-b: %v", err)
 	}
@@ -621,7 +621,7 @@ func TestGateway_PromptGetOnDeadBackendReturnsError(t *testing.T) {
 	defer httpBackend.Close()
 
 	ctx := context.Background()
-	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-dead", Transport: "http", URL: httpBackend.URL})
+	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-dead", Transport: "http", URL: httpBackend.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-dead: %v", err)
 	}
@@ -665,7 +665,7 @@ func TestGateway_CallLogsSuccessWithMaskedArguments(t *testing.T) {
 	defer httpA.Close()
 
 	ctx := context.Background()
-	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-a: %v", err)
 	}
@@ -728,7 +728,7 @@ func TestGateway_CallLogsNoArguments(t *testing.T) {
 	defer httpA.Close()
 
 	ctx := context.Background()
-	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-a: %v", err)
 	}
@@ -779,7 +779,7 @@ func TestGateway_CallLogsFailure(t *testing.T) {
 	defer httpBackend.Close()
 
 	ctx := context.Background()
-	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-dead", Transport: "http", URL: httpBackend.URL})
+	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-dead", Transport: "http", URL: httpBackend.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-dead: %v", err)
 	}
@@ -845,7 +845,7 @@ func TestGateway_ServeHTTP_LogsRemoteAddr(t *testing.T) {
 	defer httpA.Close()
 
 	ctx := context.Background()
-	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-a: %v", err)
 	}
@@ -917,7 +917,7 @@ func TestGateway_CallCreatesSpanWithParentFromTraceparent(t *testing.T) {
 	defer httpA.Close()
 
 	ctx := context.Background()
-	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-a: %v", err)
 	}
@@ -1010,7 +1010,7 @@ func TestGateway_ResourceReadCreatesSpan(t *testing.T) {
 	defer httpA.Close()
 
 	ctx := context.Background()
-	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL})
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{})
 	if err != nil {
 		t.Fatalf("connect backend-a: %v", err)
 	}
