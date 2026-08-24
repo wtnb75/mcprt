@@ -61,7 +61,7 @@ type Server struct {
 	backends map[string]*backend.Backend
 	maskKeys []string
 
-	mu sync.Mutex //nolint:unused // locked/unlocked starting in Task 3/4's UpdateTools/UpdateResources/UpdatePrompts
+	mu sync.Mutex
 
 	toolEntries   []router.Entry[*mcp.Tool]
 	toolTable     *router.Table[*mcp.Tool]

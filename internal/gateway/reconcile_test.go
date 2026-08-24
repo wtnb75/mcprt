@@ -1,0 +1,193 @@
+package gateway_test
+
+import (
+	"context"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"sort"
+	"sync"
+	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/wtnb75/mcprt/internal/backend"
+	"github.com/wtnb75/mcprt/internal/gateway"
+	"github.com/wtnb75/mcprt/internal/router"
+)
+
+// toolSchema is a minimal valid input schema shared by every test *mcp.Tool
+// literal in this file: mcp.Server.AddTool panics on a nil InputSchema (see
+// TestGateway_FallsBackWhenWinnerSchemaInvalid in gateway_test.go, which
+// exercises that panic deliberately), so every tool that's meant to
+// register successfully here needs one.
+var toolSchema = map[string]any{"type": "object"}
+
+// downstreamToolNames connects a fresh test client to srv and returns the
+// sorted list of tool names it currently sees, for asserting on the effect
+// of an UpdateTools call.
+func downstreamToolNames(t *testing.T, ctx context.Context, srv *mcp.Server) []string {
+	t.Helper()
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	var names []string
+	for tool, err := range session.Tools(ctx, nil) {
+		if err != nil {
+			t.Fatalf("listing tools: %v", err)
+		}
+		names = append(names, tool.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func TestUpdateTools_AddsRemovesAndChangesItems(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx := context.Background()
+
+	entries := []router.Entry[*mcp.Tool]{
+		{BackendName: "a", Items: []*mcp.Tool{
+			{Name: "keep", Description: "v1", InputSchema: toolSchema},
+			{Name: "gone", Description: "v1", InputSchema: toolSchema},
+		}},
+	}
+	table := router.Resolve(entries, toolNameOf, toolRename, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}},
+		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil)
+
+	if got := downstreamToolNames(t, ctx, srv.MCP()); !equalStrings(got, []string{"gone", "keep"}) {
+		t.Fatalf("initial tools = %v, want [gone keep]", got)
+	}
+
+	// "gone" disappears, "keep" changes description, "new" appears.
+	srv.UpdateTools("a", []*mcp.Tool{
+		{Name: "keep", Description: "v2", InputSchema: toolSchema},
+		{Name: "new", Description: "v1", InputSchema: toolSchema},
+	})
+
+	if got := downstreamToolNames(t, ctx, srv.MCP()); !equalStrings(got, []string{"keep", "new"}) {
+		t.Fatalf("tools after UpdateTools = %v, want [keep new]", got)
+	}
+}
+
+func TestUpdateTools_ConflictFallbackPromotesWhenWinnerRemoved(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx := context.Background()
+
+	entries := []router.Entry[*mcp.Tool]{
+		{BackendName: "a", Items: []*mcp.Tool{{Name: "search", Description: "from a", InputSchema: toolSchema}}},
+		{BackendName: "b", Items: []*mcp.Tool{{Name: "search", Description: "from b", InputSchema: toolSchema}}},
+	}
+	table := router.Resolve(entries, toolNameOf, toolRename, nil)
+	if len(table.Conflicts) != 1 || table.Conflicts[0].Winner != "a" {
+		t.Fatalf("initial table.Conflicts = %+v, want one conflict won by \"a\"", table.Conflicts)
+	}
+	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}, "b": {Name: "b"}},
+		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil)
+
+	// backend "a" no longer serves "search": "b"'s definition should take over.
+	srv.UpdateTools("a", nil)
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	var found *mcp.Tool
+	for tool, err := range session.Tools(ctx, nil) {
+		if err != nil {
+			t.Fatalf("listing tools: %v", err)
+		}
+		if tool.Name == "search" {
+			found = tool
+		}
+	}
+	if found == nil || found.Description != "from b" {
+		t.Fatalf("tool \"search\" = %+v, want description \"from b\" (promoted fallback)", found)
+	}
+}
+
+func TestUpdateTools_LogsOnlyNewConflicts(t *testing.T) {
+	var buf logBuffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	// "b" is included from the start (with no tools yet) because
+	// replaceEntry only replaces an *existing* entry's Items -- a
+	// list_changed callback only ever fires for a backend that was already
+	// connected and entered into entries at startup (see replaceEntry's
+	// doc comment in reconcile.go).
+	entries := []router.Entry[*mcp.Tool]{
+		{BackendName: "a", Items: []*mcp.Tool{{Name: "search", InputSchema: toolSchema}}},
+		{BackendName: "b", Items: nil},
+	}
+	table := router.Resolve(entries, toolNameOf, toolRename, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}, "b": {Name: "b"}},
+		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil)
+
+	buf.reset() // discard whatever New itself may have logged (nothing, in this case, but keep the assertion below scoped to UpdateTools)
+
+	// First reconcile introduces a brand-new conflict: must log.
+	srv.UpdateTools("b", []*mcp.Tool{{Name: "search", InputSchema: toolSchema}})
+	if !buf.contains("tool name conflict") {
+		t.Fatalf("log output = %q, want a \"tool name conflict\" warning for the newly-introduced conflict", buf.String())
+	}
+	buf.reset()
+
+	// Second reconcile touches an unrelated tool; the SAME conflict persists
+	// but must NOT be re-logged.
+	srv.UpdateTools("a", []*mcp.Tool{{Name: "search", InputSchema: toolSchema}, {Name: "other", InputSchema: toolSchema}})
+	if buf.contains("tool name conflict") {
+		t.Fatalf("log output = %q, want no \"tool name conflict\" warning for an already-known conflict", buf.String())
+	}
+}
+
+func TestUpdateTools_ConcurrentCallsDoNotRace(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	entries := []router.Entry[*mcp.Tool]{
+		{BackendName: "a", Items: []*mcp.Tool{{Name: "x", InputSchema: toolSchema}}},
+		{BackendName: "b", Items: []*mcp.Tool{{Name: "y", InputSchema: toolSchema}}},
+	}
+	table := router.Resolve(entries, toolNameOf, toolRename, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}, "b": {Name: "b"}},
+		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			srv.UpdateTools("a", []*mcp.Tool{{Name: "x", InputSchema: toolSchema}, {Name: "extra-a", InputSchema: toolSchema}})
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			srv.UpdateTools("b", []*mcp.Tool{{Name: "y", InputSchema: toolSchema}, {Name: "extra-b", InputSchema: toolSchema}})
+		}(i)
+	}
+	wg.Wait()
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

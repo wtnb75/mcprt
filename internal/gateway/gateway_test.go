@@ -261,6 +261,16 @@ func toolRename(t *mcp.Tool, name string) *mcp.Tool {
 	return &c
 }
 
+// logBuffer is an io.Writer that lets tests both feed a slog.Handler and
+// inspect/reset what's been written, without pulling in a mutex-free race
+// (slog serializes Handler.Handle calls per-logger already).
+type logBuffer struct {
+	bytes.Buffer
+}
+
+func (b *logBuffer) reset()                 { b.Reset() }
+func (b *logBuffer) contains(s string) bool { return bytes.Contains(b.Bytes(), []byte(s)) }
+
 func newFakeResourceBackendServer(name string, uris ...string) *mcp.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: name, Version: "v1"}, nil)
 	for _, uri := range uris {
