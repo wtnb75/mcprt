@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -25,35 +26,131 @@ type Tables struct {
 	Prompts           *router.Table[*mcp.Prompt]
 }
 
-// New builds an mcp.Server that exposes tables' resolved
-// tools/resources/prompts, forwarding each call to the backend that owns
-// it. backends must contain an entry for every BackendName referenced in
+// Entries bundles the raw, pre-resolution per-backend item lists Server
+// needs in order to re-run router.Resolve when a backend's list changes
+// (see Server.UpdateTools/UpdateResources/UpdatePrompts). It must be built
+// from the same connected backend set as tables passed to New.
+type Entries struct {
+	Tools             []router.Entry[*mcp.Tool]
+	Resources         []router.Entry[*mcp.Resource]
+	ResourceTemplates []router.Entry[*mcp.ResourceTemplate]
+	Prompts           []router.Entry[*mcp.Prompt]
+}
+
+// Overrides bundles the exposed-name -> winning-backend overrides for each
+// category, as loaded from config.Config. router.Resolve takes overrides as
+// an explicit argument rather than storing it, so Server retains these to
+// re-supply on every reconcile.
+type Overrides struct {
+	Tools             map[string]string
+	Resources         map[string]string
+	ResourceTemplates map[string]string
+	Prompts           map[string]string
+}
+
+// Server wraps an *mcp.Server with the reconcile state needed to react to a
+// backend's list_changed notification: its per-backend raw item lists, the
+// currently-registered routing table, and the exposed-name overrides -- all
+// four independently for tools/resources/resource templates/prompts. mu
+// protects all eight of those fields together; the protected section is
+// always in-memory work (router.Resolve plus the SDK's Add/Remove calls),
+// never backend I/O, so one mutex is enough.
+type Server struct {
+	mcp      *mcp.Server
+	logger   *slog.Logger
+	backends map[string]*backend.Backend
+	maskKeys []string
+
+	mu sync.Mutex //nolint:unused // locked/unlocked starting in Task 3/4's UpdateTools/UpdateResources/UpdatePrompts
+
+	toolEntries   []router.Entry[*mcp.Tool]
+	toolTable     *router.Table[*mcp.Tool]
+	toolOverrides map[string]string
+
+	resourceEntries           []router.Entry[*mcp.Resource]
+	resourceTable             *router.Table[*mcp.Resource]
+	resourceOverrides         map[string]string
+	resourceTemplateEntries   []router.Entry[*mcp.ResourceTemplate]
+	resourceTemplateTable     *router.Table[*mcp.ResourceTemplate]
+	resourceTemplateOverrides map[string]string
+
+	promptEntries   []router.Entry[*mcp.Prompt]
+	promptTable     *router.Table[*mcp.Prompt]
+	promptOverrides map[string]string
+}
+
+// MCP returns the underlying *mcp.Server, for ServeStdio/ServeHTTP.
+func (s *Server) MCP() *mcp.Server { return s.mcp }
+
+// Backend looks up a connected backend by name, for the cli layer's
+// list_changed callbacks (see internal/cli/server.go) to re-list from
+// without keeping their own separate reference.
+func (s *Server) Backend(name string) *backend.Backend { return s.backends[name] }
+
+// emptyTable returns t, or a fresh empty table if t is nil -- New is called
+// with tables.X == nil when a category has no items anywhere (see New's
+// existing nil checks below), and Update* assumes toolTable etc are never
+// nil so its diff loops don't need their own nil guards.
+func emptyTable[T any](t *router.Table[T]) *router.Table[T] {
+	if t != nil {
+		return t
+	}
+	return &router.Table[T]{}
+}
+
+// New builds a Server that exposes tables' resolved tools/resources/prompts,
+// forwarding each call to the backend that owns it, and retains entries and
+// overrides so a later UpdateTools/UpdateResources/UpdatePrompts call can
+// re-run router.Resolve when a backend reports its list has changed.
+// backends must contain an entry for every BackendName referenced in
 // tables (the caller builds both from the same set of connected backends).
-func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Tables, maskKeys []string) *mcp.Server {
-	srv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{Logger: logger})
+func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Tables, entries Entries, overrides Overrides, maskKeys []string) *Server {
+	mcpSrv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{Logger: logger})
+
+	s := &Server{
+		mcp:      mcpSrv,
+		logger:   logger,
+		backends: backends,
+		maskKeys: maskKeys,
+
+		toolEntries:   entries.Tools,
+		toolTable:     emptyTable(tables.Tools),
+		toolOverrides: overrides.Tools,
+
+		resourceEntries:           entries.Resources,
+		resourceTable:             emptyTable(tables.Resources),
+		resourceOverrides:         overrides.Resources,
+		resourceTemplateEntries:   entries.ResourceTemplates,
+		resourceTemplateTable:     emptyTable(tables.ResourceTemplates),
+		resourceTemplateOverrides: overrides.ResourceTemplates,
+
+		promptEntries:   entries.Prompts,
+		promptTable:     emptyTable(tables.Prompts),
+		promptOverrides: overrides.Prompts,
+	}
 
 	if tables.Tools != nil {
 		for _, resolved := range tables.Tools.Items {
-			registerTool(srv, logger, backends, resolved, maskKeys)
+			registerTool(mcpSrv, logger, backends, resolved, maskKeys)
 		}
 	}
 	if tables.Resources != nil {
 		for _, resolved := range tables.Resources.Items {
-			registerResource(srv, logger, backends, resolved, maskKeys)
+			registerResource(mcpSrv, logger, backends, resolved, maskKeys)
 		}
 	}
 	if tables.ResourceTemplates != nil {
 		for _, resolved := range tables.ResourceTemplates.Items {
-			registerResourceTemplate(srv, logger, backends, resolved, maskKeys)
+			registerResourceTemplate(mcpSrv, logger, backends, resolved, maskKeys)
 		}
 	}
 	if tables.Prompts != nil {
 		for _, resolved := range tables.Prompts.Items {
-			registerPrompt(srv, logger, backends, resolved, maskKeys)
+			registerPrompt(mcpSrv, logger, backends, resolved, maskKeys)
 		}
 	}
 
-	return srv
+	return s
 }
 
 // registerTool registers resolved.Item, falling back to the next

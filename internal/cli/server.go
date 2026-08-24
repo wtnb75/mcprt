@@ -153,7 +153,7 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 		Resources:         resourceTable,
 		ResourceTemplates: resourceTemplateTable,
 		Prompts:           promptTable,
-	}, cfg.Logging.MaskKeys)
+	}, gateway.Entries{}, gateway.Overrides{}, cfg.Logging.MaskKeys)
 
 	logger.Info("listening", "stdio", cfg.Listen.Stdio, "http", cfg.Listen.HTTP)
 
@@ -161,11 +161,11 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	errCh := make(chan error, 2)
 	if cfg.Listen.Stdio {
 		running++
-		go func() { errCh <- gateway.ServeStdio(ctx, srv) }()
+		go func() { errCh <- gateway.ServeStdio(ctx, srv.MCP()) }()
 	}
 	if cfg.Listen.HTTP != "" {
 		running++
-		go func() { errCh <- gateway.ServeHTTP(ctx, srv, cfg.Listen.HTTP) }()
+		go func() { errCh <- gateway.ServeHTTP(ctx, srv.MCP(), cfg.Listen.HTTP) }()
 	}
 
 	// Log each listener's outcome as it arrives, so a listener that fails
