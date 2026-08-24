@@ -180,6 +180,137 @@ func TestUpdateTools_ConcurrentCallsDoNotRace(t *testing.T) {
 	wg.Wait()
 }
 
+func resourceNameOf(r *mcp.Resource) string { return r.URI }
+
+func resourceRename(r *mcp.Resource, name string) *mcp.Resource {
+	c := *r
+	c.URI = name
+	return &c
+}
+
+func resourceTemplateNameOf(t *mcp.ResourceTemplate) string { return t.URITemplate }
+
+func resourceTemplateRename(t *mcp.ResourceTemplate, name string) *mcp.ResourceTemplate {
+	c := *t
+	c.URITemplate = name
+	return &c
+}
+
+func TestUpdateResources_AddsRemovesResourcesAndTemplatesInOneCall(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx := context.Background()
+	resourceEntries := []router.Entry[*mcp.Resource]{
+		{BackendName: "a", Items: []*mcp.Resource{{URI: "file:///keep", Name: "keep"}, {URI: "file:///gone", Name: "gone"}}},
+	}
+	templateEntries := []router.Entry[*mcp.ResourceTemplate]{
+		{BackendName: "a", Items: []*mcp.ResourceTemplate{{URITemplate: "file:///dir/{f}", Name: "dir"}}},
+	}
+	resourceTable := router.Resolve(resourceEntries, resourceNameOf, resourceRename, nil)
+	templateTable := router.Resolve(templateEntries, resourceTemplateNameOf, resourceTemplateRename, nil)
+
+	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}},
+		gateway.Tables{Resources: resourceTable, ResourceTemplates: templateTable},
+		gateway.Entries{Resources: resourceEntries, ResourceTemplates: templateEntries},
+		gateway.Overrides{}, nil)
+
+	srv.UpdateResources("a",
+		[]*mcp.Resource{{URI: "file:///keep", Name: "keep"}, {URI: "file:///new", Name: "new"}},
+		nil, // templates all removed
+	)
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	var uris []string
+	for r, err := range session.Resources(ctx, nil) {
+		if err != nil {
+			t.Fatalf("listing resources: %v", err)
+		}
+		uris = append(uris, r.URI)
+	}
+	sort.Strings(uris)
+	if !equalStrings(uris, []string{"file:///keep", "file:///new"}) {
+		t.Fatalf("resources after UpdateResources = %v, want [file:///keep file:///new]", uris)
+	}
+
+	var templateCount int
+	for range session.ResourceTemplates(ctx, nil) {
+		templateCount++
+	}
+	if templateCount != 0 {
+		t.Fatalf("resource templates after UpdateResources = %d, want 0", templateCount)
+	}
+}
+
+func TestUpdatePrompts_AddsRemovesAndChangesItems(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx := context.Background()
+
+	entries := []router.Entry[*mcp.Prompt]{
+		{BackendName: "a", Items: []*mcp.Prompt{{Name: "keep", Description: "v1"}, {Name: "gone", Description: "v1"}}},
+	}
+	table := router.Resolve(entries, promptNameOf, promptRename, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}},
+		gateway.Tables{Prompts: table}, gateway.Entries{Prompts: entries}, gateway.Overrides{}, nil)
+
+	srv.UpdatePrompts("a", []*mcp.Prompt{{Name: "keep", Description: "v2"}, {Name: "new", Description: "v1"}})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	var names []string
+	for p, err := range session.Prompts(ctx, nil) {
+		if err != nil {
+			t.Fatalf("listing prompts: %v", err)
+		}
+		names = append(names, p.Name)
+	}
+	sort.Strings(names)
+	if !equalStrings(names, []string{"keep", "new"}) {
+		t.Fatalf("prompts after UpdatePrompts = %v, want [keep new]", names)
+	}
+}
+
+func TestUpdateResourcesAndUpdatePrompts_ConcurrentCallsDoNotRace(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	resourceEntries := []router.Entry[*mcp.Resource]{{BackendName: "a", Items: []*mcp.Resource{{URI: "file:///x", Name: "x"}}}}
+	promptEntries := []router.Entry[*mcp.Prompt]{{BackendName: "a", Items: []*mcp.Prompt{{Name: "p"}}}}
+	resourceTable := router.Resolve(resourceEntries, resourceNameOf, resourceRename, nil)
+	promptTable := router.Resolve(promptEntries, promptNameOf, promptRename, nil)
+
+	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}},
+		gateway.Tables{Resources: resourceTable, Prompts: promptTable},
+		gateway.Entries{Resources: resourceEntries, Prompts: promptEntries},
+		gateway.Overrides{}, nil)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			srv.UpdateResources("a", []*mcp.Resource{{URI: "file:///x", Name: "x"}, {URI: "file:///y", Name: "y"}}, nil)
+		}()
+		go func() {
+			defer wg.Done()
+			srv.UpdatePrompts("a", []*mcp.Prompt{{Name: "p"}, {Name: "q"}})
+		}()
+	}
+	wg.Wait()
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
