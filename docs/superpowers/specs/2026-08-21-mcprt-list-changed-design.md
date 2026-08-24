@@ -177,7 +177,7 @@ type gwHolder struct {
    - 失敗したら`logger.Warn`して終了（直前の既知の一覧を保持し、このreconcileはスキップする）
 4. 成功したら`gw.UpdateTools(backendName, tools)`を呼ぶ
 5. `UpdateTools`内: mutex取得 → 該当backendの`toolEntries`を更新 → `router.Resolve`で全体再計算 → 新旧`Table.Items`を突き合わせて`RemoveTools`/`AddTool`を必要な分だけ呼ぶ → 新しいconflictがあればWARNログ → mutex解放
-6. SDKが登録内容の変化を検知し、自動的にdownstreamへ`notifications/tools/list_changed`を送信する（Remove/Addそれぞれの呼び出しごとに1回ずつ発火するため、変更点が複数あれば複数回に分かれてバーストする。デバウンスなし方針と一貫）
+6. SDKが登録内容の変化を検知し、自動的にdownstreamへ`notifications/tools/list_changed`を送信する（実装確認：SDK内部は`changeAndNotify`が`notificationDelay`＝10msの`time.AfterFunc`タイマーで送信をまとめており、1回の`UpdateTools`呼び出し内でRemove/Addが複数回発生してもdownstreamへの送信は1回に集約される。これはSDK側の実装詳細であり、mcprt自身は何のデバウンス／コーリアレスも実装しない、というスコープ外方針とは矛盾しない）
 
 resources用コールバックのみ、`ListResources`と`ListResourceTemplates`の両方を再実行し、`UpdateResources`が両方のTableを1回のロック区間内でまとめて差分適用する。
 

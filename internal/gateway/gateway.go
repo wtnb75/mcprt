@@ -17,8 +17,9 @@ import (
 )
 
 // Tables bundles the independent routing tables the gateway serves: tools,
-// resources, resource templates, and prompts. They are built once at startup
-// and never change while the gateway runs.
+// resources, resource templates, and prompts. New uses them as the initial
+// state; Server.UpdateTools/UpdateResources/UpdatePrompts replace them later
+// in response to a backend's list_changed notification (see reconcile.go).
 type Tables struct {
 	Tools             *router.Table[*mcp.Tool]
 	Resources         *router.Table[*mcp.Resource]

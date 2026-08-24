@@ -130,22 +130,22 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 		}
 	}()
 
-	toolTable := router.Resolve(conn.toolEntries, toolNameOf, toolRename, cfg.Overrides)
+	toolTable := router.Resolve(conn.toolEntries, gateway.ToolNameOf, gateway.ToolRename, cfg.Overrides)
 	for _, c := range toolTable.Conflicts {
 		logger.Warn("tool name conflict", "tool", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
 
-	resourceTable := router.Resolve(conn.resourceEntries, resourceNameOf, resourceRename, cfg.ResourceOverrides)
+	resourceTable := router.Resolve(conn.resourceEntries, gateway.ResourceNameOf, gateway.ResourceRename, cfg.ResourceOverrides)
 	for _, c := range resourceTable.Conflicts {
 		logger.Warn("resource URI conflict", "uri", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
 
-	resourceTemplateTable := router.Resolve(conn.resourceTemplateEntries, resourceTemplateNameOf, resourceTemplateRename, cfg.ResourceTemplateOverrides)
+	resourceTemplateTable := router.Resolve(conn.resourceTemplateEntries, gateway.ResourceTemplateNameOf, gateway.ResourceTemplateRename, cfg.ResourceTemplateOverrides)
 	for _, c := range resourceTemplateTable.Conflicts {
 		logger.Warn("resource template URI conflict", "uriTemplate", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
 
-	promptTable := router.Resolve(conn.promptEntries, promptNameOf, promptRename, cfg.PromptOverrides)
+	promptTable := router.Resolve(conn.promptEntries, gateway.PromptNameOf, gateway.PromptRename, cfg.PromptOverrides)
 	for _, c := range promptTable.Conflicts {
 		logger.Warn("prompt name conflict", "prompt", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
@@ -413,36 +413,4 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 		result.promptEntries = append(result.promptEntries, o.promptEntry)
 	}
 	return result
-}
-
-func toolNameOf(t *mcp.Tool) string { return t.Name }
-
-func toolRename(t *mcp.Tool, name string) *mcp.Tool {
-	c := *t
-	c.Name = name
-	return &c
-}
-
-func resourceNameOf(r *mcp.Resource) string { return r.URI }
-
-func resourceRename(r *mcp.Resource, name string) *mcp.Resource {
-	c := *r
-	c.URI = name
-	return &c
-}
-
-func resourceTemplateNameOf(t *mcp.ResourceTemplate) string { return t.URITemplate }
-
-func resourceTemplateRename(t *mcp.ResourceTemplate, name string) *mcp.ResourceTemplate {
-	c := *t
-	c.URITemplate = name
-	return &c
-}
-
-func promptNameOf(p *mcp.Prompt) string { return p.Name }
-
-func promptRename(p *mcp.Prompt, name string) *mcp.Prompt {
-	c := *p
-	c.Name = name
-	return &c
 }

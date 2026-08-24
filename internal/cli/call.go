@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/wtnb75/mcprt/internal/config"
+	"github.com/wtnb75/mcprt/internal/gateway"
 	"github.com/wtnb75/mcprt/internal/router"
 )
 
@@ -68,7 +69,7 @@ func runCall(ctx context.Context, cmd *cobra.Command, configPath, toolName, args
 		}
 	}()
 
-	table := router.Resolve(conn.toolEntries, toolNameOf, toolRename, cfg.Overrides)
+	table := router.Resolve(conn.toolEntries, gateway.ToolNameOf, gateway.ToolRename, cfg.Overrides)
 	resolved, ok := table.Items[toolName]
 	if !ok {
 		return fmt.Errorf("unknown tool %q", toolName)

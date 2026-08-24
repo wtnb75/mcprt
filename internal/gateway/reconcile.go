@@ -9,33 +9,42 @@ import (
 	"github.com/wtnb75/mcprt/internal/router"
 )
 
-func toolNameOf(t *mcp.Tool) string { return t.Name }
+// ToolNameOf, ToolRename, ResourceNameOf, ResourceRename,
+// ResourceTemplateNameOf, ResourceTemplateRename, PromptNameOf, and
+// PromptRename are the router.Resolve nameOf/rename pair for each category.
+// They are exported so both the initial startup resolution (internal/cli's
+// runServer/runCall/runList) and every later reconcile (UpdateTools/
+// UpdateResources/UpdatePrompts below) resolve names identically -- two
+// independent copies of "how to name/rename a tool" drifting apart would
+// silently break reconcile's diffing against the startup-built table.
 
-func toolRename(t *mcp.Tool, name string) *mcp.Tool {
+func ToolNameOf(t *mcp.Tool) string { return t.Name }
+
+func ToolRename(t *mcp.Tool, name string) *mcp.Tool {
 	c := *t
 	c.Name = name
 	return &c
 }
 
-func resourceNameOf(r *mcp.Resource) string { return r.URI }
+func ResourceNameOf(r *mcp.Resource) string { return r.URI }
 
-func resourceRename(r *mcp.Resource, name string) *mcp.Resource {
+func ResourceRename(r *mcp.Resource, name string) *mcp.Resource {
 	c := *r
 	c.URI = name
 	return &c
 }
 
-func resourceTemplateNameOf(t *mcp.ResourceTemplate) string { return t.URITemplate }
+func ResourceTemplateNameOf(t *mcp.ResourceTemplate) string { return t.URITemplate }
 
-func resourceTemplateRename(t *mcp.ResourceTemplate, name string) *mcp.ResourceTemplate {
+func ResourceTemplateRename(t *mcp.ResourceTemplate, name string) *mcp.ResourceTemplate {
 	c := *t
 	c.URITemplate = name
 	return &c
 }
 
-func promptNameOf(p *mcp.Prompt) string { return p.Name }
+func PromptNameOf(p *mcp.Prompt) string { return p.Name }
 
-func promptRename(p *mcp.Prompt, name string) *mcp.Prompt {
+func PromptRename(p *mcp.Prompt, name string) *mcp.Prompt {
 	c := *p
 	c.Name = name
 	return &c
@@ -82,7 +91,7 @@ func (s *Server) UpdateTools(backendName string, items []*mcp.Tool) {
 	defer s.mu.Unlock()
 
 	s.toolEntries = replaceEntry(s.toolEntries, backendName, items)
-	newTable := router.Resolve(s.toolEntries, toolNameOf, toolRename, s.toolOverrides)
+	newTable := router.Resolve(s.toolEntries, ToolNameOf, ToolRename, s.toolOverrides)
 
 	for name := range s.toolTable.Items {
 		if _, ok := newTable.Items[name]; !ok {
@@ -108,7 +117,7 @@ func (s *Server) UpdateResources(backendName string, resources []*mcp.Resource, 
 	defer s.mu.Unlock()
 
 	s.resourceEntries = replaceEntry(s.resourceEntries, backendName, resources)
-	newResourceTable := router.Resolve(s.resourceEntries, resourceNameOf, resourceRename, s.resourceOverrides)
+	newResourceTable := router.Resolve(s.resourceEntries, ResourceNameOf, ResourceRename, s.resourceOverrides)
 	for name := range s.resourceTable.Items {
 		if _, ok := newResourceTable.Items[name]; !ok {
 			s.mcp.RemoveResources(name)
@@ -123,7 +132,7 @@ func (s *Server) UpdateResources(backendName string, resources []*mcp.Resource, 
 	s.resourceTable = newResourceTable
 
 	s.resourceTemplateEntries = replaceEntry(s.resourceTemplateEntries, backendName, templates)
-	newTemplateTable := router.Resolve(s.resourceTemplateEntries, resourceTemplateNameOf, resourceTemplateRename, s.resourceTemplateOverrides)
+	newTemplateTable := router.Resolve(s.resourceTemplateEntries, ResourceTemplateNameOf, ResourceTemplateRename, s.resourceTemplateOverrides)
 	for name := range s.resourceTemplateTable.Items {
 		if _, ok := newTemplateTable.Items[name]; !ok {
 			s.mcp.RemoveResourceTemplates(name)
@@ -145,7 +154,7 @@ func (s *Server) UpdatePrompts(backendName string, items []*mcp.Prompt) {
 	defer s.mu.Unlock()
 
 	s.promptEntries = replaceEntry(s.promptEntries, backendName, items)
-	newTable := router.Resolve(s.promptEntries, promptNameOf, promptRename, s.promptOverrides)
+	newTable := router.Resolve(s.promptEntries, PromptNameOf, PromptRename, s.promptOverrides)
 
 	for name := range s.promptTable.Items {
 		if _, ok := newTable.Items[name]; !ok {

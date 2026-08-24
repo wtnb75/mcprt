@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/wtnb75/mcprt/internal/config"
+	"github.com/wtnb75/mcprt/internal/gateway"
 	"github.com/wtnb75/mcprt/internal/router"
 )
 
@@ -82,7 +83,7 @@ func runList(ctx context.Context, cmd *cobra.Command, configPath string, jsonOut
 		}
 	}()
 
-	table := router.Resolve(conn.toolEntries, toolNameOf, toolRename, cfg.Overrides)
+	table := router.Resolve(conn.toolEntries, gateway.ToolNameOf, gateway.ToolRename, cfg.Overrides)
 
 	if jsonOutput {
 		return printListJSON(cmd, listToolDetails(table), listConflicts(table))
