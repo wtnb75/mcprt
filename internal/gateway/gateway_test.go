@@ -61,6 +61,45 @@ func newFakeBackendServer(name string, toolNames ...string) *mcp.Server {
 	return srv
 }
 
+// TestGateway_Backends checks that Backends returns every backend the
+// Server was constructed with, keyed by name -- scheduleDrain (see
+// internal/cli/server.go) relies on this to force-close a superseded
+// generation's connections.
+func TestGateway_Backends(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendServerA := newFakeBackendServer("backend-a", "ping")
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServerA }, nil))
+	defer httpA.Close()
+	connA, err := backend.Connect(context.Background(), config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = connA.Close() }()
+
+	backendServerB := newFakeBackendServer("backend-b", "pong")
+	httpB := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServerB }, nil))
+	defer httpB.Close()
+	connB, err := backend.Connect(context.Background(), config.BackendConfig{Name: "backend-b", Transport: "http", URL: httpB.URL}, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("connect backend-b: %v", err)
+	}
+	defer func() { _ = connB.Close() }()
+
+	want := map[string]*backend.Backend{"backend-a": connA, "backend-b": connB}
+	srv := gateway.New(logger, want, gateway.Tables{}, gateway.Entries{}, gateway.Overrides{}, nil)
+
+	got := srv.Backends()
+	if len(got) != len(want) {
+		t.Fatalf("Backends() returned %d entries, want %d", len(got), len(want))
+	}
+	for name, b := range want {
+		if got[name] != b {
+			t.Fatalf("Backends()[%q] = %v, want %v", name, got[name], b)
+		}
+	}
+}
+
 // TestGateway_CallOnDeadBackendReturnsError checks that a call to a backend
 // that is no longer reachable surfaces the error to the client (callHandler
 // also logs it, which isn't asserted here).

@@ -88,6 +88,11 @@ func (s *Server) MCP() *mcp.Server { return s.mcp }
 // without keeping their own separate reference.
 func (s *Server) Backend(name string) *backend.Backend { return s.backends[name] }
 
+// Backends returns every currently connected backend, keyed by name, for
+// scheduleDrain (see internal/cli/server.go) to force-close a superseded
+// generation's connections after its drain timeout.
+func (s *Server) Backends() map[string]*backend.Backend { return s.backends }
+
 // emptyTable returns t, or a fresh empty table if t is nil -- New is called
 // with tables.X == nil when a category has no items anywhere (see New's
 // existing nil checks below), and Update* assumes toolTable etc are never
