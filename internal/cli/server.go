@@ -112,9 +112,6 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
-	if !cfg.Listen.Stdio && cfg.Listen.HTTP == "" {
-		return errors.New("no listener configured: enable listen.stdio or set listen.http")
-	}
 
 	// A child context we can cancel ourselves: if one listener fails while
 	// another is still healthy, cancelling here tells the healthy one to
@@ -122,13 +119,67 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var gwH gwHolder
-	conn := connectBackends(ctx, logger, cfg.Backends, &gwH)
+	srv, err := buildGateway(ctx, logger, cfg)
+	if err != nil {
+		return err
+	}
 	defer func() {
-		for _, b := range conn.backends {
+		for _, b := range srv.Backends() {
 			_ = b.Close()
 		}
 	}()
+
+	logger.Info("listening", "stdio", cfg.Listen.Stdio, "http", cfg.Listen.HTTP)
+
+	running := 0
+	errCh := make(chan error, 2)
+	if cfg.Listen.Stdio {
+		running++
+		go func() { errCh <- gateway.ServeStdio(ctx, srv.MCP()) }()
+	}
+	if cfg.Listen.HTTP != "" {
+		running++
+		go func() { errCh <- gateway.ServeHTTP(ctx, func() *mcp.Server { return srv.MCP() }, cfg.Listen.HTTP) }()
+	}
+
+	// Log each listener's outcome as it arrives, so a listener that fails
+	// while another is still healthy is reported immediately. A cancelled
+	// context is how a clean shutdown reaches ServeStdio, so it isn't a
+	// failure. cancel() on a real failure stops the other listener too,
+	// instead of waiting on it indefinitely.
+	var firstErr error
+	for i := 0; i < running; i++ {
+		err := <-errCh
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, context.Canceled) {
+			logger.Debug("listener stopped due to shutdown", "error", err)
+			continue
+		}
+		logger.Error("listener stopped with error", "error", err)
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+	}
+	return firstErr
+}
+
+// buildGateway connects to every configured backend (see connectBackends)
+// and builds a fresh *gateway.Server from scratch. Called once at startup,
+// and (from Task 5's watchSIGHUP) once per SIGHUP-triggered reload with a
+// freshly-loaded cfg -- the two call sites are otherwise identical, which is
+// the whole point of the graceful-restart design: nothing about
+// config-derived state is patched piecemeal, it's all rebuilt the same way
+// every time.
+func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) (*gateway.Server, error) {
+	if !cfg.Listen.Stdio && cfg.Listen.HTTP == "" {
+		return nil, errors.New("no listener configured: enable listen.stdio or set listen.http")
+	}
+
+	var gwH gwHolder
+	conn := connectBackends(ctx, logger, cfg.Backends, &gwH)
 
 	toolTable := router.Resolve(conn.toolEntries, gateway.ToolNameOf, gateway.ToolRename, cfg.Overrides)
 	for _, c := range toolTable.Conflicts {
@@ -168,41 +219,7 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	}, cfg.Logging.MaskKeys)
 	gwH.ptr.Store(srv)
 
-	logger.Info("listening", "stdio", cfg.Listen.Stdio, "http", cfg.Listen.HTTP)
-
-	running := 0
-	errCh := make(chan error, 2)
-	if cfg.Listen.Stdio {
-		running++
-		go func() { errCh <- gateway.ServeStdio(ctx, srv.MCP()) }()
-	}
-	if cfg.Listen.HTTP != "" {
-		running++
-		go func() { errCh <- gateway.ServeHTTP(ctx, func() *mcp.Server { return srv.MCP() }, cfg.Listen.HTTP) }()
-	}
-
-	// Log each listener's outcome as it arrives, so a listener that fails
-	// while another is still healthy is reported immediately. A cancelled
-	// context is how a clean shutdown reaches ServeStdio, so it isn't a
-	// failure. cancel() on a real failure stops the other listener too,
-	// instead of waiting on it indefinitely.
-	var firstErr error
-	for i := 0; i < running; i++ {
-		err := <-errCh
-		if err == nil {
-			continue
-		}
-		if errors.Is(err, context.Canceled) {
-			logger.Debug("listener stopped due to shutdown", "error", err)
-			continue
-		}
-		logger.Error("listener stopped with error", "error", err)
-		if firstErr == nil {
-			firstErr = err
-			cancel()
-		}
-	}
-	return firstErr
+	return srv, nil
 }
 
 // gwHolder lets a backend's ChangeCallbacks closures (built inside

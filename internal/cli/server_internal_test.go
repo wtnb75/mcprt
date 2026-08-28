@@ -266,6 +266,63 @@ func TestConnectBackends_LogsSuccessfulConnect(t *testing.T) {
 	}
 }
 
+// TestBuildGateway_NoListenerConfigured checks that buildGateway itself
+// validates a listener is configured, independent of runServer's own
+// earlier check -- watchSIGHUP (Task 5) relies on buildGateway to reject a
+// reloaded config with no listener before swapping anything in.
+func TestBuildGateway_NoListenerConfigured(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := &config.Config{}
+	if _, err := buildGateway(context.Background(), logger, cfg); err == nil {
+		t.Fatal("buildGateway: expected error when no listener is configured, got nil")
+	}
+}
+
+// TestBuildGateway_Success checks that buildGateway connects to every
+// configured backend and returns a *gateway.Server exposing their tools --
+// the same construction runServer used to do inline, now reusable for a
+// SIGHUP-triggered reload.
+func TestBuildGateway_Success(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	mcp.AddTool(backendSrv, &mcp.Tool{Name: "ping", Description: "ping"},
+		func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
+			return nil, struct{}{}, nil
+		})
+	backendHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil))
+	defer backendHTTP.Close()
+
+	cfg := &config.Config{
+		Listen: config.ListenConfig{HTTP: "127.0.0.1:0"},
+		Backends: []config.BackendConfig{
+			{Name: "fake", Transport: "http", URL: backendHTTP.URL},
+		},
+	}
+
+	srv, err := buildGateway(context.Background(), logger, cfg)
+	if err != nil {
+		t.Fatalf("buildGateway: %v", err)
+	}
+	// Close the backend connection before the deferred backendHTTP.Close()
+	// runs: httptest.Server.Close() blocks until all outstanding requests
+	// complete, and a streamable-HTTP backend's standalone SSE stream stays
+	// open indefinitely for server-initiated notifications, so leaving it
+	// open here would hang backendHTTP.Close() (and the whole test binary)
+	// instead of returning promptly.
+	defer func() {
+		for _, b := range srv.Backends() {
+			_ = b.Close()
+		}
+	}()
+	if len(srv.Backends()) != 1 {
+		t.Fatalf("Backends() = %v, want 1 entry", srv.Backends())
+	}
+	if srv.Backend("fake") == nil {
+		t.Fatal(`Backend("fake") = nil, want the connected backend`)
+	}
+}
+
 func TestParseLogFormat(t *testing.T) {
 	if _, err := parseLogFormat("text"); err != nil {
 		t.Fatalf("parseLogFormat(\"text\"): %v", err)
