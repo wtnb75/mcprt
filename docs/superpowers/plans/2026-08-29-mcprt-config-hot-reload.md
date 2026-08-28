@@ -1071,10 +1071,18 @@ backends:
 	go func() {
 		execErr <- cli.Execute(ctx, []string{"server", "--config", configPath})
 	}()
-	t.Cleanup(func() {
-		cancel()
-		<-execErr
-	})
+	// cancel()+<-execErr run as explicit statements at the very end of this
+	// function (see below), NOT via t.Cleanup or defer -- matching the
+	// existing TestServerCommand_ServesAggregatedTools pattern in this same
+	// file. Plain defers registered before this point (httpA.Close(),
+	// httpB.Close() below) only fire once the function actually returns,
+	// which is after these explicit statements run; if they were deferred
+	// (or handled via t.Cleanup, which always runs after every plain defer
+	// in this function has already fired) they'd race the still-running
+	// mcprt process's own open connections to backendA/backendB, and
+	// httpA.Close()/httpB.Close() would block for real waiting on a
+	// connection nothing has told to close yet -- the same class of hang
+	// Task 5 found and fixed in its own tests.
 
 	dial := func() *mcp.ClientSession {
 		client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
@@ -1149,6 +1157,11 @@ backends:
 	// never disturbed by the swap.
 	if got := toolNames(t, oldSession); len(got) != 1 || got[0] != "from-a" {
 		t.Fatalf("oldSession tools after reload = %v, want [from-a] (must stay on its original backend)", got)
+	}
+
+	cancel()
+	if err := <-execErr; err != nil {
+		t.Fatalf("server exited with error: %v", err)
 	}
 }
 ```
