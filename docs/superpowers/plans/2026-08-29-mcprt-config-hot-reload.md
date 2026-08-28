@@ -666,18 +666,6 @@ func newFakeBackendHTTP(toolName string) *httptest.Server {
 	return httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 }
 
-// toolNamesOf lists resolved.Item.Name for every item in table.Items, for
-// asserting which tools a *gateway.Server currently exposes without going
-// through a real MCP session.
-func toolNamesOf(table *router.Table[*mcp.Tool]) []string {
-	var names []string
-	for _, resolved := range table.Items {
-		names = append(names, resolved.Item.Name)
-	}
-	sort.Strings(names)
-	return names
-}
-
 // TestWatchSIGHUP_ReloadsConfig checks that a SIGHUP delivered to the test
 // process makes watchSIGHUP rebuild the gateway from the (rewritten) config
 // file and swap current to the new generation.
@@ -712,6 +700,29 @@ func TestWatchSIGHUP_ReloadsConfig(t *testing.T) {
 	}
 	current := new(atomic.Pointer[gateway.Server])
 	current.Store(srv)
+	// buildGateway's connected backend keeps its standalone SSE stream open
+	// on a context detached from genCtx (see the go-sdk's streamable client:
+	// Connect deliberately detaches so the stream survives the connect-time
+	// context expiring) -- cancelling genCtx alone never closes it. Without
+	// this defer, backendA/backendB.Close() above would block for real,
+	// waiting on a connection nothing ever closes; TestBuildGateway_Success
+	// (Task 3) established this same pattern for the same reason.
+	defer func() {
+		for _, b := range current.Load().Backends() {
+			_ = b.Close()
+		}
+	}()
+
+	// Ensure SIGHUP's process-wide disposition is no longer "default"
+	// (terminate) before watchSIGHUP's own signal.Notify has necessarily
+	// run inside the goroutine below -- otherwise the syscall.Kill a few
+	// lines down could race a still-unregistered handler and kill this
+	// whole test binary instead of being delivered as a normal signal. Any
+	// number of signal.Notify registrations for the same signal all
+	// receive it, so this doesn't interfere with watchSIGHUP's own handling.
+	sighupRegistered := make(chan os.Signal, 1)
+	signal.Notify(sighupRegistered, syscall.SIGHUP)
+	defer signal.Stop(sighupRegistered)
 
 	done := make(chan struct{})
 	go func() {
@@ -743,12 +754,33 @@ func TestWatchSIGHUP_ReloadsConfig(t *testing.T) {
 	<-done
 }
 
+// syncBuffer is bytes.Buffer plus a mutex around every access, for tests
+// where one goroutine writes log output (via slog, which issues one Write
+// per formatted line) while the test goroutine concurrently polls it -- a
+// bare bytes.Buffer is not safe for that and -race catches it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // TestWatchSIGHUP_IgnoresReloadWithoutHTTPListener checks that a SIGHUP
 // whose newly-loaded config has no HTTP listener leaves current untouched
 // and logs a warning, instead of swapping in a *gateway.Server nothing can
 // reach (hot-reload is HTTP-only, see this plan's Global Constraints).
 func TestWatchSIGHUP_IgnoresReloadWithoutHTTPListener(t *testing.T) {
-	var logBuf bytes.Buffer
+	var logBuf syncBuffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 
 	backendA := newFakeBackendHTTP("from-a")
@@ -773,6 +805,15 @@ func TestWatchSIGHUP_IgnoresReloadWithoutHTTPListener(t *testing.T) {
 	}
 	current := new(atomic.Pointer[gateway.Server])
 	current.Store(srv)
+	defer func() {
+		for _, b := range current.Load().Backends() {
+			_ = b.Close()
+		}
+	}()
+
+	sighupRegistered := make(chan os.Signal, 1)
+	signal.Notify(sighupRegistered, syscall.SIGHUP)
+	defer signal.Stop(sighupRegistered)
 
 	done := make(chan struct{})
 	go func() {
@@ -861,7 +902,7 @@ func TestScheduleDrain_ForceClosesBackendsAfterTimeout(t *testing.T) {
 }
 ```
 
-このテストコードを動かすには、`internal/cli/server_internal_test.go`の既存importに以下を追加する必要がある: `"fmt"`, `"sort"`, `"sync/atomic"`, `"syscall"`, `"github.com/wtnb75/mcprt/internal/gateway"`, `"github.com/wtnb75/mcprt/internal/router"`。（`"bytes"`, `"net/http/httptest"`, `"os"`, `"path/filepath"`, `"strings"`は既存importに含まれているため追加不要。）
+このテストコードを動かすには、`internal/cli/server_internal_test.go`の既存importに以下を追加する必要がある: `"fmt"`, `"os/signal"`, `"sync"`, `"sync/atomic"`, `"syscall"`, `"github.com/wtnb75/mcprt/internal/gateway"`。（`"bytes"`, `"net/http/httptest"`, `"os"`, `"path/filepath"`, `"strings"`は既存importに含まれているため追加不要。）
 
 - [ ] **Step 2: テストが失敗することを確認する**
 
