@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -26,6 +29,11 @@ import (
 // hung backend can't stall the whole gateway's startup (see
 // connectBackends). A var so tests can shrink it.
 var backendConnectTimeout = 30 * time.Second
+
+// reloadDrainTimeout bounds how long a superseded generation's backend
+// connections are kept alive after a hot-reload swap, so sessions still
+// bound to it can finish naturally. A var so tests can shrink it.
+var reloadDrainTimeout = 5 * time.Minute
 
 // telemetryShutdownTimeout bounds internal/telemetry.Setup's returned
 // shutdown func, which flushes buffered spans to the configured OTLP
@@ -127,9 +135,16 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	// watchSIGHUP's scheduleDrain, Task 5) without tearing down the
 	// listeners themselves.
 	genCtx, genCancel := context.WithCancel(ctx)
+	// watchSIGHUP takes ownership of genCancel once spawned below (calling
+	// it via scheduleDrain on the generation's first supersession), but this
+	// defer still runs at process shutdown regardless -- e.g. when no HTTP
+	// listener is configured and watchSIGHUP never runs at all, or when the
+	// process exits before any reload happens. Calling an already-cancelled
+	// context.CancelFunc again is a safe no-op, so this is just a backstop,
+	// not a double-cancellation hazard.
+	defer genCancel()
 	srv, err := buildGateway(genCtx, logger, cfg)
 	if err != nil {
-		genCancel()
 		return err
 	}
 
@@ -451,9 +466,74 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 	return result
 }
 
-// watchSIGHUP is implemented in full by Task 5; this stub only exists so
-// Task 4's wiring compiles and its existing-test regression check can run
-// before Task 5 adds SIGHUP handling itself.
+// watchSIGHUP blocks until ctx is cancelled, rebuilding the gateway (via
+// buildGateway) and swapping current on every SIGHUP. initialGenCancel is
+// the cancel func for the generation runServer already built before
+// spawning this loop -- watchSIGHUP takes ownership of it so that
+// generation 0 is cancelled on its first supersession exactly like every
+// later one; without this, the very first reload would leak generation 0's
+// connectBackends-spawned goroutines' resources forever. Only spawned by
+// runServer when cfg.Listen.HTTP != "" -- hot-reload only makes sense for
+// HTTP (see this plan's Global Constraints).
 func watchSIGHUP(ctx context.Context, logger *slog.Logger, configPath string, current *atomic.Pointer[gateway.Server], initialGenCancel context.CancelFunc) {
-	<-ctx.Done()
+	sighup := make(chan os.Signal, 1)
+	signal.Notify(sighup, syscall.SIGHUP)
+	defer signal.Stop(sighup)
+
+	genCancel := initialGenCancel // the currently-live generation's cancel func
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sighup:
+			cfg, err := config.Load(configPath)
+			if err != nil {
+				logger.Error("config reload failed, keeping current config", "error", err)
+				continue
+			}
+			// buildGateway itself validates that SOME listener is
+			// configured; this check is specifically about whether
+			// hot-reload can do anything USEFUL with the new config, which
+			// is a stricter, hot-reload-specific condition on top of that.
+			if cfg.Listen.HTTP == "" {
+				logger.Warn("SIGHUP received, but hot-reload is only supported for HTTP listeners; ignoring")
+				continue
+			}
+			if cfg.Listen.Stdio {
+				logger.Warn("SIGHUP received: only the HTTP listener will see the new config; the existing stdio session (if any) keeps running under the old one")
+			}
+
+			genCtx, newGenCancel := context.WithCancel(ctx)
+			newSrv, err := buildGateway(genCtx, logger, cfg)
+			if err != nil {
+				logger.Error("config reload failed, keeping current config", "error", err)
+				newGenCancel()
+				continue
+			}
+
+			oldSrv := current.Swap(newSrv)
+			logger.Info("config reloaded")
+
+			scheduleDrain(logger, oldSrv, genCancel) // supersede and drain the generation this reload replaced
+			genCancel = newGenCancel                 // track the new generation for the NEXT reload (or process shutdown, which cancels ctx and makes newGenCancel a no-op)
+		}
+	}
+}
+
+// scheduleDrain cancels the just-superseded generation's long-lived ctx
+// (stopping its backends' list_changed callback contexts) and, after
+// reloadDrainTimeout, force-closes every one of its backend connections --
+// so a session still bound to oldSrv gets a normal "backend disconnected"
+// error from that point on, instead of the old generation's connections
+// staying open indefinitely.
+func scheduleDrain(logger *slog.Logger, oldSrv *gateway.Server, oldGenCancel context.CancelFunc) {
+	oldGenCancel()
+	time.AfterFunc(reloadDrainTimeout, func() {
+		for name, b := range oldSrv.Backends() {
+			if err := b.Close(); err != nil {
+				logger.Warn("closing superseded backend connection", "backend", name, "error", err)
+			}
+		}
+	})
 }

@@ -4,13 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -18,6 +23,8 @@ import (
 	"go.opentelemetry.io/otel"
 
 	"github.com/wtnb75/mcprt/internal/config"
+	"github.com/wtnb75/mcprt/internal/gateway"
+	"github.com/wtnb75/mcprt/internal/router"
 )
 
 // TestMain forces OTEL_TRACES_EXPORTER=none for every test in this
@@ -464,4 +471,268 @@ func TestRunServer_ConfiguresGlobalTracerProvider(t *testing.T) {
 	if !recording {
 		t.Fatal("global TracerProvider was not configured by runServer (span.IsRecording() = false)")
 	}
+}
+
+// newFakeBackendHTTP starts an httptest server exposing a single tool named
+// toolName, for buildGateway/watchSIGHUP tests that need a real backend to
+// connect to. The caller must Close() the returned server.
+func newFakeBackendHTTP(toolName string) *httptest.Server {
+	srv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	mcp.AddTool(srv, &mcp.Tool{Name: toolName, Description: toolName},
+		func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
+			return nil, struct{}{}, nil
+		})
+	return httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+}
+
+// toolNamesOf lists resolved.Item.Name for every item in table.Items, for
+// asserting which tools a *gateway.Server currently exposes without going
+// through a real MCP session.
+//
+// Unused by any test in this file as of this task: gateway.Server exposes no
+// accessor for its resolved *router.Table[*mcp.Tool] (only Backend/Backends/
+// MCP), so nothing here can currently obtain one to pass in. Kept per this
+// task's brief, which specifies it as reusable test infrastructure.
+//
+//nolint:unused
+func toolNamesOf(table *router.Table[*mcp.Tool]) []string {
+	var names []string
+	for _, resolved := range table.Items {
+		names = append(names, resolved.Item.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// TestWatchSIGHUP_ReloadsConfig checks that a SIGHUP delivered to the test
+// process makes watchSIGHUP rebuild the gateway from the (rewritten) config
+// file and swap current to the new generation.
+func TestWatchSIGHUP_ReloadsConfig(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendA := newFakeBackendHTTP("from-a")
+	defer backendA.Close()
+	backendB := newFakeBackendHTTP("from-b")
+	defer backendB.Close()
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeCfg := func(url string) {
+		t.Helper()
+		content := fmt.Sprintf("listen:\n  http: \"127.0.0.1:0\"\nbackends:\n  - name: b\n    transport: http\n    url: %q\n", url)
+		if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+			t.Fatalf("writing config: %v", err)
+		}
+	}
+	writeCfg(backendA.URL)
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	genCtx, genCancel := context.WithCancel(ctx)
+	srv, err := buildGateway(genCtx, logger, cfg)
+	if err != nil {
+		t.Fatalf("buildGateway: %v", err)
+	}
+	// Generation 0's backend connection (backendA) is never closed by
+	// scheduleDrain within this test's lifetime -- the production
+	// reloadDrainTimeout default is 5 minutes, and this test doesn't shrink
+	// it (TestScheduleDrain_ForceClosesBackendsAfterTimeout covers that
+	// behavior directly). A streamable-HTTP backend's standalone SSE stream
+	// stays open indefinitely for server-initiated notifications (see
+	// TestBuildGateway_Success), so without an explicit Close() here, the
+	// deferred backendA.Close()/backendB.Close() below would block forever
+	// waiting for that connection to go idle. These defers run before
+	// those (registered later, LIFO), closing both generations' backend
+	// connections regardless of whether the SIGHUP swap below succeeds.
+	defer func() {
+		for _, b := range srv.Backends() {
+			_ = b.Close()
+		}
+	}()
+	current := new(atomic.Pointer[gateway.Server])
+	current.Store(srv)
+	defer func() {
+		for _, b := range current.Load().Backends() {
+			_ = b.Close()
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		watchSIGHUP(ctx, logger, configPath, current, genCancel)
+		close(done)
+	}()
+
+	writeCfg(backendB.URL)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("sending SIGHUP: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if current.Load() != srv {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	newSrv := current.Load()
+	if newSrv == srv {
+		t.Fatal("current was not swapped after SIGHUP")
+	}
+	if genCtx.Err() == nil {
+		t.Fatal("generation 0's genCtx should be cancelled once superseded")
+	}
+
+	cancel()
+	<-done
+}
+
+// syncBuffer is a bytes.Buffer guarded by a mutex, safe for a background
+// goroutine (here, watchSIGHUP logging through it) and the test's own
+// deadline poll loop to touch concurrently -- a plain bytes.Buffer would
+// otherwise be a genuine data race under `go test -race`.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestWatchSIGHUP_IgnoresReloadWithoutHTTPListener checks that a SIGHUP
+// whose newly-loaded config has no HTTP listener leaves current untouched
+// and logs a warning, instead of swapping in a *gateway.Server nothing can
+// reach (hot-reload is HTTP-only, see this plan's Global Constraints).
+func TestWatchSIGHUP_IgnoresReloadWithoutHTTPListener(t *testing.T) {
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	backendA := newFakeBackendHTTP("from-a")
+	defer backendA.Close()
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := fmt.Sprintf("listen:\n  http: \"127.0.0.1:0\"\nbackends:\n  - name: b\n    transport: http\n    url: %q\n", backendA.URL)
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	genCtx, genCancel := context.WithCancel(ctx)
+	srv, err := buildGateway(genCtx, logger, cfg)
+	if err != nil {
+		t.Fatalf("buildGateway: %v", err)
+	}
+	current := new(atomic.Pointer[gateway.Server])
+	current.Store(srv)
+	// See the matching comment in TestWatchSIGHUP_ReloadsConfig: without an
+	// explicit Close() here, the deferred backendA.Close() below would block
+	// forever on backendA's still-open standalone SSE stream (current is
+	// never swapped in this test, so nothing else closes it).
+	defer func() {
+		for _, b := range current.Load().Backends() {
+			_ = b.Close()
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		watchSIGHUP(ctx, logger, configPath, current, genCancel)
+		close(done)
+	}()
+
+	// Rewrite to a stdio-only config (no listen.http): buildGateway itself
+	// would accept this (stdio is a valid listener), but watchSIGHUP must
+	// refuse it as a hot-reload target.
+	if err := os.WriteFile(configPath, []byte("listen:\n  stdio: true\nbackends: []\n"), 0o600); err != nil {
+		t.Fatalf("rewriting config: %v", err)
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("sending SIGHUP: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(logBuf.String(), "hot-reload is only supported for HTTP listeners") {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(logBuf.String(), "hot-reload is only supported for HTTP listeners") {
+		t.Fatalf("log output = %q, want it to mention HTTP-only hot-reload", logBuf.String())
+	}
+	if current.Load() != srv {
+		t.Fatal("current should not have been swapped")
+	}
+
+	cancel()
+	<-done
+}
+
+// TestScheduleDrain_ForceClosesBackendsAfterTimeout checks that
+// scheduleDrain cancels the superseded generation's context immediately,
+// but only force-closes its backend connections once reloadDrainTimeout
+// has elapsed.
+func TestScheduleDrain_ForceClosesBackendsAfterTimeout(t *testing.T) {
+	origTimeout := reloadDrainTimeout
+	reloadDrainTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { reloadDrainTimeout = origTimeout })
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendA := newFakeBackendHTTP("from-a")
+	defer backendA.Close()
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := fmt.Sprintf("listen:\n  http: \"127.0.0.1:0\"\nbackends:\n  - name: b\n    transport: http\n    url: %q\n", backendA.URL)
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	genCtx, genCancel := context.WithCancel(context.Background())
+	srv, err := buildGateway(genCtx, logger, cfg)
+	if err != nil {
+		t.Fatalf("buildGateway: %v", err)
+	}
+	b := srv.Backend("b")
+	if b == nil {
+		t.Fatal(`Backend("b") = nil`)
+	}
+
+	scheduleDrain(logger, srv, genCancel)
+
+	if genCtx.Err() == nil {
+		t.Fatal("scheduleDrain should cancel genCtx immediately")
+	}
+	// Immediately after scheduleDrain returns, the backend must still be
+	// usable (drain timeout hasn't elapsed yet).
+	if _, err := b.ListTools(context.Background()); err != nil {
+		t.Fatalf("backend should still be open immediately after scheduleDrain: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		if _, lastErr = b.ListTools(context.Background()); lastErr != nil {
+			return // force-closed as expected
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("backend was not force-closed within 2s of reloadDrainTimeout elapsing")
 }
