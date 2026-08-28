@@ -115,16 +115,31 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 
 	// A child context we can cancel ourselves: if one listener fails while
 	// another is still healthy, cancelling here tells the healthy one to
-	// shut down too instead of leaving runServer blocked waiting on it.
+	// shut down too instead of leaving runServer blocked waiting on it. It
+	// also bounds every generation's genCtx below, so process shutdown
+	// cancels all of them regardless of hot-reload state.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	srv, err := buildGateway(ctx, logger, cfg)
+	// genCtx/genCancel scope generation 0's backend connections and
+	// list_changed callbacks (see buildGateway) separately from ctx itself,
+	// so a later SIGHUP-triggered reload can supersede this generation (via
+	// watchSIGHUP's scheduleDrain, Task 5) without tearing down the
+	// listeners themselves.
+	genCtx, genCancel := context.WithCancel(ctx)
+	srv, err := buildGateway(genCtx, logger, cfg)
 	if err != nil {
+		genCancel()
 		return err
 	}
+
+	// current is where new HTTP connections get routed (see
+	// gateway.ServeHTTP below): generation 0 until a SIGHUP-triggered
+	// reload (Task 5's watchSIGHUP) swaps it.
+	current := new(atomic.Pointer[gateway.Server])
+	current.Store(srv)
 	defer func() {
-		for _, b := range srv.Backends() {
+		for _, b := range current.Load().Backends() {
 			_ = b.Close()
 		}
 	}()
@@ -135,11 +150,15 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	errCh := make(chan error, 2)
 	if cfg.Listen.Stdio {
 		running++
+		// Unlike the HTTP listener, ServeStdio is pinned to generation 0's
+		// srv for its whole lifetime -- stdio hot-reload is out of scope
+		// (see this plan's Global Constraints and watchSIGHUP below).
 		go func() { errCh <- gateway.ServeStdio(ctx, srv.MCP()) }()
 	}
 	if cfg.Listen.HTTP != "" {
 		running++
-		go func() { errCh <- gateway.ServeHTTP(ctx, func() *mcp.Server { return srv.MCP() }, cfg.Listen.HTTP) }()
+		go func() { errCh <- gateway.ServeHTTP(ctx, func() *mcp.Server { return current.Load().MCP() }, cfg.Listen.HTTP) }()
+		go watchSIGHUP(ctx, logger, configPath, current, genCancel)
 	}
 
 	// Log each listener's outcome as it arrives, so a listener that fails
@@ -430,4 +449,11 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 		result.promptEntries = append(result.promptEntries, o.promptEntry)
 	}
 	return result
+}
+
+// watchSIGHUP is implemented in full by Task 5; this stub only exists so
+// Task 4's wiring compiles and its existing-test regression check can run
+// before Task 5 adds SIGHUP handling itself.
+func watchSIGHUP(ctx context.Context, logger *slog.Logger, configPath string, current *atomic.Pointer[gateway.Server], initialGenCancel context.CancelFunc) {
+	<-ctx.Done()
 }
