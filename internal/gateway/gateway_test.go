@@ -918,7 +918,7 @@ func TestGateway_ServeHTTP_LogsRemoteAddr(t *testing.T) {
 
 	gwCtx, cancel := context.WithCancel(context.Background())
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- gateway.ServeHTTP(gwCtx, srv.MCP(), addr) }()
+	go func() { serveErr <- gateway.ServeHTTP(gwCtx, func() *mcp.Server { return srv.MCP() }, addr) }()
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
 	var session *mcp.ClientSession

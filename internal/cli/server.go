@@ -178,7 +178,7 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	}
 	if cfg.Listen.HTTP != "" {
 		running++
-		go func() { errCh <- gateway.ServeHTTP(ctx, srv.MCP(), cfg.Listen.HTTP) }()
+		go func() { errCh <- gateway.ServeHTTP(ctx, func() *mcp.Server { return srv.MCP() }, cfg.Listen.HTTP) }()
 	}
 
 	// Log each listener's outcome as it arrives, so a listener that fails

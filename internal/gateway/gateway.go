@@ -368,10 +368,16 @@ func ServeStdio(ctx context.Context, srv *mcp.Server) error {
 // wait forever for the connection to go idle. A var so tests can shrink it.
 var shutdownTimeout = 5 * time.Second
 
-// ServeHTTP runs srv as a Streamable HTTP server listening on addr, until
-// ctx is cancelled.
-func ServeHTTP(ctx context.Context, srv *mcp.Server, addr string) error {
-	handler := remoteAddrMiddleware(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+// ServeHTTP runs a Streamable HTTP server listening on addr, until ctx is
+// cancelled. getServer is called once per brand-new session (the
+// go-sdk's StreamableHTTPHandler looks up an existing session by its
+// Mcp-Session-Id header instead of calling getServer again) -- not a fixed
+// value -- so that a config hot-reload (see internal/cli/server.go's
+// buildGateway/watchSIGHUP) can swap in a freshly-built *gateway.Server for
+// new sessions without disturbing sessions already bound to the previous
+// one.
+func ServeHTTP(ctx context.Context, getServer func() *mcp.Server, addr string) error {
+	handler := remoteAddrMiddleware(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return getServer() }, nil))
 	httpServer := &http.Server{Addr: addr, Handler: handler}
 
 	errCh := make(chan error, 1)
