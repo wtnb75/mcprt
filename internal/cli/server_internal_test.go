@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,7 +24,6 @@ import (
 
 	"github.com/wtnb75/mcprt/internal/config"
 	"github.com/wtnb75/mcprt/internal/gateway"
-	"github.com/wtnb75/mcprt/internal/router"
 )
 
 // TestMain forces OTEL_TRACES_EXPORTER=none for every test in this
@@ -485,25 +484,6 @@ func newFakeBackendHTTP(toolName string) *httptest.Server {
 	return httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
 }
 
-// toolNamesOf lists resolved.Item.Name for every item in table.Items, for
-// asserting which tools a *gateway.Server currently exposes without going
-// through a real MCP session.
-//
-// Unused by any test in this file as of this task: gateway.Server exposes no
-// accessor for its resolved *router.Table[*mcp.Tool] (only Backend/Backends/
-// MCP), so nothing here can currently obtain one to pass in. Kept per this
-// task's brief, which specifies it as reusable test infrastructure.
-//
-//nolint:unused
-func toolNamesOf(table *router.Table[*mcp.Tool]) []string {
-	var names []string
-	for _, resolved := range table.Items {
-		names = append(names, resolved.Item.Name)
-	}
-	sort.Strings(names)
-	return names
-}
-
 // TestWatchSIGHUP_ReloadsConfig checks that a SIGHUP delivered to the test
 // process makes watchSIGHUP rebuild the gateway from the (rewritten) config
 // file and swap current to the new generation.
@@ -559,6 +539,20 @@ func TestWatchSIGHUP_ReloadsConfig(t *testing.T) {
 			_ = b.Close()
 		}
 	}()
+
+	// Register a throwaway SIGHUP handler synchronously, before spawning
+	// watchSIGHUP (whose own signal.Notify runs inside its goroutine, racing
+	// against the syscall.Kill below). Without this, if the kill lands
+	// before that goroutine gets scheduled, the process has no registered
+	// handler for SIGHUP yet and the Go runtime applies the default action
+	// (terminate) -- killing the whole test binary instead of just this
+	// test. Once ANY handler is registered for a signal, the runtime never
+	// reverts to default disposition for it, and every registered channel
+	// (this one and watchSIGHUP's own) receives every subsequent delivery,
+	// so this doesn't interfere with watchSIGHUP actually seeing the signal.
+	ready := make(chan os.Signal, 1)
+	signal.Notify(ready, syscall.SIGHUP)
+	defer signal.Stop(ready)
 
 	done := make(chan struct{})
 	go func() {
@@ -650,6 +644,15 @@ func TestWatchSIGHUP_IgnoresReloadWithoutHTTPListener(t *testing.T) {
 			_ = b.Close()
 		}
 	}()
+
+	// See the matching comment in TestWatchSIGHUP_ReloadsConfig: register a
+	// throwaway SIGHUP handler synchronously before spawning watchSIGHUP, so
+	// the syscall.Kill below can never land while SIGHUP's disposition is
+	// still "default" (which would terminate the whole test binary instead
+	// of just this test).
+	ready := make(chan os.Signal, 1)
+	signal.Notify(ready, syscall.SIGHUP)
+	defer signal.Stop(ready)
 
 	done := make(chan struct{})
 	go func() {
