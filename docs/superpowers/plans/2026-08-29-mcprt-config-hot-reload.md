@@ -349,7 +349,7 @@ func TestBuildGateway_Success(t *testing.T) {
 }
 ```
 
-`server_internal_test.go`の`import`に`"net/http/httptest"`を追加する（`"net/http"`は既にimport済み。`bytes`, `encoding/json`, `strings`は既存のTestConnectBackends系テストで使用済みのはず — 実際に追加が必要なのは`net/http/httptest`のみ）。
+`server_internal_test.go`の既存importに`"bytes"`, `"context"`, `"encoding/json"`, `"io"`, `"log/slog"`, `"net/http"`, `"net/http/httptest"`, `"os"`, `"path/filepath"`, `"strings"`, `"testing"`, `"time"`, `"github.com/modelcontextprotocol/go-sdk/mcp"`, `"github.com/wtnb75/mcprt/internal/config"`が既に含まれている。このStepで書くテストが使う識別子はすべてこれらでカバーされており、新規追加が必要なimportはない。
 
 - [ ] **Step 2: テストが失敗することを確認する**
 
@@ -861,7 +861,7 @@ func TestScheduleDrain_ForceClosesBackendsAfterTimeout(t *testing.T) {
 }
 ```
 
-このテストコードは以下のimportを`internal/cli/server_internal_test.go`に追加で必要とする: `"bytes"`（既存）, `"fmt"`, `"net/http/httptest"`, `"os"`（既存）, `"path/filepath"`（既存）, `"sort"`, `"strings"`（既存）, `"sync/atomic"`, `"syscall"`, `"github.com/wtnb75/mcprt/internal/gateway"`, `"github.com/wtnb75/mcprt/internal/router"`。既存のものは重複追加しないこと。
+このテストコードを動かすには、`internal/cli/server_internal_test.go`の既存importに以下を追加する必要がある: `"fmt"`, `"sort"`, `"sync/atomic"`, `"syscall"`, `"github.com/wtnb75/mcprt/internal/gateway"`, `"github.com/wtnb75/mcprt/internal/router"`。（`"bytes"`, `"net/http/httptest"`, `"os"`, `"path/filepath"`, `"strings"`は既存importに含まれているため追加不要。）
 
 - [ ] **Step 2: テストが失敗することを確認する**
 
@@ -1114,7 +1114,7 @@ backends:
 
 `reloadDrainTimeout`は`internal/cli`パッケージの非公開変数なので、外部テストパッケージ（`server_test.go`は`package cli_test`）からは直接書き換えられない。このテストはdrainタイムアウト経過後の強制クローズまでは検証しない（それはTask 5の`TestScheduleDrain_ForceClosesBackendsAfterTimeout`が内部テストとしてカバー済み）。
 
-`internal/cli/server_test.go`の既存importに、このテストが新規に使う`"os"`, `"syscall"`を追加する（`"context"`, `"fmt"`, `"net/http"`, `"net/http/httptest"`, `"sort"`, `"time"`, `"github.com/modelcontextprotocol/go-sdk/mcp"`, `"github.com/wtnb75/mcprt/internal/cli"`は既存importに含まれている）。
+`internal/cli/server_test.go`の既存importに、このテストが新規に使う`"syscall"`を追加する（`"context"`, `"fmt"`, `"net/http"`, `"net/http/httptest"`, `"os"`, `"sort"`, `"time"`, `"github.com/modelcontextprotocol/go-sdk/mcp"`, `"github.com/wtnb75/mcprt/internal/cli"`は既存importに含まれている）。
 
 - [ ] **Step 2: テストが失敗することを確認する**
 
