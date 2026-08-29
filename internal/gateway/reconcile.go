@@ -6,6 +6,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/wtnb75/mcprt/internal/backend"
 	"github.com/wtnb75/mcprt/internal/router"
 )
 
@@ -177,4 +178,54 @@ func (s *Server) UpdatePrompts(backendName string, items []*mcp.Prompt) {
 	logNewConflicts(s.logger, "prompt name conflict", "prompt", s.promptTable.Conflicts, newTable.Conflicts)
 
 	s.promptTable = newTable
+}
+
+// upsertEntry is replaceEntry's counterpart for a backend connecting: it
+// replaces backendName's entry if one already exists (a reconnect), or
+// appends a new one with the given prefix if this is the first time
+// backendName has ever appeared in entries (a backend that failed to
+// connect at mcprt startup, connecting for the first time). Unlike
+// replaceEntry, this needs prefix because a first-time entry has no prior
+// Prefix to inherit.
+func upsertEntry[T any](entries []router.Entry[T], backendName, prefix string, items []T) []router.Entry[T] {
+	out := make([]router.Entry[T], len(entries))
+	copy(out, entries)
+	for i, e := range out {
+		if e.BackendName == backendName {
+			out[i].Prefix = prefix
+			out[i].Items = items
+			return out
+		}
+	}
+	return append(out, router.Entry[T]{BackendName: backendName, Prefix: prefix, Items: items})
+}
+
+// ConnectBackend registers (or re-registers) backendName's live connection
+// and reconciles its full item set -- used both when a backend that failed
+// to connect at mcprt startup finally connects for the first time, and
+// when a previously-connected backend reconnects after a disconnect (see
+// internal/cli/server.go's superviseBackend). prefix is the backend's
+// configured Prefix (from config.BackendConfig; resources and resource
+// templates never carry one, matching connectBackends' existing
+// convention).
+//
+// This first ensures an entry (seeded with nil Items) exists for
+// backendName under s.mu, in one atomic step with setting s.backends[name]
+// -- then delegates the actual item reconciliation to the existing
+// UpdateTools/UpdateResources/UpdatePrompts, each of which takes its own
+// lock. A backend name is only ever driven by one supervisor goroutine at
+// a time (see internal/cli/server.go), so nothing else touches this
+// backend's entry between the two phases.
+func (s *Server) ConnectBackend(name string, b *backend.Backend, prefix string, tools []*mcp.Tool, resources []*mcp.Resource, templates []*mcp.ResourceTemplate, prompts []*mcp.Prompt) {
+	s.mu.Lock()
+	s.backends[name] = b
+	s.toolEntries = upsertEntry(s.toolEntries, name, "", nil)
+	s.resourceEntries = upsertEntry(s.resourceEntries, name, "", nil)
+	s.resourceTemplateEntries = upsertEntry(s.resourceTemplateEntries, name, "", nil)
+	s.promptEntries = upsertEntry(s.promptEntries, name, "", nil)
+	s.mu.Unlock()
+
+	s.UpdateTools(name, tools)
+	s.UpdateResources(name, resources, templates)
+	s.UpdatePrompts(name, prompts)
 }

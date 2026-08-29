@@ -2,6 +2,7 @@ package gateway_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -340,6 +341,122 @@ func TestUpdateResourcesAndUpdatePrompts_ConcurrentCallsDoNotRace(t *testing.T) 
 			defer wg.Done()
 			srv.UpdatePrompts("a", []*mcp.Prompt{{Name: "p"}, {Name: "q"}})
 		}()
+	}
+	wg.Wait()
+}
+
+// TestConnectBackend_AddsNewBackendNotInEntries checks that ConnectBackend
+// registers a backend that was never part of the Server's founding entries
+// -- the case of a backend that failed to connect at mcprt startup and
+// joins later via superviseBackend (see internal/cli/server.go).
+func TestConnectBackend_AddsNewBackendNotInEntries(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx := context.Background()
+
+	entries := []router.Entry[*mcp.Tool]{
+		{BackendName: "a", Items: []*mcp.Tool{{Name: "existing", InputSchema: toolSchema}}},
+	}
+	table := router.Resolve(entries, toolNameOf, toolRename, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}},
+		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil)
+
+	newConn := &backend.Backend{Name: "new"}
+	srv.ConnectBackend("new", newConn, "",
+		[]*mcp.Tool{{Name: "fresh", InputSchema: toolSchema}}, nil, nil, nil)
+
+	if srv.Backends()["new"] != newConn {
+		t.Fatalf("Backends()[\"new\"] = %v, want %v", srv.Backends()["new"], newConn)
+	}
+	if got := downstreamToolNames(t, ctx, srv.MCP()); !equalStrings(got, []string{"existing", "fresh"}) {
+		t.Fatalf("tools after ConnectBackend = %v, want [existing fresh]", got)
+	}
+}
+
+// TestConnectBackend_ReconnectsExistingBackend checks that ConnectBackend
+// replaces an already-known backend's connection and item set -- the case
+// of a backend that disconnected and successfully reconnected.
+func TestConnectBackend_ReconnectsExistingBackend(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx := context.Background()
+
+	entries := []router.Entry[*mcp.Tool]{
+		{BackendName: "a", Prefix: "a-", Items: []*mcp.Tool{{Name: "old", InputSchema: toolSchema}}},
+	}
+	table := router.Resolve(entries, toolNameOf, toolRename, nil)
+	oldConn := &backend.Backend{Name: "a"}
+	srv := gateway.New(logger, map[string]*backend.Backend{"a": oldConn},
+		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil)
+
+	// Simulate a disconnect (as superviseBackend does) before the reconnect.
+	srv.UpdateTools("a", nil)
+	if got := downstreamToolNames(t, ctx, srv.MCP()); len(got) != 0 {
+		t.Fatalf("tools after simulated disconnect = %v, want []", got)
+	}
+
+	newConn := &backend.Backend{Name: "a"}
+	srv.ConnectBackend("a", newConn, "a-",
+		[]*mcp.Tool{{Name: "reconnected", InputSchema: toolSchema}}, nil, nil, nil)
+
+	if srv.Backends()["a"] != newConn {
+		t.Fatalf("Backends()[\"a\"] = %v, want the new connection %v", srv.Backends()["a"], newConn)
+	}
+	if got := downstreamToolNames(t, ctx, srv.MCP()); !equalStrings(got, []string{"reconnected"}) {
+		t.Fatalf("tools after ConnectBackend reconnect = %v, want [reconnected]", got)
+	}
+}
+
+// TestConnectBackend_ReconnectIntroducingConflictLogsIt checks that a
+// reconnect which introduces a brand-new name conflict logs it, exactly
+// like UpdateTools does (ConnectBackend delegates to UpdateTools for the
+// actual reconcile).
+func TestConnectBackend_ReconnectIntroducingConflictLogsIt(t *testing.T) {
+	var buf logBuffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+
+	entries := []router.Entry[*mcp.Tool]{
+		{BackendName: "a", Items: []*mcp.Tool{{Name: "search", InputSchema: toolSchema}}},
+		{BackendName: "b", Items: nil}, // "b" starts with nothing, matching UpdateTools' precedent
+	}
+	table := router.Resolve(entries, toolNameOf, toolRename, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}, "b": {Name: "b"}},
+		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil)
+
+	buf.reset()
+	srv.ConnectBackend("b", &backend.Backend{Name: "b"}, "",
+		[]*mcp.Tool{{Name: "search", InputSchema: toolSchema}}, nil, nil, nil)
+	if !buf.contains("tool name conflict") {
+		t.Fatalf("log output = %q, want a \"tool name conflict\" warning", buf.String())
+	}
+}
+
+// TestConnectBackend_ConcurrentWithUpdateToolsDoesNotRace checks that
+// ConnectBackend for a brand-new backend and UpdateTools for an existing
+// one can run concurrently without racing -- superviseBackend spawns one
+// goroutine per backend, so a new backend's first connect can land at the
+// same moment another backend's list_changed fires.
+func TestConnectBackend_ConcurrentWithUpdateToolsDoesNotRace(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	entries := []router.Entry[*mcp.Tool]{
+		{BackendName: "a", Items: []*mcp.Tool{{Name: "x", InputSchema: toolSchema}}},
+	}
+	table := router.Resolve(entries, toolNameOf, toolRename, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}},
+		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			srv.UpdateTools("a", []*mcp.Tool{{Name: "x", InputSchema: toolSchema}, {Name: "extra", InputSchema: toolSchema}})
+		}()
+		go func(i int) {
+			defer wg.Done()
+			name := fmt.Sprintf("new-%d", i)
+			srv.ConnectBackend(name, &backend.Backend{Name: name}, "",
+				[]*mcp.Tool{{Name: fmt.Sprintf("tool-%d", i), InputSchema: toolSchema}}, nil, nil, nil)
+		}(i)
 	}
 	wg.Wait()
 }
