@@ -150,12 +150,43 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 
 	// current is where new HTTP connections get routed (see
 	// gateway.ServeHTTP below): generation 0 until a SIGHUP-triggered
-	// reload (Task 5's watchSIGHUP) swaps it.
+	// reload (watchSIGHUP) swaps it.
 	current := new(atomic.Pointer[gateway.Server])
 	current.Store(srv)
+	// live tracks every generation whose backend connections are still open
+	// -- current plus any superseded generation still inside its
+	// reloadDrainTimeout window -- so shutdown below closes all of them, not
+	// just current. Backends are real subprocesses (stdio/ssh/docker run) that
+	// don't reliably die with their parent, so leaving a draining generation's
+	// connections to scheduleDrain's timer alone would leak them whenever the
+	// process exits before that timer fires.
+	live := new(generations)
+	live.add(srv)
+
+	// startup is the listener configuration this process actually bound.
+	// Listener re-binding is out of hot-reload's scope, so watchSIGHUP
+	// compares every reloaded config against these values rather than
+	// believing whatever the new config says about listeners.
+	startup := startupListen{http: cfg.Listen.HTTP, stdio: cfg.Listen.Stdio}
+
+	// sighupDone is closed when watchSIGHUP returns; nil when no HTTP
+	// listener is configured and it never runs at all.
+	var sighupDone chan struct{}
 	defer func() {
-		for _, b := range current.Load().Backends() {
-			_ = b.Close()
+		// Wait for watchSIGHUP to exit before closing anything: it runs
+		// fire-and-forget, so a reload still in flight when ctx was cancelled
+		// could otherwise Swap in a brand-new generation after this loop had
+		// already run, leaking its backends with nothing left to close them.
+		// cancel() here (rather than relying on the outer `defer cancel()`,
+		// which runs later) is what guarantees watchSIGHUP actually returns.
+		cancel()
+		if sighupDone != nil {
+			<-sighupDone
+		}
+		for _, s := range live.takeAll() {
+			for _, b := range s.Backends() {
+				_ = b.Close()
+			}
 		}
 	}()
 
@@ -172,8 +203,14 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	}
 	if cfg.Listen.HTTP != "" {
 		running++
-		go func() { errCh <- gateway.ServeHTTP(ctx, func() *mcp.Server { return current.Load().MCP() }, cfg.Listen.HTTP) }()
-		go watchSIGHUP(ctx, logger, configPath, current, genCancel)
+		go func() {
+			errCh <- gateway.ServeHTTP(ctx, func() *mcp.Server { return current.Load().MCP() }, cfg.Listen.HTTP)
+		}()
+		sighupDone = make(chan struct{})
+		go func() {
+			defer close(sighupDone)
+			watchSIGHUP(ctx, logger, configPath, startup, current, live, genCancel)
+		}()
 	}
 
 	// Log each listener's outcome as it arrives, so a listener that fails
@@ -466,16 +503,69 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 	return result
 }
 
+// startupListen is the listener configuration the process actually started
+// with: the address its HTTP listener is bound to, and whether it really
+// started a stdio listener. Changing either of those requires a process
+// restart (listener re-binding is out of hot-reload's scope), so a reloaded
+// config's listen.* values describe what the operator *asked for*, never what
+// the process is doing -- watchSIGHUP needs both to tell them apart.
+type startupListen struct {
+	http  string
+	stdio bool
+}
+
+// generations tracks every gateway generation whose backend connections are
+// still open: the live one plus any superseded generation still inside its
+// reloadDrainTimeout window. Removing a generation from the set is what
+// confers the right to close it, so scheduleDrain's drain timer (which runs
+// on its own goroutine) and runServer's shutdown path can never both close
+// the same connections.
+type generations struct {
+	mu   sync.Mutex
+	live []*gateway.Server
+}
+
+func (g *generations) add(srv *gateway.Server) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.live = append(g.live, srv)
+}
+
+// take removes srv from the set, reporting whether this caller is the one
+// that removed it -- i.e. whether it now owns closing srv's backends.
+func (g *generations) take(srv *gateway.Server) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for i, s := range g.live {
+		if s == srv {
+			g.live = append(g.live[:i], g.live[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// takeAll empties the set and returns everything it held, transferring
+// ownership of closing all of them to the caller.
+func (g *generations) takeAll() []*gateway.Server {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	all := g.live
+	g.live = nil
+	return all
+}
+
 // watchSIGHUP blocks until ctx is cancelled, rebuilding the gateway (via
 // buildGateway) and swapping current on every SIGHUP. initialGenCancel is
 // the cancel func for the generation runServer already built before
 // spawning this loop -- watchSIGHUP takes ownership of it so that
 // generation 0 is cancelled on its first supersession exactly like every
 // later one; without this, the very first reload would leak generation 0's
-// connectBackends-spawned goroutines' resources forever. Only spawned by
-// runServer when cfg.Listen.HTTP != "" -- hot-reload only makes sense for
-// HTTP (see this plan's Global Constraints).
-func watchSIGHUP(ctx context.Context, logger *slog.Logger, configPath string, current *atomic.Pointer[gateway.Server], initialGenCancel context.CancelFunc) {
+// connectBackends-spawned goroutines' resources forever. Every generation it
+// builds is registered in live so process shutdown can close it even while it
+// drains. Only spawned by runServer when cfg.Listen.HTTP != "" -- hot-reload
+// only makes sense for HTTP (see this plan's Global Constraints).
+func watchSIGHUP(ctx context.Context, logger *slog.Logger, configPath string, startup startupListen, current *atomic.Pointer[gateway.Server], live *generations, initialGenCancel context.CancelFunc) {
 	sighup := make(chan os.Signal, 1)
 	signal.Notify(sighup, syscall.SIGHUP)
 	defer signal.Stop(sighup)
@@ -500,8 +590,22 @@ func watchSIGHUP(ctx context.Context, logger *slog.Logger, configPath string, cu
 				logger.Warn("SIGHUP received, but hot-reload is only supported for HTTP listeners; ignoring")
 				continue
 			}
-			if cfg.Listen.Stdio {
-				logger.Warn("SIGHUP received: only the HTTP listener will see the new config; the existing stdio session (if any) keeps running under the old one")
+			// Listener re-binding is out of hot-reload's scope: this process
+			// keeps serving on the address it bound at startup no matter what
+			// the reloaded config says. Say so explicitly -- otherwise an
+			// operator who edited listen.http sees nothing but "config
+			// reloaded" and keeps waiting for an address that will never come
+			// up.
+			if cfg.Listen.HTTP != startup.http {
+				logger.Warn("listen.http change requires a process restart and was NOT applied; still serving on the startup address",
+					"listening", startup.http, "requested", cfg.Listen.HTTP)
+			}
+			// Gated on what the PROCESS actually started, not on the reloaded
+			// config's listen.stdio: a process started HTTP-only never has a
+			// stdio session to warn about, however the new config reads.
+			if startup.stdio {
+				logger.Warn("SIGHUP received: only the HTTP listener sees the new config; the existing stdio session keeps running under the previous generation, whose backend connections are force-closed once the drain timeout elapses -- every stdio call fails permanently from that point on, and only a process restart restores it",
+					"drainTimeout", reloadDrainTimeout)
 			}
 
 			genCtx, newGenCancel := context.WithCancel(ctx)
@@ -512,11 +616,15 @@ func watchSIGHUP(ctx context.Context, logger *slog.Logger, configPath string, cu
 				continue
 			}
 
+			// Register before the swap: from here on the new generation has
+			// open backend connections, and shutdown must close them whether
+			// or not it ever became current.
+			live.add(newSrv)
 			oldSrv := current.Swap(newSrv)
 			logger.Info("config reloaded")
 
-			scheduleDrain(logger, oldSrv, genCancel) // supersede and drain the generation this reload replaced
-			genCancel = newGenCancel                 // track the new generation for the NEXT reload (or process shutdown, which cancels ctx and makes newGenCancel a no-op)
+			scheduleDrain(logger, oldSrv, genCancel, live) // supersede and drain the generation this reload replaced
+			genCancel = newGenCancel                       // track the new generation for the NEXT reload (or process shutdown, which cancels ctx and makes newGenCancel a no-op)
 		}
 	}
 }
@@ -526,10 +634,15 @@ func watchSIGHUP(ctx context.Context, logger *slog.Logger, configPath string, cu
 // reloadDrainTimeout, force-closes every one of its backend connections --
 // so a session still bound to oldSrv gets a normal "backend disconnected"
 // error from that point on, instead of the old generation's connections
-// staying open indefinitely.
-func scheduleDrain(logger *slog.Logger, oldSrv *gateway.Server, oldGenCancel context.CancelFunc) {
+// staying open indefinitely. The timer only closes what it can still take
+// out of live: if process shutdown already claimed (and closed) oldSrv, this
+// callback has nothing left to do.
+func scheduleDrain(logger *slog.Logger, oldSrv *gateway.Server, oldGenCancel context.CancelFunc, live *generations) {
 	oldGenCancel()
 	time.AfterFunc(reloadDrainTimeout, func() {
+		if !live.take(oldSrv) {
+			return
+		}
 		for name, b := range oldSrv.Backends() {
 			if err := b.Close(); err != nil {
 				logger.Warn("closing superseded backend connection", "backend", name, "error", err)

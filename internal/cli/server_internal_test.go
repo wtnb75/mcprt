@@ -534,6 +534,8 @@ func TestWatchSIGHUP_ReloadsConfig(t *testing.T) {
 	}()
 	current := new(atomic.Pointer[gateway.Server])
 	current.Store(srv)
+	live := new(generations)
+	live.add(srv)
 	defer func() {
 		for _, b := range current.Load().Backends() {
 			_ = b.Close()
@@ -556,7 +558,7 @@ func TestWatchSIGHUP_ReloadsConfig(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		watchSIGHUP(ctx, logger, configPath, current, genCancel)
+		watchSIGHUP(ctx, logger, configPath, startupListen{http: cfg.Listen.HTTP}, current, live, genCancel)
 		close(done)
 	}()
 
@@ -582,6 +584,103 @@ func TestWatchSIGHUP_ReloadsConfig(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// closeWithin closes an httptest backend server and fails the test if that
+// takes longer than d. httptest.Server.Close() blocks until every connection
+// to it goes idle, and a streamable-HTTP MCP backend's standalone SSE stream
+// only goes idle once the gateway side closes its session -- so a Close()
+// that hangs here means some gateway generation's backend connection was
+// never closed at all.
+func closeWithin(t *testing.T, srv *httptest.Server, d time.Duration, what string) {
+	t.Helper()
+	closed := make(chan struct{})
+	go func() {
+		srv.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(d):
+		t.Fatalf("%s: backend server did not close within %v; its gateway-side connection is still open", what, d)
+	}
+}
+
+// TestRunServer_ShutdownClosesDrainingGenerations checks that process
+// shutdown closes the backend connections of EVERY live generation, not just
+// the one current points at: a generation superseded by a SIGHUP reload is
+// still inside its reloadDrainTimeout window (5 minutes by default, not
+// shrunk here on purpose -- so anything that gets closed during this test was
+// closed by the shutdown path, never by scheduleDrain's own timer), and its
+// backends are real subprocesses/containers in production, which must not be
+// left behind when mcprt exits.
+func TestRunServer_ShutdownClosesDrainingGenerations(t *testing.T) {
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	backendA := newFakeBackendHTTP("from-a")
+	backendB := newFakeBackendHTTP("from-b")
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeCfg := func(url string) {
+		t.Helper()
+		content := fmt.Sprintf("listen:\n  http: \"127.0.0.1:0\"\nbackends:\n  - name: b\n    transport: http\n    url: %q\n", url)
+		if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+			t.Fatalf("writing config: %v", err)
+		}
+	}
+	writeCfg(backendA.URL)
+
+	// See the matching comment in TestWatchSIGHUP_ReloadsConfig: register a
+	// throwaway SIGHUP handler synchronously, before the process under test
+	// can receive one, so a delivery that lands before runServer's watchSIGHUP
+	// goroutine registers its own can never terminate the test binary.
+	ready := make(chan os.Signal, 1)
+	signal.Notify(ready, syscall.SIGHUP)
+	defer signal.Stop(ready)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runServer(ctx, logger, configPath) }()
+
+	// Wait for runServer to get as far as spawning watchSIGHUP (which
+	// registers its own signal.Notify) before signalling, so exactly one
+	// reload happens: a SIGHUP that lands earlier would be dropped, and one
+	// sent again later would build a third generation this test doesn't need.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(logBuf.String(), "listening") {
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	// Point the config at backend B and reload.
+	writeCfg(backendB.URL)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("sending SIGHUP: %v", err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(logBuf.String(), "config reloaded") {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !strings.Contains(logBuf.String(), "config reloaded") {
+		t.Fatalf("log output = %q, want a \"config reloaded\" entry", logBuf.String())
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runServer exited with error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runServer did not exit within 10s of context cancellation")
+	}
+
+	// Generation 0 (backend A) was superseded but is still mid-drain; the
+	// current generation (backend B) is the only one the old shutdown path
+	// closed. Both must be closed by now.
+	closeWithin(t, backendA, 5*time.Second, "superseded generation 0")
+	closeWithin(t, backendB, 5*time.Second, "current generation")
 }
 
 // syncBuffer is a bytes.Buffer guarded by a mutex, safe for a background
@@ -635,6 +734,8 @@ func TestWatchSIGHUP_IgnoresReloadWithoutHTTPListener(t *testing.T) {
 	}
 	current := new(atomic.Pointer[gateway.Server])
 	current.Store(srv)
+	live := new(generations)
+	live.add(srv)
 	// See the matching comment in TestWatchSIGHUP_ReloadsConfig: without an
 	// explicit Close() here, the deferred backendA.Close() below would block
 	// forever on backendA's still-open standalone SSE stream (current is
@@ -656,7 +757,7 @@ func TestWatchSIGHUP_IgnoresReloadWithoutHTTPListener(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		watchSIGHUP(ctx, logger, configPath, current, genCancel)
+		watchSIGHUP(ctx, logger, configPath, startupListen{http: cfg.Listen.HTTP}, current, live, genCancel)
 		close(done)
 	}()
 
@@ -679,6 +780,413 @@ func TestWatchSIGHUP_IgnoresReloadWithoutHTTPListener(t *testing.T) {
 	}
 	if current.Load() != srv {
 		t.Fatal("current should not have been swapped")
+	}
+
+	cancel()
+	<-done
+}
+
+// TestWatchSIGHUP_ReportsListenChangesAgainstStartupListeners checks that
+// both listener-related messages describe the RUNNING process, not the
+// reloaded config: a changed listen.http is reported as not applied (listener
+// re-binding needs a restart, so an operator who edited it must not be left
+// thinking the new address is live), and the stdio warning stays silent for a
+// process that never started a stdio listener, however the new config reads.
+func TestWatchSIGHUP_ReportsListenChangesAgainstStartupListeners(t *testing.T) {
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	backendA := newFakeBackendHTTP("from-a")
+	defer backendA.Close()
+	backendB := newFakeBackendHTTP("from-b")
+	defer backendB.Close()
+
+	// The process is (pretend-)bound to boundAddr; the reloaded config below
+	// asks for requestedAddr and additionally turns stdio on. Neither can take
+	// effect. No listener is actually started here -- watchSIGHUP only ever
+	// compares these strings.
+	const boundAddr = "127.0.0.1:18888"
+	const requestedAddr = "127.0.0.1:19999"
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeCfg := func(listen, url string) {
+		t.Helper()
+		content := fmt.Sprintf("listen:\n  http: %q\nbackends:\n  - name: b\n    transport: http\n    url: %q\n", listen, url)
+		if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+			t.Fatalf("writing config: %v", err)
+		}
+	}
+	writeCfg(boundAddr, backendA.URL)
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	genCtx, genCancel := context.WithCancel(ctx)
+	srv, err := buildGateway(genCtx, logger, cfg)
+	if err != nil {
+		t.Fatalf("buildGateway: %v", err)
+	}
+	closeAll := func(s *gateway.Server) {
+		for _, b := range s.Backends() {
+			_ = b.Close()
+		}
+	}
+	// See TestWatchSIGHUP_ReloadsConfig: both generations' backend connections
+	// must be closed before the deferred backendA/backendB Close() calls, or
+	// those block on a still-open standalone SSE stream.
+	defer closeAll(srv)
+	current := new(atomic.Pointer[gateway.Server])
+	current.Store(srv)
+	live := new(generations)
+	live.add(srv)
+	defer func() { closeAll(current.Load()) }()
+
+	ready := make(chan os.Signal, 1)
+	signal.Notify(ready, syscall.SIGHUP)
+	defer signal.Stop(ready)
+
+	done := make(chan struct{})
+	go func() {
+		watchSIGHUP(ctx, logger, configPath, startupListen{http: boundAddr, stdio: false}, current, live, genCancel)
+		close(done)
+	}()
+
+	// The reloaded config asks for a different HTTP address AND a stdio
+	// listener the process doesn't have.
+	content := fmt.Sprintf("listen:\n  stdio: true\n  http: %q\nbackends:\n  - name: b\n    transport: http\n    url: %q\n", requestedAddr, backendB.URL)
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("rewriting config: %v", err)
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("sending SIGHUP: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && current.Load() == srv {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if current.Load() == srv {
+		t.Fatalf("current was not swapped after SIGHUP; log = %q", logBuf.String())
+	}
+
+	got := logBuf.String()
+	if !strings.Contains(got, "listen.http change requires a process restart") {
+		t.Fatalf("log output = %q, want a warning that the listen.http change was not applied", got)
+	}
+	if !strings.Contains(got, boundAddr) || !strings.Contains(got, requestedAddr) {
+		t.Fatalf("log output = %q, want it to name both the running address %q and the requested one %q", got, boundAddr, requestedAddr)
+	}
+	if strings.Contains(got, "stdio session") {
+		t.Fatalf("log output = %q, want no stdio-session warning: this process never started a stdio listener, so the reloaded config's listen.stdio is irrelevant", got)
+	}
+
+	cancel()
+	<-done
+}
+
+// TestWatchSIGHUP_StdioWarningMentionsDrainForceClose checks the warning a
+// stdio+http process gets on reload: the surviving stdio session is pinned to
+// the superseded generation, whose backend connections scheduleDrain
+// force-closes once reloadDrainTimeout elapses -- so saying only that it
+// "keeps running under the old generation" would be true for at most that
+// long. The message must carry the actual timeout value, not a hardcoded one.
+func TestWatchSIGHUP_StdioWarningMentionsDrainForceClose(t *testing.T) {
+	// Long enough that the drain timer never fires during this test, and
+	// distinctive enough that finding it in the log proves the message
+	// interpolates the real value.
+	origTimeout := reloadDrainTimeout
+	reloadDrainTimeout = 90 * time.Second
+	t.Cleanup(func() { reloadDrainTimeout = origTimeout })
+
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	backendA := newFakeBackendHTTP("from-a")
+	defer backendA.Close()
+	backendB := newFakeBackendHTTP("from-b")
+	defer backendB.Close()
+
+	const boundAddr = "127.0.0.1:18888"
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeCfg := func(url string) {
+		t.Helper()
+		content := fmt.Sprintf("listen:\n  stdio: true\n  http: %q\nbackends:\n  - name: b\n    transport: http\n    url: %q\n", boundAddr, url)
+		if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+			t.Fatalf("writing config: %v", err)
+		}
+	}
+	writeCfg(backendA.URL)
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	genCtx, genCancel := context.WithCancel(ctx)
+	srv, err := buildGateway(genCtx, logger, cfg)
+	if err != nil {
+		t.Fatalf("buildGateway: %v", err)
+	}
+	closeAll := func(s *gateway.Server) {
+		for _, b := range s.Backends() {
+			_ = b.Close()
+		}
+	}
+	defer closeAll(srv)
+	current := new(atomic.Pointer[gateway.Server])
+	current.Store(srv)
+	live := new(generations)
+	live.add(srv)
+	defer func() { closeAll(current.Load()) }()
+
+	ready := make(chan os.Signal, 1)
+	signal.Notify(ready, syscall.SIGHUP)
+	defer signal.Stop(ready)
+
+	done := make(chan struct{})
+	go func() {
+		// The process really did start a stdio listener (stdio: true above).
+		watchSIGHUP(ctx, logger, configPath, startupListen{http: boundAddr, stdio: true}, current, live, genCancel)
+		close(done)
+	}()
+
+	writeCfg(backendB.URL)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("sending SIGHUP: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && current.Load() == srv {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if current.Load() == srv {
+		t.Fatalf("current was not swapped after SIGHUP; log = %q", logBuf.String())
+	}
+
+	got := logBuf.String()
+	if !strings.Contains(got, "stdio session") {
+		t.Fatalf("log output = %q, want a warning about the surviving stdio session", got)
+	}
+	if !strings.Contains(got, "force-closed") || !strings.Contains(got, "restart") {
+		t.Fatalf("log output = %q, want the stdio warning to say the old generation's backends are force-closed and a process restart is required", got)
+	}
+	if !strings.Contains(got, reloadDrainTimeout.String()) {
+		t.Fatalf("log output = %q, want it to name the actual drain timeout (%v)", got, reloadDrainTimeout)
+	}
+
+	cancel()
+	<-done
+}
+
+// TestWatchSIGHUP_MalformedConfigKeepsCurrentGeneration covers the
+// config.Load failure branch -- the most likely real-world SIGHUP outcome,
+// since an operator can signal mid-edit: the reload is abandoned, the old
+// generation stays live, and the failure is logged at error level.
+func TestWatchSIGHUP_MalformedConfigKeepsCurrentGeneration(t *testing.T) {
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	backendA := newFakeBackendHTTP("from-a")
+	defer backendA.Close()
+
+	const boundAddr = "127.0.0.1:18888"
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := fmt.Sprintf("listen:\n  http: %q\nbackends:\n  - name: b\n    transport: http\n    url: %q\n", boundAddr, backendA.URL)
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	genCtx, genCancel := context.WithCancel(ctx)
+	srv, err := buildGateway(genCtx, logger, cfg)
+	if err != nil {
+		t.Fatalf("buildGateway: %v", err)
+	}
+	current := new(atomic.Pointer[gateway.Server])
+	current.Store(srv)
+	live := new(generations)
+	live.add(srv)
+	// current is never swapped in this test, so nothing else closes
+	// generation 0's connection before the deferred backendA.Close() above.
+	defer func() {
+		for _, b := range current.Load().Backends() {
+			_ = b.Close()
+		}
+	}()
+
+	ready := make(chan os.Signal, 1)
+	signal.Notify(ready, syscall.SIGHUP)
+	defer signal.Stop(ready)
+
+	done := make(chan struct{})
+	go func() {
+		watchSIGHUP(ctx, logger, configPath, startupListen{http: boundAddr}, current, live, genCancel)
+		close(done)
+	}()
+
+	// A tab-indented mapping is invalid YAML anywhere in the document, so
+	// config.Load fails at the parse step -- the half-saved-file case.
+	if err := os.WriteFile(configPath, []byte("listen:\n\thttp: \"127.0.0.1:18888\"\n"), 0o600); err != nil {
+		t.Fatalf("rewriting config: %v", err)
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("sending SIGHUP: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(logBuf.String(), "config reload failed") {
+		time.Sleep(20 * time.Millisecond)
+	}
+	got := logBuf.String()
+	if !strings.Contains(got, "config reload failed, keeping current config") {
+		t.Fatalf("log output = %q, want a \"config reload failed, keeping current config\" entry", got)
+	}
+	if !strings.Contains(got, "level=ERROR") {
+		t.Fatalf("log output = %q, want the reload failure logged at error level", got)
+	}
+	if current.Load() != srv {
+		t.Fatal("current must not be swapped when the reloaded config doesn't parse")
+	}
+
+	cancel()
+	<-done
+}
+
+// TestWatchSIGHUP_ConsecutiveReloadsSupersedeEachGeneration checks that a
+// SECOND SIGHUP supersedes generation 1 -- not generation 0 all over again.
+// watchSIGHUP keeps the live generation's cancel func in genCancel and
+// reassigns it after every swap; without that reassignment generation 0 would
+// be cancelled twice while generation 1's context stayed live for the
+// process's whole lifetime.
+//
+// Generation 1's cancellation is observed through the one thing its context
+// still drives after buildGateway returned: its backends' list_changed
+// callbacks (toolsChangedCallback derives each re-list context from the
+// generation context). Once generation 1 is superseded, a list_changed
+// notification from ITS backend must fail the re-list rather than quietly
+// succeed -- while generation 2, built from the same code path, still lists
+// fine.
+func TestWatchSIGHUP_ConsecutiveReloadsSupersedeEachGeneration(t *testing.T) {
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	backendA := newFakeBackendHTTP("from-a")
+	defer backendA.Close()
+	// Generation 1's backend is built inline rather than via
+	// newFakeBackendHTTP, because this test needs the *mcp.Server itself to
+	// fire a tools/list_changed notification at it later.
+	mcpB := mcp.NewServer(&mcp.Implementation{Name: "backend-b", Version: "v1"}, nil)
+	noopTool := func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
+		return nil, struct{}{}, nil
+	}
+	mcp.AddTool(mcpB, &mcp.Tool{Name: "from-b", Description: "from-b"}, noopTool)
+	backendB := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpB }, nil))
+	defer backendB.Close()
+	backendC := newFakeBackendHTTP("from-c")
+	defer backendC.Close()
+
+	const boundAddr = "127.0.0.1:18888"
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeCfg := func(url string) {
+		t.Helper()
+		content := fmt.Sprintf("listen:\n  http: %q\nbackends:\n  - name: b\n    transport: http\n    url: %q\n", boundAddr, url)
+		if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+			t.Fatalf("writing config: %v", err)
+		}
+	}
+	writeCfg(backendA.URL)
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	genCtx, genCancel := context.WithCancel(ctx)
+	gen0, err := buildGateway(genCtx, logger, cfg)
+	if err != nil {
+		t.Fatalf("buildGateway: %v", err)
+	}
+	closeAll := func(s *gateway.Server) {
+		for _, b := range s.Backends() {
+			_ = b.Close()
+		}
+	}
+	// Every generation this test creates is closed explicitly (see
+	// TestWatchSIGHUP_ReloadsConfig): reloadDrainTimeout keeps its production
+	// 5-minute default here, so scheduleDrain's timer never fires and the
+	// deferred backendA/B/C Close() calls below would otherwise block on
+	// still-open standalone SSE streams.
+	defer closeAll(gen0)
+	current := new(atomic.Pointer[gateway.Server])
+	current.Store(gen0)
+	live := new(generations)
+	live.add(gen0)
+	defer func() { closeAll(current.Load()) }()
+
+	ready := make(chan os.Signal, 1)
+	signal.Notify(ready, syscall.SIGHUP)
+	defer signal.Stop(ready)
+
+	done := make(chan struct{})
+	go func() {
+		watchSIGHUP(ctx, logger, configPath, startupListen{http: boundAddr}, current, live, genCancel)
+		close(done)
+	}()
+
+	reload := func(prev *gateway.Server, url string) *gateway.Server {
+		t.Helper()
+		writeCfg(url)
+		if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+			t.Fatalf("sending SIGHUP: %v", err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && current.Load() == prev {
+			time.Sleep(20 * time.Millisecond)
+		}
+		next := current.Load()
+		if next == prev {
+			t.Fatalf("current was not swapped after SIGHUP; log = %q", logBuf.String())
+		}
+		return next
+	}
+
+	gen1 := reload(gen0, backendB.URL)
+	defer closeAll(gen1)
+	gen2 := reload(gen1, backendC.URL)
+	if gen2 == gen0 {
+		t.Fatal("the second reload must build a third generation, not restore generation 0")
+	}
+
+	// Generation 2 is live and healthy: its own backend still lists fine.
+	if _, err := gen2.Backend("b").ListTools(context.Background()); err != nil {
+		t.Fatalf("generation 2's backend should be usable: %v", err)
+	}
+
+	// Generation 1 is superseded, so its context must be cancelled: a
+	// list_changed notification from its backend now fails the re-list. Each
+	// AddTool fires one notification, so keep firing until the failure shows
+	// up -- the very first one could race scheduleDrain's cancel, which
+	// watchSIGHUP calls just after the swap this test polls for.
+	deadline := time.Now().Add(5 * time.Second)
+	for i := 0; time.Now().Before(deadline); i++ {
+		if strings.Contains(logBuf.String(), "list_changed: re-list failed") {
+			break
+		}
+		mcp.AddTool(mcpB, &mcp.Tool{Name: fmt.Sprintf("extra-%d", i), Description: "extra"}, noopTool)
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !strings.Contains(logBuf.String(), "list_changed: re-list failed") {
+		t.Fatalf("log output = %q, want generation 1's re-list to fail: its generation context should have been cancelled when generation 2 superseded it", logBuf.String())
 	}
 
 	cancel()
@@ -718,7 +1226,13 @@ func TestScheduleDrain_ForceClosesBackendsAfterTimeout(t *testing.T) {
 		t.Fatal(`Backend("b") = nil`)
 	}
 
-	scheduleDrain(logger, srv, genCancel)
+	// scheduleDrain's timer only closes a generation it can still take out of
+	// the live set (that's what keeps it from double-closing one process
+	// shutdown already closed), so register srv there first, exactly as
+	// runServer/watchSIGHUP do.
+	live := new(generations)
+	live.add(srv)
+	scheduleDrain(logger, srv, genCancel, live)
 
 	if genCtx.Err() == nil {
 		t.Fatal("scheduleDrain should cancel genCtx immediately")
