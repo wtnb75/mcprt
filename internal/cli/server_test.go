@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"sync/atomic"
@@ -828,6 +829,22 @@ backends:
     transport: http
     url: %q
 `, gatewayAddr, httpA.URL))
+
+	// Register a throwaway SIGHUP handler synchronously, before starting the
+	// server (whose watchSIGHUP registers its own signal.Notify inside a
+	// goroutine, racing against the syscall.Kill below). Without this, if the
+	// kill lands before that goroutine gets scheduled, the process has no
+	// registered handler for SIGHUP yet and the Go runtime applies the default
+	// action (terminate) -- killing the whole test binary, with no test
+	// attribution. Once ANY handler is registered for a signal, the runtime
+	// never reverts to default disposition for it, and every registered
+	// channel (this one and watchSIGHUP's own) receives every subsequent
+	// delivery, so this doesn't interfere with the server actually seeing the
+	// signal. Same pattern as TestWatchSIGHUP_ReloadsConfig in
+	// server_internal_test.go.
+	ready := make(chan os.Signal, 1)
+	signal.Notify(ready, syscall.SIGHUP)
+	defer signal.Stop(ready)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	execErr := make(chan error, 1)
