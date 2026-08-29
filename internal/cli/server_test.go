@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -764,6 +765,177 @@ backends:
 	waitForPromptNames(t, ctx, session, []string{"farewell"})
 
 	_ = session.Close()
+	cancel()
+	if err := <-execErr; err != nil {
+		t.Fatalf("server exited with error: %v", err)
+	}
+}
+
+// TestServerCommand_SIGHUPReloadsConfig is this feature's end-to-end
+// acceptance test: mcprt server started via cli.Execute, in HTTP mode; the
+// config file is rewritten to point at a second backend; SIGHUP is sent to
+// the test process itself. A brand-new client session must see the new
+// backend's tools, while a session that connected before the reload keeps
+// working against the old backend until reloadDrainTimeout elapses, after
+// which its calls start failing.
+func TestServerCommand_SIGHUPReloadsConfig(t *testing.T) {
+	backendA := mcp.NewServer(&mcp.Implementation{Name: "backend-a", Version: "v1"}, nil)
+	mcp.AddTool(backendA, &mcp.Tool{Name: "from-a", Description: "from a"},
+		func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
+			return nil, struct{}{}, nil
+		})
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendA }, nil))
+	// httpA.Close() blocks until every open connection to it goes idle.
+	// backend A is generation 0's backend; once the SIGHUP-triggered reload
+	// below supersedes generation 0, scheduleDrain (Task 5) intentionally
+	// keeps its connection to backend A open -- that's the whole point of
+	// drain -- and only force-closes it once reloadDrainTimeout elapses
+	// (production default: 5 minutes). reloadDrainTimeout is an unexported
+	// var in package cli that this external cli_test package cannot shrink
+	// (unlike TestScheduleDrain_ForceClosesBackendsAfterTimeout, an internal
+	// test), so without CloseClientConnections() here, this deferred
+	// httpA.Close() would genuinely block for the full 5 minutes waiting for
+	// scheduleDrain's own timer -- turning this test green but ~300s slower
+	// than every other test in this file. Forcing the lingering connection
+	// closed here is just fast test teardown; it doesn't touch what the
+	// test already asserted about generation 0 staying reachable while it
+	// drained.
+	defer func() {
+		httpA.CloseClientConnections()
+		httpA.Close()
+	}()
+
+	backendB := mcp.NewServer(&mcp.Implementation{Name: "backend-b", Version: "v1"}, nil)
+	mcp.AddTool(backendB, &mcp.Tool{Name: "from-b", Description: "from b"},
+		func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
+			return nil, struct{}{}, nil
+		})
+	httpB := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendB }, nil))
+	// backend B is the current generation at shutdown time: runServer's own
+	// shutdown path closes it (see runServer's `current.Load().Backends()`
+	// cleanup defer) before cli.Execute returns, so by the time this test's
+	// <-execErr unblocks below, httpB has no active connection left and
+	// Close() here returns immediately. No CloseClientConnections() needed.
+	defer httpB.Close()
+
+	gatewayAddr := freePort(t)
+	configPath := writeConfig(t, fmt.Sprintf(`
+listen:
+  http: %q
+
+backends:
+  - name: b
+    transport: http
+    url: %q
+`, gatewayAddr, httpA.URL))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	execErr := make(chan error, 1)
+	go func() {
+		execErr <- cli.Execute(ctx, []string{"server", "--config", configPath})
+	}()
+	// cancel()+<-execErr run as explicit statements at the very end of this
+	// function (see below), NOT via t.Cleanup or defer -- matching the
+	// existing TestServerCommand_ServesAggregatedTools pattern in this same
+	// file. Plain defers registered before this point (httpA.Close(),
+	// httpB.Close() below) only fire once the function actually returns,
+	// which is after these explicit statements run; if they were deferred
+	// (or handled via t.Cleanup, which always runs after every plain defer
+	// in this function has already fired) they'd race the still-running
+	// mcprt process's own open connections to backendA/backendB, and
+	// httpA.Close()/httpB.Close() would block for real waiting on a
+	// connection nothing has told to close yet -- the same class of hang
+	// Task 5 found and fixed in its own tests.
+
+	dial := func() *mcp.ClientSession {
+		client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+		var session *mcp.ClientSession
+		var connectErr error
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			session, connectErr = client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: "http://" + gatewayAddr}, nil)
+			if connectErr == nil {
+				return session
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatalf("connecting to gateway: %v", connectErr)
+		return nil
+	}
+	toolNames := func(t *testing.T, s *mcp.ClientSession) []string {
+		t.Helper()
+		var names []string
+		for tool, err := range s.Tools(ctx, nil) {
+			if err != nil {
+				t.Fatalf("listing tools: %v", err)
+			}
+			names = append(names, tool.Name)
+		}
+		sort.Strings(names)
+		return names
+	}
+
+	// oldSession and newSession are closed explicitly, right before cancel()
+	// below, rather than via defer: like httpA.Close()/httpB.Close() above,
+	// a deferred Close() would only run once this function returns, which
+	// is after the explicit cancel()/<-execErr statements at the end of
+	// this function. gateway.ServeHTTP's graceful shutdown (shutdownTimeout,
+	// 5s) waits for every open MCP Streamable HTTP session's long-lived SSE
+	// stream to go idle; a still-open client session at the moment ctx is
+	// cancelled makes that shutdown time out and Execute return a non-nil
+	// error, failing this test's own <-execErr check below -- the same
+	// class of ordering bug as the httpA/httpB one, one layer closer in.
+	oldSession := dial()
+	if got := toolNames(t, oldSession); len(got) != 1 || got[0] != "from-a" {
+		t.Fatalf("oldSession tools = %v, want [from-a]", got)
+	}
+
+	// Point the config at backend B and reload.
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf(`
+listen:
+  http: %q
+
+backends:
+  - name: b
+    transport: http
+    url: %q
+`, gatewayAddr, httpB.URL)), 0o600); err != nil {
+		t.Fatalf("rewriting config: %v", err)
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("sending SIGHUP: %v", err)
+	}
+
+	// A brand-new session must see backend B's tools once the reload has
+	// taken effect (poll: reload is asynchronous).
+	deadline := time.Now().Add(5 * time.Second)
+	var newSession *mcp.ClientSession
+	var got []string
+	for time.Now().Before(deadline) {
+		newSession = dial()
+		got = toolNames(t, newSession)
+		if len(got) == 1 && got[0] == "from-b" {
+			break
+		}
+		_ = newSession.Close()
+		time.Sleep(100 * time.Millisecond)
+	}
+	if len(got) != 1 || got[0] != "from-b" {
+		t.Fatalf("newSession tools = %v, want [from-b] after reload", got)
+	}
+
+	// The pre-reload session must still work against backend A: it was
+	// never disturbed by the swap.
+	if got := toolNames(t, oldSession); len(got) != 1 || got[0] != "from-a" {
+		t.Fatalf("oldSession tools after reload = %v, want [from-a] (must stay on its original backend)", got)
+	}
+
+	// Close both client sessions before shutting the server down (see the
+	// comment above oldSession's declaration): otherwise their still-open
+	// SSE streams make the gateway's graceful shutdown below time out.
+	_ = oldSession.Close()
+	_ = newSession.Close()
+
 	cancel()
 	if err := <-execErr; err != nil {
 		t.Fatalf("server exited with error: %v", err)
