@@ -52,10 +52,17 @@ type Overrides struct {
 // Server wraps an *mcp.Server with the reconcile state needed to react to a
 // backend's list_changed notification: its per-backend raw item lists, the
 // currently-registered routing table, and the exposed-name overrides -- all
-// four independently for tools/resources/resource templates/prompts. mu
-// protects all eight of those fields together; the protected section is
-// always in-memory work (router.Resolve plus the SDK's Add/Remove calls),
-// never backend I/O, so one mutex is enough.
+// four independently for tools/resources/resource templates/prompts -- plus
+// the connected backends themselves. mu protects the backends map and all
+// eight of those reconcile fields together; the protected section is always
+// in-memory work (router.Resolve plus the SDK's Add/Remove calls), never
+// backend I/O, so one mutex is enough.
+//
+// backends is NOT fixed at construction: ConnectBackend (see reconcile.go)
+// adds a backend that failed to connect at startup, and replaces a
+// reconnecting backend's entry with its new connection, at any time while
+// the Server is serving. Every read of it therefore goes through mu (see
+// Backend/Backends).
 type Server struct {
 	mcp      *mcp.Server
 	logger   *slog.Logger

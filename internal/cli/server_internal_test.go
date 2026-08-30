@@ -300,54 +300,24 @@ func freeAddr(t *testing.T) string {
 	return addr
 }
 
-// connectBackendsWaitable is connectBackends' test-only counterpart: same
-// spawn-and-collect behavior (see connectBackends), but additionally returns
-// a channel that closes once every spawned superviseBackend goroutine has
-// actually returned. connectBackends itself returns as soon as its
-// collection window elapses, without ever waiting for the (deliberately
-// long-lived) supervisor goroutines it spawns to exit -- by design, since in
-// production they run for the life of the process. A test that cancels ctx
-// and wants to assert nothing of its own survives past that point (so it
-// can't leak a goroutine that goes on reading/writing package-level test
-// vars like backendConnectTimeout into a LATER test -- a real `go test
-// -race` failure, confirmed by reproducing it) needs this instead, to wait
-// on before returning.
+// connectBackendsWaitable is connectBackends plus the one thing tests need
+// that production doesn't: a channel that closes once every spawned
+// superviseBackend goroutine has actually returned. connectBackends itself
+// returns as soon as its collection window closes, without ever waiting for
+// the (deliberately long-lived) supervisor goroutines it spawns to exit --
+// by design, since in production they run for the life of the generation. A
+// test that cancels ctx and wants to assert nothing of its own survives past
+// that point (so it can't leak a goroutine that goes on reading
+// package-level test vars like backendConnectTimeout into a LATER test -- a
+// real `go test -race` failure, confirmed by reproducing it) waits on this
+// before returning.
+//
+// It is a straight alias for the production superviseBackends rather than a
+// second implementation: an earlier copy of connectBackends' collection loop
+// lived here and had already gone stale, missing the config-order-preserving
+// and distinct-index-counting fixes production had since grown.
 func connectBackendsWaitable(ctx context.Context, logger *slog.Logger, configs []config.BackendConfig, gwH *gwHolder) (connected, <-chan struct{}) {
-	var wg sync.WaitGroup
-	resultCh := make(chan *connectResult, len(configs))
-	for _, bc := range configs {
-		wg.Add(1)
-		go func(bc config.BackendConfig) {
-			defer wg.Done()
-			superviseBackend(ctx, logger, bc, gwH, func(c *connectResult) { resultCh <- c })
-		}(bc)
-	}
-	done := make(chan struct{})
-	go func() { wg.Wait(); close(done) }()
-
-	result := connected{backends: make(map[string]*backend.Backend, len(configs))}
-	deadline := time.After(backendConnectTimeout)
-	for i := 0; i < len(configs); i++ {
-		select {
-		case c := <-resultCh:
-			result.backends[c.backend.Name] = c.backend
-			result.toolEntries = append(result.toolEntries, router.Entry[*mcp.Tool]{
-				BackendName: c.backend.Name, Prefix: c.backend.Prefix, Items: c.tools,
-			})
-			result.resourceEntries = append(result.resourceEntries, router.Entry[*mcp.Resource]{
-				BackendName: c.backend.Name, Items: c.resources,
-			})
-			result.resourceTemplateEntries = append(result.resourceTemplateEntries, router.Entry[*mcp.ResourceTemplate]{
-				BackendName: c.backend.Name, Items: c.resourceTemplates,
-			})
-			result.promptEntries = append(result.promptEntries, router.Entry[*mcp.Prompt]{
-				BackendName: c.backend.Name, Prefix: c.backend.Prefix, Items: c.prompts,
-			})
-		case <-deadline:
-			return result, done
-		}
-	}
-	return result, done
+	return superviseBackends(ctx, logger, configs, gwH)
 }
 
 // waitSupervisorsDone waits for done (from connectBackendsWaitable) to
@@ -589,7 +559,7 @@ func TestSuperviseBackend_StopsRetryingWhenContextCancelled(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		superviseBackend(ctx, logger, config.BackendConfig{Name: "unreachable", Transport: "http", URL: "http://" + addr}, nil, func(*connectResult) {})
+		superviseBackend(ctx, logger, config.BackendConfig{Name: "unreachable", Transport: "http", URL: "http://" + addr}, nil, nil, nil)
 		close(done)
 	}()
 
@@ -659,7 +629,7 @@ func TestCollectConnectResults_FlappingBackendDoesNotDropHealthyBackend(t *testi
 	resultCh <- indexedConnectResult{0, flappySecond}
 	resultCh <- indexedConnectResult{1, healthy}
 
-	results := collectConnectResults(resultCh, 2, make(chan time.Time)) // a deadline that never fires
+	results := collectConnectResults(resultCh, 2, make(chan time.Time), nil) // a deadline that never fires
 
 	if results[0] != flappySecond {
 		t.Fatalf("results[0] = %+v, want flappySecond (the latest connect for a flapping backend wins)", results[0])
@@ -675,6 +645,190 @@ func TestCollectConnectResults_FlappingBackendDoesNotDropHealthyBackend(t *testi
 	defer cancel()
 	if _, err := flappyFirst.backend.ListTools(ctx); err == nil {
 		t.Fatal("flappyFirst.ListTools succeeded after being superseded, want collectConnectResults to have closed it")
+	}
+}
+
+// TestConnectBackends_ReturnsWithoutWaitingOutTimeoutForADeadBackend checks
+// that a backend which is down (and stays down) does not make connectBackends
+// burn the whole backendConnectTimeout before returning: every supervisor
+// signals once its OWN first connectAndList attempt has resolved -- success or
+// failure -- and once all of them have, the collection window closes
+// immediately instead of waiting for a slot that a permanently-failing backend
+// will never fill.
+//
+// Before this, the collection loop's only exit for a failing backend was the
+// deadline itself, so `mcprt list`/`mcprt call` against a dead backend took
+// the full 30s default, and runServer's HTTP listener bind (which happens
+// AFTER buildGateway) was delayed by the same 30s -- a readiness-probe hazard
+// in container deployments.
+func TestConnectBackends_ReturnsWithoutWaitingOutTimeoutForADeadBackend(t *testing.T) {
+	origTimeout := backendConnectTimeout
+	backendConnectTimeout = 10 * time.Second
+	t.Cleanup(func() { backendConnectTimeout = origTimeout })
+	origMin, origMax := backendBackoffMin, backendBackoffMax
+	backendBackoffMin, backendBackoffMax = 20*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { backendBackoffMin, backendBackoffMax = origMin, origMax })
+
+	addr := freeAddr(t) // nothing ever listens here -- every attempt fails at once
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	var supervisorsDone <-chan struct{}
+	// Registered first -> runs last (LIFO), after cancel() below: the
+	// supervisor keeps retrying this dead backend forever otherwise, reading
+	// the package-level vars this test writes above while a LATER test writes
+	// them too (see connectBackendsWaitable's doc comment).
+	defer func() { waitSupervisorsDone(t, supervisorsDone) }()
+	defer cancel()
+
+	start := time.Now()
+	conn, supervisorsDone := connectBackendsWaitable(ctx, logger,
+		[]config.BackendConfig{{Name: "down", Transport: "http", URL: "http://" + addr}}, nil)
+	elapsed := time.Since(start)
+
+	if len(conn.backends) != 0 {
+		t.Fatalf("backends = %v, want none (nothing is listening on %s)", conn.backends, addr)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("connectBackends took %v with backendConnectTimeout=%v; it must return as soon as every backend's FIRST attempt has resolved, not wait out the timeout for a backend that is merely retrying", elapsed, backendConnectTimeout)
+	}
+}
+
+// TestCollectConnectResults_KeepsResultAlreadyBufferedWhenDeadlineFires checks
+// that a result which has ALREADY landed in resultCh when the collection
+// window closes is still picked up, instead of being discarded by whichever
+// select branch Go happens to pick.
+//
+// Go's select chooses uniformly at random among ready cases, so with both a
+// fired deadline and a buffered result ready, the old loop dropped the result
+// about half the time -- and the backend it belonged to was then excluded from
+// the founding set for good: its supervisor is parked in Session.Wait()
+// believing it already reported, so it never joins later via ConnectBackend
+// either. The iteration count below turns that coin flip into a
+// deterministic failure.
+func TestCollectConnectResults_KeepsResultAlreadyBufferedWhenDeadlineFires(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		healthy := &connectResult{backend: &backend.Backend{Name: "healthy"}}
+		resultCh := make(chan indexedConnectResult, 2)
+		resultCh <- indexedConnectResult{1, healthy}
+
+		deadline := make(chan time.Time)
+		close(deadline) // an already-fired deadline: always ready
+
+		results := collectConnectResults(resultCh, 2, deadline, nil)
+		if results[1] != healthy {
+			t.Fatalf("iteration %d: results[1] = %v, want healthy's already-buffered result -- collectConnectResults must drain what already arrived before returning", i, results[1])
+		}
+	}
+}
+
+// serveIdenticalToolBackend starts an MCP backend on ln exposing a single
+// "ping" tool whose name, description and input schema are identical no
+// matter which payload it serves -- only the text its handler returns
+// differs. Two such backends are therefore indistinguishable to the
+// gateway's value-equality reconcile diff (reflect.DeepEqual over the
+// resolved *mcp.Tool), while still being distinguishable to the test that
+// calls them.
+func serveIdenticalToolBackend(ln net.Listener, payload string) *http.Server {
+	srv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	srv.AddTool(&mcp.Tool{Name: "ping", Description: "ping", InputSchema: map[string]any{"type": "object"}},
+		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: payload}}}, nil
+		})
+	h := &http.Server{Handler: mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil)}
+	go func() { _ = h.Serve(ln) }()
+	return h
+}
+
+// TestConnectBackend_ReconnectRebindsHandlerAfterDisconnectMissedWhileHolderNil
+// reproduces the narrow publication window where gwH.ptr is still nil (see
+// superviseBackend): a backend that made the founding set disconnects before
+// gateway.New has run, so superviseBackend's disconnect-triggered clear
+// (gw.UpdateTools(name, nil)) is skipped -- there is no gw to call it on yet.
+// By the time the supervisor reconnects, gwH.ptr IS populated, so the
+// reconnect goes through ConnectBackend -- whose UpdateTools diff compares
+// the newly-listed tools against a table that was never cleared. When the
+// reconnected backend's tool set is value-identical to the one still
+// registered from the FIRST, now-dead connection, that diff sees no change
+// at all and skips re-registration, leaving the gateway's tool handler bound
+// to the closed *backend.Backend forever: every tools/call fails permanently.
+//
+// What actually changed here is the backend OBJECT'S IDENTITY, which a
+// value-equality diff cannot observe -- so ConnectBackend must force
+// re-registration of everything the (re)connecting backend owns.
+func TestConnectBackend_ReconnectRebindsHandlerAfterDisconnectMissedWhileHolderNil(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr := freeAddr(t)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("listening on %s: %v", addr, err)
+	}
+	first := serveIdenticalToolBackend(ln, "from-first-connection")
+
+	bc := config.BackendConfig{Name: "fake", Transport: "http", URL: "http://" + addr}
+
+	// 1. The founding connect plus gateway.New, exactly as
+	//    connectBackends/buildGateway wire them.
+	c1, err := connectAndList(ctx, logger, bc, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("first connect: %v", err)
+	}
+	entries := []router.Entry[*mcp.Tool]{{BackendName: bc.Name, Items: c1.tools}}
+	table := router.Resolve(entries, gateway.ToolNameOf, gateway.ToolRename, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{bc.Name: c1.backend},
+		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil)
+
+	// 2. The disconnect lands while gwH.ptr is still nil, so no clear runs:
+	//    the gateway keeps serving "ping" through c1's dead connection.
+	if err := c1.backend.Close(); err != nil {
+		t.Fatalf("closing the first backend connection: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("stopping the first backend server: %v", err)
+	}
+
+	ln2, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("re-listening on %s: %v", addr, err)
+	}
+	second := serveIdenticalToolBackend(ln2, "from-second-connection")
+	defer func() { _ = second.Close() }()
+
+	// 3. gwH.ptr is populated by now, so the supervisor's reconnect goes
+	//    through ConnectBackend -- with a tool set identical to what is
+	//    still registered.
+	c2, err := connectAndList(ctx, logger, bc, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer func() { _ = c2.backend.Close() }()
+	srv.ConnectBackend(bc.Name, c2.backend, bc.Prefix, c2.tools, c2.resources, c2.resourceTemplates, c2.prompts)
+
+	// 4. A downstream tools/call must reach the NEW connection.
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "ping"})
+	if err != nil {
+		t.Fatalf("tools/call after reconnect: %v -- the gateway's handler is still bound to the first, closed connection", err)
+	}
+	if len(res.Content) != 1 {
+		t.Fatalf("tools/call content = %+v, want exactly one text content", res.Content)
+	}
+	text, ok := res.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("tools/call content[0] = %T, want *mcp.TextContent", res.Content[0])
+	}
+	if text.Text != "from-second-connection" {
+		t.Fatalf("tools/call reached %q, want %q (the reconnected backend)", text.Text, "from-second-connection")
 	}
 }
 

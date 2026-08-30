@@ -469,19 +469,26 @@ func connectAndList(ctx context.Context, logger *slog.Logger, bc config.BackendC
 // failure, forever -- there is no give-up while ctx is alive), report the
 // result, wait for disconnect, clear the backend's items, and reconnect.
 //
-// ctx is always the generation's own genCtx here (buildGateway, the only
-// caller of connectBackends, is itself always called with a generation's
-// genCtx -- see this plan's header note). Because genCtx is
-// generation-scoped rather than process-scoped, a superseded generation's
-// supervisors wind down on their own once that generation's connections
-// actually close (a real disconnect, or scheduleDrain's eventual
-// force-close after reloadDrainTimeout): Session.Wait() returns, the next
-// connectAndList attempt fails immediately against the already-cancelled
-// ctx, and the retry-wait select's <-ctx.Done() branch returns. No special
-// generation-teardown code is needed for that to happen.
+// ctx scopes the supervisor's whole lifetime, and what it is scoped TO
+// depends on the caller:
+//   - buildGateway passes that generation's genCtx. Because genCtx is
+//     generation-scoped rather than process-scoped, a superseded generation's
+//     supervisors wind down on their own once that generation's connections
+//     actually close (a real disconnect, or scheduleDrain's eventual
+//     force-close after reloadDrainTimeout): Session.Wait() returns, the next
+//     connectAndList attempt fails immediately against the already-cancelled
+//     ctx, and the retry-wait select's <-ctx.Done() branch returns. No special
+//     generation-teardown code is needed for that to happen.
+//   - runList and runCall (internal/cli/list.go, internal/cli/call.go) also
+//     call connectBackends, with gwH == nil and the command's own context --
+//     process-lifetime, not generation-scoped. They cancel it explicitly
+//     before closing their backend connections, so a supervisor released from
+//     Session.Wait() by that close can't race ahead and open one more
+//     connection (for a stdio backend: fork one more subprocess) that nobody
+//     owns, microseconds before the process exits.
 //
-// onFirstConnect is called on any successful connect (first-ever or a
-// reconnect) for as long as gwH.ptr is still nil -- i.e. before the
+// onFirstConnect, if non-nil, is called on any successful connect (first-ever
+// or a reconnect) for as long as gwH.ptr is still nil -- i.e. before the
 // generation's own buildGateway call has finished constructing its
 // *gateway.Server. Once gwH.ptr is populated, every successful connect
 // (first-ever included) goes through gw.ConnectBackend instead, so a
@@ -489,11 +496,19 @@ func connectAndList(ctx context.Context, logger *slog.Logger, bc config.BackendC
 // collection window has already closed still gets registered (see this
 // plan's design note on this exact race).
 //
-// gwH may be nil (some callers -- and this plan's own tests -- exercise
-// connectBackends/superviseBackend without a gwHolder at all, when they
-// don't care about gateway reconcile); every gwH access below is guarded
-// accordingly.
-func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.BackendConfig, gwH *gwHolder, onFirstConnect func(*connectResult)) {
+// onFirstAttempt, if non-nil, is called exactly once, as soon as this
+// backend's FIRST connectAndList attempt has resolved -- whether it succeeded
+// or failed, and after any successful result has already been reported
+// through onFirstConnect/ConnectBackend. That is what lets connectBackends
+// stop waiting on a backend which is merely retrying: a permanently-failing
+// backend never fills a result slot, so without this signal the collection
+// window's only exit would be its own deadline (see collectConnectResults).
+//
+// gwH may be nil (some callers -- runList/runCall, and this plan's own
+// tests -- exercise connectBackends/superviseBackend without a gwHolder at
+// all, when they don't care about gateway reconcile); every gwH access below
+// is guarded accordingly.
+func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.BackendConfig, gwH *gwHolder, onFirstConnect func(*connectResult), onFirstAttempt func()) {
 	cb := backend.ChangeCallbacks{}
 	if gwH != nil {
 		cb = backend.ChangeCallbacks{
@@ -503,11 +518,25 @@ func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.Backen
 		}
 	}
 
+	// firstAttemptPending guards onFirstAttempt so it fires exactly once, on
+	// this backend's first resolved attempt and never again.
+	firstAttemptPending := true
+	reportFirstAttempt := func() {
+		if !firstAttemptPending {
+			return
+		}
+		firstAttemptPending = false
+		if onFirstAttempt != nil {
+			onFirstAttempt()
+		}
+	}
+
 	backoff := backendBackoffMin
 	for {
 		c, err := connectAndList(ctx, logger, bc, cb)
 		if err != nil {
 			logger.Error("backend connect failed, retrying", "backend", bc.Name, "error", err, "retry_in", backoff)
+			reportFirstAttempt()
 			select {
 			case <-ctx.Done():
 				return
@@ -524,9 +553,13 @@ func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.Backen
 		}
 		if gw != nil {
 			gw.ConnectBackend(bc.Name, c.backend, bc.Prefix, c.tools, c.resources, c.resourceTemplates, c.prompts)
-		} else {
+		} else if onFirstConnect != nil {
 			onFirstConnect(c)
 		}
+		// Reported only AFTER the result has been handed over, so a collector
+		// woken by the last outstanding first attempt is guaranteed to find
+		// this backend's result already waiting in its channel.
+		reportFirstAttempt()
 
 		if err := c.backend.Session.Wait(); err != nil {
 			logger.Warn("backend disconnected", "backend", bc.Name, "error", err)
@@ -554,9 +587,29 @@ type indexedConnectResult struct {
 }
 
 // collectConnectResults drains resultCh until every one of n backend
-// indices has landed at least one result, or deadline fires first -- n is
-// always len(configs) from connectBackends' perspective, one slot per
-// configured backend, indexed by indexedConnectResult.i.
+// indices has landed at least one result -- n is always len(configs) from
+// connectBackends' perspective, one slot per configured backend, indexed by
+// indexedConnectResult.i -- or until one of its two other exits fires first:
+//
+//   - firstAttemptsDone closes once EVERY backend's first connectAndList
+//     attempt has resolved, success or failure (see superviseBackend's
+//     onFirstAttempt). A backend that failed never fills its slot, so without
+//     this the deadline below would be the only exit for it: every startup
+//     with one permanently-down backend would burn the whole
+//     backendConnectTimeout, delaying `mcprt list`/`mcprt call` and, worse,
+//     runServer's HTTP listener bind (which happens after buildGateway) by
+//     that long. Waiting past this point would only be waiting on RETRIES,
+//     which join later via ConnectBackend anyway.
+//   - deadline is the outer bound, for a first attempt that is genuinely
+//     slow rather than failed (a backend still mid-handshake).
+//
+// Whichever exit fires, results still sitting in resultCh's buffer are
+// drained before returning: with a fired deadline (or a closed
+// firstAttemptsDone) and a buffered result both ready, Go's select picks
+// between them at random, and a discarded result is lost for good -- the
+// backend is excluded from the founding set while its supervisor, parked in
+// Session.Wait(), believes it already reported, so it never joins later via
+// ConnectBackend either.
 //
 // It counts DISTINCT indices filled, not raw channel receives: a backend
 // index can report more than once inside the collection window (connect,
@@ -575,36 +628,57 @@ type indexedConnectResult struct {
 // connection is the live one), but the connectResult it replaces is closed
 // here first: nothing else owns it once it's overwritten, and leaving it
 // open would orphan that *backend.Backend's connection forever.
-func collectConnectResults(resultCh <-chan indexedConnectResult, n int, deadline <-chan time.Time) []*connectResult {
+func collectConnectResults(resultCh <-chan indexedConnectResult, n int, deadline <-chan time.Time, firstAttemptsDone <-chan struct{}) []*connectResult {
 	results := make([]*connectResult, n)
 	received := 0
+	accept := func(r indexedConnectResult) {
+		if results[r.i] == nil {
+			received++
+		} else {
+			_ = results[r.i].backend.Close()
+		}
+		results[r.i] = r.c
+	}
+
+collect:
 	for received < n {
 		select {
 		case r := <-resultCh:
-			if results[r.i] == nil {
-				received++
-			} else {
-				_ = results[r.i].backend.Close()
-			}
-			results[r.i] = r.c
+			accept(r)
+		case <-firstAttemptsDone:
+			break collect
 		case <-deadline:
+			break collect
+		}
+	}
+
+	// Drain whatever already arrived but hasn't been read yet, then return.
+	for {
+		select {
+		case r := <-resultCh:
+			accept(r)
+		default:
 			return results
 		}
 	}
-	return results
 }
 
 // connectBackends spawns a persistent superviseBackend goroutine for every
-// configured backend and waits up to backendConnectTimeout collecting
-// whichever ones connect within that window, then returns with exactly
-// that set -- a backend that fails to connect, fails to list tools, or
-// doesn't finish within backendConnectTimeout is excluded from this
-// generation's founding set (best-effort, matches the pre-reconnect
+// configured backend and collects whichever ones connect within the startup
+// window, then returns with exactly that set -- a backend that fails to
+// connect, fails to list tools, or doesn't finish in time is excluded from
+// this generation's founding set (best-effort, matches the pre-reconnect
 // behavior), but its supervisor keeps retrying in the background and
 // joins later via gateway.Server.ConnectBackend once ctx's gwHolder is
 // populated (see buildGateway). A backend that fails to list resources,
 // resource templates, or prompts is kept with its tools intact and
 // treated as having none of that kind (see connectAndList).
+//
+// The window closes as soon as every backend's FIRST connect attempt has
+// resolved (or all of them succeeded), and only falls back to
+// backendConnectTimeout as an outer bound for an attempt still in flight --
+// so one permanently-down backend costs a failed connect, not 30 seconds of
+// everyone else's startup (see collectConnectResults).
 //
 // Results are collected off resultCh in whichever order their concurrent
 // connects happen to finish in, but built into connected's Entries slices in
@@ -616,17 +690,54 @@ func collectConnectResults(resultCh <-chan indexedConnectResult, n int, deadline
 // determinism (caught by TestListCommand_ReportsConflict flaking once this
 // function was rewritten to connect concurrently).
 func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.BackendConfig, gwH *gwHolder) connected {
+	conn, _ := superviseBackends(ctx, logger, configs, gwH)
+	return conn
+}
+
+// superviseBackends is connectBackends' implementation, additionally
+// returning a channel that closes once every supervisor goroutine it spawned
+// has actually returned. connectBackends itself discards that channel:
+// supervisors are meant to outlive it and run for the whole generation's
+// life. Only tests wait on it -- a test that cancels ctx and then returns
+// would otherwise leave a supervisor running, reading package-level vars
+// (backendConnectTimeout, backendBackoffMin/Max) that a LATER test writes,
+// which is a genuine `go test -race` failure rather than a theoretical one.
+func superviseBackends(ctx context.Context, logger *slog.Logger, configs []config.BackendConfig, gwH *gwHolder) (connected, <-chan struct{}) {
 	resultCh := make(chan indexedConnectResult, len(configs))
+
+	// firstAttempts reaches zero once every backend's first connect attempt
+	// has resolved, success or failure; supervisors tracks the goroutines
+	// themselves, which live far longer.
+	var firstAttempts, supervisors sync.WaitGroup
+	firstAttempts.Add(len(configs))
 	for i, bc := range configs {
-		go superviseBackend(ctx, logger, bc, gwH, func(c *connectResult) { resultCh <- indexedConnectResult{i, c} })
+		supervisors.Add(1)
+		go func() {
+			defer supervisors.Done()
+			superviseBackend(ctx, logger, bc, gwH,
+				func(c *connectResult) { resultCh <- indexedConnectResult{i, c} },
+				firstAttempts.Done)
+		}()
 	}
+	firstAttemptsDone := make(chan struct{})
+	go func() { firstAttempts.Wait(); close(firstAttemptsDone) }()
+	supervisorsDone := make(chan struct{})
+	go func() { supervisors.Wait(); close(supervisorsDone) }()
 
-	results := collectConnectResults(resultCh, len(configs), time.After(backendConnectTimeout))
+	results := collectConnectResults(resultCh, len(configs), time.After(backendConnectTimeout), firstAttemptsDone)
+	return assembleConnected(results), supervisorsDone
+}
 
-	result := connected{backends: make(map[string]*backend.Backend, len(configs))}
+// assembleConnected turns collectConnectResults' per-config-index results
+// into the connected value connectBackends returns, skipping the indices
+// that never reported. Its input is indexed by config position, so the
+// Entries it builds preserve configs' original order -- see connectBackends
+// on why that order is load-bearing.
+func assembleConnected(results []*connectResult) connected {
+	result := connected{backends: make(map[string]*backend.Backend, len(results))}
 	for _, c := range results {
 		if c == nil {
-			continue // this backend didn't connect within backendConnectTimeout
+			continue // this backend didn't connect within the collection window
 		}
 		result.backends[c.backend.Name] = c.backend
 		result.toolEntries = append(result.toolEntries, router.Entry[*mcp.Tool]{

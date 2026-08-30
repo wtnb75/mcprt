@@ -83,6 +83,25 @@ func logNewConflicts(logger *slog.Logger, msg, field string, oldConflicts, newCo
 	}
 }
 
+// boundTo reports whether resolved's registration binds its handler to
+// backendName -- either as the winning candidate, or as one of the fallbacks
+// registerTool/registerResource/registerResourceTemplate falls back to when a
+// higher-priority candidate turns out to be unregisterable. It is what scopes
+// ConnectBackend's forced re-registration (see rebind below) to the items the
+// (re)connecting backend actually serves, leaving every other backend's
+// handlers untouched.
+func boundTo[T any](resolved *router.Resolved[T], backendName string) bool {
+	if resolved.BackendName == backendName {
+		return true
+	}
+	for _, f := range resolved.Fallbacks {
+		if f.BackendName == backendName {
+			return true
+		}
+	}
+	return false
+}
+
 // UpdateTools replaces backendName's tool entry with items, re-resolves the
 // merged table, and applies the diff (Remove vanished names, Add
 // new/changed names) to the underlying *mcp.Server. Called from the cli
@@ -90,7 +109,23 @@ func logNewConflicts(logger *slog.Logger, msg, field string, oldConflicts, newCo
 func (s *Server) UpdateTools(backendName string, items []*mcp.Tool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.updateToolsLocked(backendName, items, false)
+}
 
+// updateToolsLocked is UpdateTools' body, callable with s.mu already held so
+// ConnectBackend can do its whole registration in one atomic step.
+//
+// rebind forces re-registration of every item bound to backendName (see
+// boundTo) even when the re-resolved definition is value-identical to the
+// one currently registered. Only ConnectBackend passes true: a reconnecting
+// backend replaces a dead *backend.Backend with a live one, and the handler
+// closures registered on the *mcp.Server captured the OLD object -- an
+// identity change that the value-equality diff below cannot observe. The
+// list_changed path (rebind == false) is unaffected: for an already-live
+// backend the object is the same one the handlers already hold, so
+// re-registering an unchanged definition would be pure churn (and an
+// unnecessary tools/list_changed notification to every downstream client).
+func (s *Server) updateToolsLocked(backendName string, items []*mcp.Tool, rebind bool) {
 	s.toolEntries = replaceEntry(s.toolEntries, backendName, items)
 	newTable := router.Resolve(s.toolEntries, ToolNameOf, ToolRename, s.toolOverrides)
 
@@ -100,16 +135,19 @@ func (s *Server) UpdateTools(backendName string, items []*mcp.Tool) {
 		}
 	}
 	for name, resolved := range newTable.Items {
-		if old, ok := s.toolTable.Items[name]; !ok || !reflect.DeepEqual(old, resolved) {
-			if !registerTool(s.mcp, s.logger, s.backends, resolved, s.maskKeys) {
-				// Every candidate for name was unregisterable (registerTool
-				// already logged this). Without this, a prior successful
-				// registration for the same exposed name would keep serving
-				// its now-superseded definition. RemoveTools on a name that
-				// was never registered is a safe no-op (go-sdk's
-				// featureSet.remove returns false and skips notifying).
-				s.mcp.RemoveTools(name)
-			}
+		old, ok := s.toolTable.Items[name]
+		unchanged := ok && reflect.DeepEqual(old, resolved)
+		if unchanged && !(rebind && boundTo(resolved, backendName)) {
+			continue
+		}
+		if !registerTool(s.mcp, s.logger, s.backends, resolved, s.maskKeys) {
+			// Every candidate for name was unregisterable (registerTool
+			// already logged this). Without this, a prior successful
+			// registration for the same exposed name would keep serving
+			// its now-superseded definition. RemoveTools on a name that
+			// was never registered is a safe no-op (go-sdk's
+			// featureSet.remove returns false and skips notifying).
+			s.mcp.RemoveTools(name)
 		}
 	}
 	logNewConflicts(s.logger, "tool name conflict", "tool", s.toolTable.Conflicts, newTable.Conflicts)
@@ -124,7 +162,13 @@ func (s *Server) UpdateTools(backendName string, items []*mcp.Tool) {
 func (s *Server) UpdateResources(backendName string, resources []*mcp.Resource, templates []*mcp.ResourceTemplate) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.updateResourcesLocked(backendName, resources, templates, false)
+}
 
+// updateResourcesLocked is UpdateResources' body, callable with s.mu already
+// held. See updateToolsLocked for what rebind means and why only
+// ConnectBackend passes true.
+func (s *Server) updateResourcesLocked(backendName string, resources []*mcp.Resource, templates []*mcp.ResourceTemplate, rebind bool) {
 	s.resourceEntries = replaceEntry(s.resourceEntries, backendName, resources)
 	newResourceTable := router.Resolve(s.resourceEntries, ResourceNameOf, ResourceRename, s.resourceOverrides)
 	for name := range s.resourceTable.Items {
@@ -133,9 +177,12 @@ func (s *Server) UpdateResources(backendName string, resources []*mcp.Resource, 
 		}
 	}
 	for name, resolved := range newResourceTable.Items {
-		if old, ok := s.resourceTable.Items[name]; !ok || !reflect.DeepEqual(old, resolved) {
-			registerResource(s.mcp, s.logger, s.backends, resolved, s.maskKeys)
+		old, ok := s.resourceTable.Items[name]
+		unchanged := ok && reflect.DeepEqual(old, resolved)
+		if unchanged && !(rebind && boundTo(resolved, backendName)) {
+			continue
 		}
+		registerResource(s.mcp, s.logger, s.backends, resolved, s.maskKeys)
 	}
 	logNewConflicts(s.logger, "resource URI conflict", "uri", s.resourceTable.Conflicts, newResourceTable.Conflicts)
 	s.resourceTable = newResourceTable
@@ -148,9 +195,12 @@ func (s *Server) UpdateResources(backendName string, resources []*mcp.Resource, 
 		}
 	}
 	for name, resolved := range newTemplateTable.Items {
-		if old, ok := s.resourceTemplateTable.Items[name]; !ok || !reflect.DeepEqual(old, resolved) {
-			registerResourceTemplate(s.mcp, s.logger, s.backends, resolved, s.maskKeys)
+		old, ok := s.resourceTemplateTable.Items[name]
+		unchanged := ok && reflect.DeepEqual(old, resolved)
+		if unchanged && !(rebind && boundTo(resolved, backendName)) {
+			continue
 		}
+		registerResourceTemplate(s.mcp, s.logger, s.backends, resolved, s.maskKeys)
 	}
 	logNewConflicts(s.logger, "resource template URI conflict", "uriTemplate", s.resourceTemplateTable.Conflicts, newTemplateTable.Conflicts)
 	s.resourceTemplateTable = newTemplateTable
@@ -161,7 +211,13 @@ func (s *Server) UpdateResources(backendName string, resources []*mcp.Resource, 
 func (s *Server) UpdatePrompts(backendName string, items []*mcp.Prompt) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.updatePromptsLocked(backendName, items, false)
+}
 
+// updatePromptsLocked is UpdatePrompts' body, callable with s.mu already
+// held. See updateToolsLocked for what rebind means and why only
+// ConnectBackend passes true.
+func (s *Server) updatePromptsLocked(backendName string, items []*mcp.Prompt, rebind bool) {
 	s.promptEntries = replaceEntry(s.promptEntries, backendName, items)
 	newTable := router.Resolve(s.promptEntries, PromptNameOf, PromptRename, s.promptOverrides)
 
@@ -171,9 +227,12 @@ func (s *Server) UpdatePrompts(backendName string, items []*mcp.Prompt) {
 		}
 	}
 	for name, resolved := range newTable.Items {
-		if old, ok := s.promptTable.Items[name]; !ok || !reflect.DeepEqual(old, resolved) {
-			registerPrompt(s.mcp, s.logger, s.backends, resolved, s.maskKeys)
+		old, ok := s.promptTable.Items[name]
+		unchanged := ok && reflect.DeepEqual(old, resolved)
+		if unchanged && !(rebind && boundTo(resolved, backendName)) {
+			continue
 		}
+		registerPrompt(s.mcp, s.logger, s.backends, resolved, s.maskKeys)
 	}
 	logNewConflicts(s.logger, "prompt name conflict", "prompt", s.promptTable.Conflicts, newTable.Conflicts)
 
@@ -208,23 +267,30 @@ func upsertEntry[T any](entries []router.Entry[T], backendName, prefix string, i
 // templates never carry one, matching connectBackends' existing
 // convention).
 //
-// This first ensures an entry (seeded with nil Items) exists for
-// backendName under s.mu, in one atomic step with setting s.backends[name]
-// -- then delegates the actual item reconciliation to the existing
-// UpdateTools/UpdateResources/UpdatePrompts, each of which takes its own
-// lock. A backend name is only ever driven by one supervisor goroutine at
-// a time (see internal/cli/server.go), so nothing else touches this
-// backend's entry between the two phases.
+// This ensures an entry (seeded with nil Items) exists for backendName,
+// registers b as its live connection, and reconciles all four item kinds --
+// the whole thing under a single s.mu acquisition, so no concurrent reader
+// or other backend's reconcile can observe a half-connected state.
+//
+// The three reconciles run in rebind mode (see updateToolsLocked): every
+// item this backend serves is re-registered even when its definition is
+// value-identical to the one already registered. That identical case is the
+// norm for a reconnect, and it is exactly the case a value-equality diff
+// gets wrong here -- the handlers registered on the *mcp.Server captured the
+// PREVIOUS *backend.Backend, which is now closed, so leaving them in place
+// would keep advertising this backend's tools while every call through them
+// failed permanently.
 func (s *Server) ConnectBackend(name string, b *backend.Backend, prefix string, tools []*mcp.Tool, resources []*mcp.Resource, templates []*mcp.ResourceTemplate, prompts []*mcp.Prompt) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.backends[name] = b
 	s.toolEntries = upsertEntry(s.toolEntries, name, prefix, nil)
 	s.resourceEntries = upsertEntry(s.resourceEntries, name, "", nil)
 	s.resourceTemplateEntries = upsertEntry(s.resourceTemplateEntries, name, "", nil)
 	s.promptEntries = upsertEntry(s.promptEntries, name, prefix, nil)
-	s.mu.Unlock()
 
-	s.UpdateTools(name, tools)
-	s.UpdateResources(name, resources, templates)
-	s.UpdatePrompts(name, prompts)
+	s.updateToolsLocked(name, tools, true)
+	s.updateResourcesLocked(name, resources, templates, true)
+	s.updatePromptsLocked(name, prompts, true)
 }

@@ -62,12 +62,23 @@ func runCall(ctx context.Context, cmd *cobra.Command, configPath, toolName, args
 	// (prefix/overrides applied), so it exercises the exact path a client
 	// would.
 	logger := slog.New(slog.NewTextHandler(cmd.ErrOrStderr(), nil))
+	// connectBackends spawns a supervisor goroutine per backend that keeps
+	// watching (and reconnecting to) its backend for as long as ctx lives, so
+	// this command owns a context it can end itself.
+	ctx, cancel := context.WithCancel(ctx)
 	conn := connectBackends(ctx, logger, cfg.Backends, nil)
 	defer func() {
 		for _, b := range conn.backends {
 			_ = b.Close()
 		}
 	}()
+	// Registered last -> runs first (LIFO), before the close loop above: the
+	// close is what releases each supervisor from Session.Wait(), and the
+	// graceful-disconnect path has no backoff at all, so a supervisor still
+	// running then would immediately open one more connection (for a stdio
+	// backend, fork one more subprocess) that nobody owns, microseconds
+	// before this process exits.
+	defer cancel()
 
 	table := router.Resolve(conn.toolEntries, gateway.ToolNameOf, gateway.ToolRename, cfg.Overrides)
 	resolved, ok := table.Items[toolName]
