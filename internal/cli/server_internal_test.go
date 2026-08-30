@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,8 +23,10 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.opentelemetry.io/otel"
 
+	"github.com/wtnb75/mcprt/internal/backend"
 	"github.com/wtnb75/mcprt/internal/config"
 	"github.com/wtnb75/mcprt/internal/gateway"
+	"github.com/wtnb75/mcprt/internal/router"
 )
 
 // TestMain forces OTEL_TRACES_EXPORTER=none for every test in this
@@ -88,10 +91,13 @@ func TestConnectBackends_TimesOutHungBackend(t *testing.T) {
 		{Name: "hung", Transport: "stdio", Command: []string{"sleep", "30"}},
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // stop the "hung" backend's supervisor from retrying forever after this test returns
+
 	done := make(chan struct{})
 	var conn connected
 	go func() {
-		conn = connectBackends(context.Background(), logger, configs, nil)
+		conn = connectBackends(ctx, logger, configs, nil)
 		close(done)
 	}()
 
@@ -174,12 +180,14 @@ func TestConnectBackends_ResourceListFailureKeepsBackendTools(t *testing.T) {
 		{Name: "fake", Transport: "http", URL: backendHTTP.URL},
 	}
 
-	conn := connectBackends(context.Background(), logger, configs, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	conn := connectBackends(ctx, logger, configs, nil)
 	defer func() {
 		for _, b := range conn.backends {
 			_ = b.Close()
 		}
 	}()
+	defer cancel() // registered last -> runs first, before the backend-close loop above
 
 	if _, ok := conn.backends["fake"]; !ok {
 		t.Fatalf("backends = %v, want backend \"fake\" to still be connected despite its resources/list failing", conn.backends)
@@ -215,12 +223,14 @@ func TestConnectBackends_PromptListFailureKeepsBackendTools(t *testing.T) {
 		{Name: "fake", Transport: "http", URL: backendHTTP.URL},
 	}
 
-	conn := connectBackends(context.Background(), logger, configs, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	conn := connectBackends(ctx, logger, configs, nil)
 	defer func() {
 		for _, b := range conn.backends {
 			_ = b.Close()
 		}
 	}()
+	defer cancel()
 
 	if _, ok := conn.backends["fake"]; !ok {
 		t.Fatalf("backends = %v, want backend \"fake\" to still be connected despite its prompts/list failing", conn.backends)
@@ -246,12 +256,14 @@ func TestConnectBackends_LogsSuccessfulConnect(t *testing.T) {
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
 	configs := []config.BackendConfig{{Name: "fake", Transport: "http", URL: backendHTTP.URL}}
 
-	conn := connectBackends(context.Background(), logger, configs, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	conn := connectBackends(ctx, logger, configs, nil)
 	defer func() {
 		for _, b := range conn.backends {
 			_ = b.Close()
 		}
 	}()
+	defer cancel()
 
 	var found bool
 	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
@@ -269,6 +281,325 @@ func TestConnectBackends_LogsSuccessfulConnect(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("log output = %q, want a \"backend connected\" entry", buf.String())
+	}
+}
+
+// freeAddr reserves an OS-assigned TCP port, releases it immediately, and
+// returns its address -- for tests that need to know an address in advance
+// (before anything is listening there) and bind to it later.
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("finding free port: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("closing probe listener: %v", err)
+	}
+	return addr
+}
+
+// connectBackendsWaitable is connectBackends' test-only counterpart: same
+// spawn-and-collect behavior (see connectBackends), but additionally returns
+// a channel that closes once every spawned superviseBackend goroutine has
+// actually returned. connectBackends itself returns as soon as its
+// collection window elapses, without ever waiting for the (deliberately
+// long-lived) supervisor goroutines it spawns to exit -- by design, since in
+// production they run for the life of the process. A test that cancels ctx
+// and wants to assert nothing of its own survives past that point (so it
+// can't leak a goroutine that goes on reading/writing package-level test
+// vars like backendConnectTimeout into a LATER test -- a real `go test
+// -race` failure, confirmed by reproducing it) needs this instead, to wait
+// on before returning.
+func connectBackendsWaitable(ctx context.Context, logger *slog.Logger, configs []config.BackendConfig, gwH *gwHolder) (connected, <-chan struct{}) {
+	var wg sync.WaitGroup
+	resultCh := make(chan *connectResult, len(configs))
+	for _, bc := range configs {
+		wg.Add(1)
+		go func(bc config.BackendConfig) {
+			defer wg.Done()
+			superviseBackend(ctx, logger, bc, gwH, func(c *connectResult) { resultCh <- c })
+		}(bc)
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+
+	result := connected{backends: make(map[string]*backend.Backend, len(configs))}
+	deadline := time.After(backendConnectTimeout)
+	for i := 0; i < len(configs); i++ {
+		select {
+		case c := <-resultCh:
+			result.backends[c.backend.Name] = c.backend
+			result.toolEntries = append(result.toolEntries, router.Entry[*mcp.Tool]{
+				BackendName: c.backend.Name, Prefix: c.backend.Prefix, Items: c.tools,
+			})
+			result.resourceEntries = append(result.resourceEntries, router.Entry[*mcp.Resource]{
+				BackendName: c.backend.Name, Items: c.resources,
+			})
+			result.resourceTemplateEntries = append(result.resourceTemplateEntries, router.Entry[*mcp.ResourceTemplate]{
+				BackendName: c.backend.Name, Items: c.resourceTemplates,
+			})
+			result.promptEntries = append(result.promptEntries, router.Entry[*mcp.Prompt]{
+				BackendName: c.backend.Name, Prefix: c.backend.Prefix, Items: c.prompts,
+			})
+		case <-deadline:
+			return result, done
+		}
+	}
+	return result, done
+}
+
+// waitSupervisorsDone waits for done (from connectBackendsWaitable) to
+// close, failing the test if that takes too long -- ctx must already be
+// cancelled and every backend connection superviseBackend could be waiting
+// on already closed by the time this is called, so a healthy supervisor
+// returns almost immediately (its next connectAndList attempt fails fast
+// against the cancelled ctx); taking longer than this means something is
+// stuck, not just slow.
+func waitSupervisorsDone(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("supervisor goroutine(s) did not return within 5s of ctx cancellation")
+	}
+}
+
+// TestSuperviseBackend_ReconnectsAfterDisconnect checks the full
+// disconnect -> item removal -> automatic reconnect -> item restoration
+// cycle, driven through connectBackends + a real *gateway.Server, exactly
+// as buildGateway wires them together.
+func TestSuperviseBackend_ReconnectsAfterDisconnect(t *testing.T) {
+	origMin, origMax := backendBackoffMin, backendBackoffMax
+	backendBackoffMin, backendBackoffMax = 10*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { backendBackoffMin, backendBackoffMax = origMin, origMax })
+
+	backendHTTP := newFakeBackendHTTP("ping")
+	defer backendHTTP.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+
+	gwH := &gwHolder{}
+	conn, supervisorsDone := connectBackendsWaitable(ctx, logger, []config.BackendConfig{{Name: "fake", Transport: "http", URL: backendHTTP.URL}}, gwH)
+	firstConn, ok := conn.backends["fake"]
+	if !ok {
+		t.Fatalf("backends = %v, want backend \"fake\" connected", conn.backends)
+	}
+
+	toolTable := router.Resolve(conn.toolEntries, gateway.ToolNameOf, gateway.ToolRename, nil)
+	srv := gateway.New(logger, conn.backends, gateway.Tables{Tools: toolTable},
+		gateway.Entries{Tools: conn.toolEntries}, gateway.Overrides{}, nil)
+	gwH.ptr.Store(srv)
+	// These three defers run in the OPPOSITE order they're registered in
+	// (LIFO), so registering them bottom-to-top of the intended sequence
+	// gives, at test end: (1) cancel ctx first, so superviseBackend's retry
+	// loop can't win a race and reconnect one more time between the Close()
+	// below unblocking its Session.Wait() and the goroutine actually exiting
+	// -- exactly the ordering Step 1 established for the four pre-existing
+	// connectBackends tests; (2) close whatever backend connection is live
+	// for "fake" (the reconnected one by now) plus firstConn (a no-op if
+	// reconnect already replaced it in srv.Backends(), Close being
+	// idempotent, kept in case an earlier Fatalf returned before any
+	// reconnect happened) -- both before the deferred backendHTTP.Close()
+	// further below runs, since a streamable-HTTP backend's standalone SSE
+	// stream stays open indefinitely for server-initiated notifications (see
+	// TestBuildGateway_Success) and would otherwise hang it forever; then
+	// (3) wait for the supervisor goroutine spawned by
+	// connectBackendsWaitable above to have actually returned. cancel() (1)
+	// alone only starts that goroutine's unwind asynchronously -- without
+	// this wait, it can survive past this test's return and go on reading
+	// package-level test vars like backendConnectTimeout, racing with a
+	// LATER test's own writes to them (reproduced as a genuine `go test
+	// -race` failure before this wait was added).
+	defer waitSupervisorsDone(t, supervisorsDone)
+	defer func() {
+		for _, b := range srv.Backends() {
+			_ = b.Close()
+		}
+		_ = firstConn.Close()
+	}()
+	defer cancel()
+
+	toolNames := func() []string {
+		gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+		defer gw.Close()
+		client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+		session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+		if err != nil {
+			t.Fatalf("connect to gateway: %v", err)
+		}
+		defer func() { _ = session.Close() }()
+		var names []string
+		for tool, err := range session.Tools(ctx, nil) {
+			if err != nil {
+				t.Fatalf("listing tools: %v", err)
+			}
+			names = append(names, tool.Name)
+		}
+		return names
+	}
+
+	if got := toolNames(); len(got) != 1 || got[0] != "ping" {
+		t.Fatalf("initial tools = %v, want [ping]", got)
+	}
+
+	// Client-initiated Close() is a terminal disconnect (unlike a server-side
+	// connection reset, which go-sdk's streamable transport would silently
+	// auto-heal on its own -- see this plan's Global Constraints), so this
+	// reliably fires Session.Wait() inside superviseBackend.
+	if err := firstConn.Close(); err != nil {
+		t.Fatalf("closing backend connection: %v", err)
+	}
+
+	// superviseBackend's disconnect -> clear -> reconnect -> re-register
+	// cycle can complete in well under a millisecond against a local
+	// httptest backend (backoff is shrunk above, and there is no backoff at
+	// all on the graceful-disconnect path -- see superviseBackend), so a
+	// second, freshly-issued toolNames() call after this loop breaks could
+	// race past the empty window and observe the *next* reconnect's tools
+	// instead. Deciding on the sampled value from inside the loop (like the
+	// reconnect-wait loop below already does) instead of re-querying
+	// afterward avoids that race while still proving superviseBackend
+	// actually cleared the tools at some point within the deadline.
+	deadline := time.Now().Add(2 * time.Second)
+	var sawEmpty bool
+	for time.Now().Before(deadline) {
+		if len(toolNames()) == 0 {
+			sawEmpty = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !sawEmpty {
+		t.Fatal("tools never went empty within 2s of disconnect (superviseBackend must clear them)")
+	}
+
+	// The fake backend server is still up -- superviseBackend's retry loop
+	// (backoff shrunk above) should reconnect automatically.
+	deadline = time.Now().Add(2 * time.Second)
+	var got []string
+	for time.Now().Before(deadline) {
+		got = toolNames()
+		if len(got) == 1 && got[0] == "ping" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(got) != 1 || got[0] != "ping" {
+		t.Fatalf("tools after automatic reconnect = %v, want [ping]", got)
+	}
+	if srv.Backends()["fake"] == firstConn {
+		t.Fatalf("Backends()[\"fake\"] still points at the closed connection, want a fresh one from the reconnect")
+	}
+}
+
+// TestSuperviseBackend_LateConnectJoinsViaConnectBackend checks that a
+// backend which failed to connect within connectBackends' collection
+// window (backendConnectTimeout) joins the gateway automatically via
+// ConnectBackend once it eventually succeeds -- the "backend that failed
+// to connect at mcprt startup" case from this plan's spec.
+func TestSuperviseBackend_LateConnectJoinsViaConnectBackend(t *testing.T) {
+	origTimeout := backendConnectTimeout
+	backendConnectTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { backendConnectTimeout = origTimeout })
+	origMin, origMax := backendBackoffMin, backendBackoffMax
+	backendBackoffMin, backendBackoffMax = 10*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { backendBackoffMin, backendBackoffMax = origMin, origMax })
+
+	addr := freeAddr(t) // nothing listens here yet
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	var supervisorsDone <-chan struct{}
+	// Registered first, so LIFO runs it dead last, after every other cleanup
+	// step below (cancel, then server-side close, then client-side close)
+	// has already run: without waiting for the supervisor goroutine spawned
+	// by connectBackendsWaitable to actually return, it can survive past
+	// this test's return and go on reading package-level test vars like
+	// backendConnectTimeout, racing with a LATER test's own writes to them
+	// (see connectBackendsWaitable's doc comment; reproduced as a genuine
+	// `go test -race` failure before this wait was added).
+	defer func() { waitSupervisorsDone(t, supervisorsDone) }()
+
+	gwH := &gwHolder{}
+	conn, supervisorsDone := connectBackendsWaitable(ctx, logger, []config.BackendConfig{{Name: "late", Transport: "http", URL: "http://" + addr}}, gwH)
+	if _, ok := conn.backends["late"]; ok {
+		t.Fatalf("backends = %v, want \"late\" excluded (nothing was listening within backendConnectTimeout)", conn.backends)
+	}
+
+	srv := gateway.New(logger, conn.backends, gateway.Tables{}, gateway.Entries{}, gateway.Overrides{}, nil)
+	gwH.ptr.Store(srv) // matches buildGateway: gwH.ptr is populated right after gateway.New
+
+	// Now start listening on the SAME address the config already points at.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("listening on %s: %v", addr, err)
+	}
+	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	mcp.AddTool(backendSrv, &mcp.Tool{Name: "late-tool", Description: "late-tool"},
+		func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
+			return nil, struct{}{}, nil
+		})
+	lateHTTP := &http.Server{Handler: mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil)}
+	go func() { _ = lateHTTP.Serve(ln) }()
+	// The next three defers run (LIFO) in this order: close the client-side
+	// backend connection FIRST -- a server-side-only close (lateHTTP.Close()
+	// below) is exactly the kind of disconnect go-sdk's streamable transport
+	// can silently auto-heal on its own (see
+	// TestSuperviseBackend_ReconnectsAfterDisconnect's matching comment on
+	// firstConn.Close()), so without an explicit client-side Close() here,
+	// superviseBackend's Session.Wait() might never return at all, and
+	// waitSupervisorsDone above would time out waiting for it forever; then
+	// close the now-redundant lateHTTP listener; then cancel ctx last, so
+	// superviseBackend's post-disconnect reconnect attempt (triggered by the
+	// client-side close above) fails against an already-cancelled ctx
+	// instead of racing to actually succeed against the now-closed lateHTTP.
+	defer cancel()
+	defer func() { _ = lateHTTP.Close() }()
+	defer func() {
+		if b := srv.Backend("late"); b != nil {
+			_ = b.Close()
+		}
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && srv.Backend("late") == nil {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if srv.Backend("late") == nil {
+		t.Fatal("srv.Backend(\"late\") = nil after starting the backend, want it registered via superviseBackend's retry")
+	}
+}
+
+// TestSuperviseBackend_StopsRetryingWhenContextCancelled checks that
+// cancelling ctx makes superviseBackend's retry loop return promptly,
+// instead of continuing to retry forever -- this is what lets a superseded
+// hot-reload generation's supervisors wind down (see this plan's header
+// note on genCtx scoping).
+func TestSuperviseBackend_StopsRetryingWhenContextCancelled(t *testing.T) {
+	origMin, origMax := backendBackoffMin, backendBackoffMax
+	backendBackoffMin, backendBackoffMax = 50*time.Millisecond, 100*time.Millisecond
+	t.Cleanup(func() { backendBackoffMin, backendBackoffMax = origMin, origMax })
+
+	addr := freeAddr(t) // nothing ever listens here -- every attempt fails
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		superviseBackend(ctx, logger, config.BackendConfig{Name: "unreachable", Transport: "http", URL: "http://" + addr}, nil, func(*connectResult) {})
+		close(done)
+	}()
+
+	time.Sleep(20 * time.Millisecond) // let it start its first (failing) attempt
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("superviseBackend did not return within 2s of ctx cancellation")
 	}
 }
 

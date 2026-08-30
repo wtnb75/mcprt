@@ -395,110 +395,221 @@ type connected struct {
 	promptEntries           []router.Entry[*mcp.Prompt]
 }
 
-// connectBackends connects to every configured backend concurrently and
-// lists its tools, resources, resource templates, and prompts. A backend
-// that fails to connect, fails to list tools, or exceeds
-// backendConnectTimeout is logged and excluded entirely (best-effort); it
-// does not fail or stall the whole startup. A backend that fails to list
-// resources, resource templates, or prompts is kept with its tools intact
-// and treated as having none of that kind: many non-Go-SDK MCP servers
-// answer resources/list, resources/templates/list, or prompts/list with a
-// JSON-RPC "method not found" error when they don't implement that
-// capability at all, rather than an empty list, and that must not take down
-// an otherwise-working tools-only backend.
-func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.BackendConfig, gwH *gwHolder) connected {
-	type outcome struct {
-		backend               *backend.Backend
-		toolEntry             router.Entry[*mcp.Tool]
-		resourceEntry         router.Entry[*mcp.Resource]
-		resourceTemplateEntry router.Entry[*mcp.ResourceTemplate]
-		promptEntry           router.Entry[*mcp.Prompt]
-	}
-	outcomes := make([]*outcome, len(configs))
+// backendBackoffMin/Max bound superviseBackend's exponential retry delay.
+// A var so tests can shrink both.
+var (
+	backendBackoffMin = 1 * time.Second
+	backendBackoffMax = 60 * time.Second
+)
 
-	var wg sync.WaitGroup
-	for i, bc := range configs {
-		wg.Add(1)
-		// Callbacks are built here, using ctx (this func's own long-lived
-		// context), NOT the timeout-bounded ctx the goroutine below derives
-		// for the initial Connect+List sequence -- a callback captured from
-		// that derived context would already be expired by the time a real
-		// list_changed notification could plausibly arrive.
-		cb := backend.ChangeCallbacks{}
-		if gwH != nil {
-			cb = backend.ChangeCallbacks{
-				OnToolsChanged:     toolsChangedCallback(ctx, logger, bc.Name, gwH),
-				OnResourcesChanged: resourcesChangedCallback(ctx, logger, bc.Name, gwH),
-				OnPromptsChanged:   promptsChangedCallback(ctx, logger, bc.Name, gwH),
-			}
+// connectResult is connectAndList's successful result: the live backend
+// plus its four freshly-listed item sets, as raw slices (not yet wrapped
+// in router.Entry -- that wrapping only makes sense once the caller knows
+// whether it's building the very first Entries for gateway.New, or calling
+// gateway.Server.ConnectBackend, which does its own wrapping via
+// upsertEntry, see internal/gateway/reconcile.go).
+type connectResult struct {
+	backend           *backend.Backend
+	tools             []*mcp.Tool
+	resources         []*mcp.Resource
+	resourceTemplates []*mcp.ResourceTemplate
+	prompts           []*mcp.Prompt
+}
+
+// connectAndList performs one connection attempt: Connect, then ListTools
+// (whose failure aborts the attempt -- the freshly-opened connection is
+// closed and the error returned, so superviseBackend's caller retries),
+// then ListResources/ListResourceTemplates/ListPrompts (each a soft
+// failure: logged and treated as an empty list, since many non-Go-SDK MCP
+// servers answer these with a "method not found" error when they don't
+// implement that capability at all -- this must not take down an
+// otherwise-working tools-only backend). Bounded to backendConnectTimeout
+// so one hung backend can't block superviseBackend's retry loop
+// indefinitely.
+func connectAndList(ctx context.Context, logger *slog.Logger, bc config.BackendConfig, cb backend.ChangeCallbacks) (*connectResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, backendConnectTimeout)
+	defer cancel()
+
+	b, err := backend.Connect(ctx, bc, cb)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	logger.Info("backend connected", "backend", bc.Name, "transport", bc.Transport)
+	tools, err := b.ListTools(ctx)
+	if err != nil {
+		_ = b.Close()
+		return nil, fmt.Errorf("list tools: %w", err)
+	}
+	resources, err := b.ListResources(ctx)
+	if err != nil {
+		logger.Warn("backend lists no resources", "backend", bc.Name, "error", err)
+		resources = nil
+	}
+	resourceTemplates, err := b.ListResourceTemplates(ctx)
+	if err != nil {
+		logger.Warn("backend lists no resource templates", "backend", bc.Name, "error", err)
+		resourceTemplates = nil
+	}
+	prompts, err := b.ListPrompts(ctx)
+	if err != nil {
+		logger.Warn("backend lists no prompts", "backend", bc.Name, "error", err)
+		prompts = nil
+	}
+	return &connectResult{
+		backend:           b,
+		tools:             tools,
+		resources:         resources,
+		resourceTemplates: resourceTemplates,
+		prompts:           prompts,
+	}, nil
+}
+
+// superviseBackend owns backendName's whole connection lifecycle for as
+// long as ctx stays alive: connect (retrying with exponential backoff on
+// failure, forever -- there is no give-up while ctx is alive), report the
+// result, wait for disconnect, clear the backend's items, and reconnect.
+//
+// ctx is always the generation's own genCtx here (buildGateway, the only
+// caller of connectBackends, is itself always called with a generation's
+// genCtx -- see this plan's header note). Because genCtx is
+// generation-scoped rather than process-scoped, a superseded generation's
+// supervisors wind down on their own once that generation's connections
+// actually close (a real disconnect, or scheduleDrain's eventual
+// force-close after reloadDrainTimeout): Session.Wait() returns, the next
+// connectAndList attempt fails immediately against the already-cancelled
+// ctx, and the retry-wait select's <-ctx.Done() branch returns. No special
+// generation-teardown code is needed for that to happen.
+//
+// onFirstConnect is called on any successful connect (first-ever or a
+// reconnect) for as long as gwH.ptr is still nil -- i.e. before the
+// generation's own buildGateway call has finished constructing its
+// *gateway.Server. Once gwH.ptr is populated, every successful connect
+// (first-ever included) goes through gw.ConnectBackend instead, so a
+// backend that connects for the first time after connectBackends' own
+// collection window has already closed still gets registered (see this
+// plan's design note on this exact race).
+//
+// gwH may be nil (some callers -- and this plan's own tests -- exercise
+// connectBackends/superviseBackend without a gwHolder at all, when they
+// don't care about gateway reconcile); every gwH access below is guarded
+// accordingly.
+func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.BackendConfig, gwH *gwHolder, onFirstConnect func(*connectResult)) {
+	cb := backend.ChangeCallbacks{}
+	if gwH != nil {
+		cb = backend.ChangeCallbacks{
+			OnToolsChanged:     toolsChangedCallback(ctx, logger, bc.Name, gwH),
+			OnResourcesChanged: resourcesChangedCallback(ctx, logger, bc.Name, gwH),
+			OnPromptsChanged:   promptsChangedCallback(ctx, logger, bc.Name, gwH),
 		}
-		go func(i int, bc config.BackendConfig, cb backend.ChangeCallbacks) {
-			defer wg.Done()
-			ctx, cancel := context.WithTimeout(ctx, backendConnectTimeout)
-			defer cancel()
-
-			b, err := backend.Connect(ctx, bc, cb)
-			if err != nil {
-				logger.Error("skipping backend: connect failed", "backend", bc.Name, "error", err)
-				return
-			}
-			logger.Info("backend connected", "backend", bc.Name, "transport", bc.Transport)
-			tools, err := b.ListTools(ctx)
-			if err != nil {
-				logger.Error("skipping backend: list tools failed", "backend", bc.Name, "error", err)
-				_ = b.Close()
-				return
-			}
-			resources, err := b.ListResources(ctx)
-			if err != nil {
-				logger.Warn("backend lists no resources", "backend", bc.Name, "error", err)
-				resources = nil
-			}
-			resourceTemplates, err := b.ListResourceTemplates(ctx)
-			if err != nil {
-				logger.Warn("backend lists no resource templates", "backend", bc.Name, "error", err)
-				resourceTemplates = nil
-			}
-			prompts, err := b.ListPrompts(ctx)
-			if err != nil {
-				logger.Warn("backend lists no prompts", "backend", bc.Name, "error", err)
-				prompts = nil
-			}
-			outcomes[i] = &outcome{
-				backend: b,
-				toolEntry: router.Entry[*mcp.Tool]{
-					BackendName: bc.Name, Prefix: bc.Prefix, Items: tools,
-				},
-				// resource/resource template entries never carry a prefix:
-				// URIs already encode a backend-specific namespace, and
-				// string-concatenating a prefix onto one would produce an
-				// invalid URI.
-				resourceEntry: router.Entry[*mcp.Resource]{
-					BackendName: bc.Name, Items: resources,
-				},
-				resourceTemplateEntry: router.Entry[*mcp.ResourceTemplate]{
-					BackendName: bc.Name, Items: resourceTemplates,
-				},
-				// prompt entries DO carry a prefix, like tools: prompt
-				// names are a flat namespace, not a URI.
-				promptEntry: router.Entry[*mcp.Prompt]{
-					BackendName: bc.Name, Prefix: bc.Prefix, Items: prompts,
-				},
-			}
-		}(i, bc, cb)
 	}
-	wg.Wait()
 
-	result := connected{backends: make(map[string]*backend.Backend, len(configs))}
-	for _, o := range outcomes {
-		if o == nil {
+	backoff := backendBackoffMin
+	for {
+		c, err := connectAndList(ctx, logger, bc, cb)
+		if err != nil {
+			logger.Error("backend connect failed, retrying", "backend", bc.Name, "error", err, "retry_in", backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			backoff = min(backoff*2, backendBackoffMax)
 			continue
 		}
-		result.backends[o.toolEntry.BackendName] = o.backend
-		result.toolEntries = append(result.toolEntries, o.toolEntry)
-		result.resourceEntries = append(result.resourceEntries, o.resourceEntry)
-		result.resourceTemplateEntries = append(result.resourceTemplateEntries, o.resourceTemplateEntry)
-		result.promptEntries = append(result.promptEntries, o.promptEntry)
+		backoff = backendBackoffMin
+
+		var gw *gateway.Server
+		if gwH != nil {
+			gw = gwH.ptr.Load()
+		}
+		if gw != nil {
+			gw.ConnectBackend(bc.Name, c.backend, bc.Prefix, c.tools, c.resources, c.resourceTemplates, c.prompts)
+		} else {
+			onFirstConnect(c)
+		}
+
+		if err := c.backend.Session.Wait(); err != nil {
+			logger.Warn("backend disconnected", "backend", bc.Name, "error", err)
+		} else {
+			logger.Info("backend disconnected", "backend", bc.Name)
+		}
+		if gwH != nil {
+			if gw := gwH.ptr.Load(); gw != nil {
+				gw.UpdateTools(bc.Name, nil)
+				gw.UpdateResources(bc.Name, nil, nil)
+				gw.UpdatePrompts(bc.Name, nil)
+			}
+		}
+		// loop: reconnect
+	}
+}
+
+// indexedConnectResult pairs a connectResult with configs' original index,
+// for connectBackends' collection loop (see below) to restore config order
+// after gathering results off a channel in whatever order their concurrent
+// connects actually finish in.
+type indexedConnectResult struct {
+	i int
+	c *connectResult
+}
+
+// connectBackends spawns a persistent superviseBackend goroutine for every
+// configured backend and waits up to backendConnectTimeout collecting
+// whichever ones connect within that window, then returns with exactly
+// that set -- a backend that fails to connect, fails to list tools, or
+// doesn't finish within backendConnectTimeout is excluded from this
+// generation's founding set (best-effort, matches the pre-reconnect
+// behavior), but its supervisor keeps retrying in the background and
+// joins later via gateway.Server.ConnectBackend once ctx's gwHolder is
+// populated (see buildGateway). A backend that fails to list resources,
+// resource templates, or prompts is kept with its tools intact and
+// treated as having none of that kind (see connectAndList).
+//
+// Results are collected off resultCh in whichever order their concurrent
+// connects happen to finish in, but built into connected's Entries slices in
+// configs' ORIGINAL order regardless -- router.Resolve treats a slice's
+// index as conflict-resolution priority (index 0 wins), so if this
+// re-sorted by arrival order instead, which backend wins a tool/resource/
+// prompt name conflict would depend on network timing instead of config
+// order, silently breaking that documented, previously-guaranteed
+// determinism (caught by TestListCommand_ReportsConflict flaking once this
+// function was rewritten to connect concurrently).
+func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.BackendConfig, gwH *gwHolder) connected {
+	resultCh := make(chan indexedConnectResult, len(configs))
+	for i, bc := range configs {
+		go superviseBackend(ctx, logger, bc, gwH, func(c *connectResult) { resultCh <- indexedConnectResult{i, c} })
+	}
+
+	results := make([]*connectResult, len(configs))
+	deadline := time.After(backendConnectTimeout)
+collect:
+	for range configs {
+		select {
+		case r := <-resultCh:
+			results[r.i] = r.c
+		case <-deadline:
+			break collect
+		}
+	}
+
+	result := connected{backends: make(map[string]*backend.Backend, len(configs))}
+	for _, c := range results {
+		if c == nil {
+			continue // this backend didn't connect within backendConnectTimeout
+		}
+		result.backends[c.backend.Name] = c.backend
+		result.toolEntries = append(result.toolEntries, router.Entry[*mcp.Tool]{
+			BackendName: c.backend.Name, Prefix: c.backend.Prefix, Items: c.tools,
+		})
+		result.resourceEntries = append(result.resourceEntries, router.Entry[*mcp.Resource]{
+			BackendName: c.backend.Name, Items: c.resources,
+		})
+		result.resourceTemplateEntries = append(result.resourceTemplateEntries, router.Entry[*mcp.ResourceTemplate]{
+			BackendName: c.backend.Name, Items: c.resourceTemplates,
+		})
+		result.promptEntries = append(result.promptEntries, router.Entry[*mcp.Prompt]{
+			BackendName: c.backend.Name, Prefix: c.backend.Prefix, Items: c.prompts,
+		})
 	}
 	return result
 }
