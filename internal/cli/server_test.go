@@ -959,6 +959,147 @@ backends:
 	}
 }
 
+// TestServerCommand_BackendReconnectsAfterDisconnect drives the whole
+// backend-reconnect feature end-to-end: a downstream client sees a
+// backend's tool, the backend goes down, the tool disappears, the backend
+// comes back up on the same address, and the tool reappears -- all without
+// mcprt itself needing a restart or a config reload.
+//
+// This uses a fully-stopped-then-restarted backend server (not
+// CloseClientConnections) because a mere connection reset is exactly the
+// class of transient failure go-sdk's own streamable HTTP client
+// transparently retries and heals on its own (see this plan's Global
+// Constraints) -- it would never reach superviseBackend's disconnect
+// detection at all.
+func TestServerCommand_BackendReconnectsAfterDisconnect(t *testing.T) {
+	newBackendHandler := func() http.Handler {
+		backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+		mcp.AddTool(backendSrv, &mcp.Tool{Name: "ping", Description: "ping"},
+			func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
+				return nil, struct{}{}, nil
+			})
+		return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil)
+	}
+
+	backendAddr := freePort(t)
+	backendListener, err := net.Listen("tcp", backendAddr)
+	if err != nil {
+		t.Fatalf("listening on %s: %v", backendAddr, err)
+	}
+	backendHTTP := &http.Server{Handler: newBackendHandler()}
+	go func() { _ = backendHTTP.Serve(backendListener) }()
+	defer func() { _ = backendHTTP.Close() }()
+
+	gatewayAddr := freePort(t)
+	configPath := writeConfig(t, fmt.Sprintf(`
+listen:
+  http: %q
+
+backends:
+  - name: fake
+    transport: http
+    url: %q
+`, gatewayAddr, "http://"+backendAddr))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	execErr := make(chan error, 1)
+	go func() {
+		execErr <- cli.Execute(ctx, []string{"server", "--config", configPath})
+	}()
+
+	dial := func() *mcp.ClientSession {
+		client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+		var session *mcp.ClientSession
+		var connectErr error
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			session, connectErr = client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: "http://" + gatewayAddr}, nil)
+			if connectErr == nil {
+				return session
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatalf("connecting to gateway: %v", connectErr)
+		return nil
+	}
+	toolNames := func(t *testing.T, s *mcp.ClientSession) []string {
+		t.Helper()
+		var names []string
+		for tool, err := range s.Tools(ctx, nil) {
+			if err != nil {
+				t.Fatalf("listing tools: %v", err)
+			}
+			names = append(names, tool.Name)
+		}
+		sort.Strings(names)
+		return names
+	}
+
+	session := dial()
+	if got := toolNames(t, session); len(got) != 1 || got[0] != "ping" {
+		t.Fatalf("initial tools = %v, want [ping]", got)
+	}
+
+	// Fully stop the backend: every connection attempt (including the
+	// transport's own built-in SSE-level auto-reconnect) fails outright,
+	// eventually surfacing as a terminal disconnect that superviseBackend
+	// notices via Session.Wait().
+	if err := backendHTTP.Close(); err != nil {
+		t.Fatalf("stopping backend: %v", err)
+	}
+
+	// go-sdk's standalone SSE stream (used for server push while otherwise
+	// idle) retries up to 5 times with a jittered exponential backoff before
+	// giving up and failing the connection -- calculateReconnectDelay
+	// (modelcontextprotocol/go-sdk mcp/streamable.go) returns
+	// backoffDuration+jitter with jitter uniform in [0, backoffDuration), so
+	// each step's actual delay is in [d, 2d) against base delays
+	// 1s,1.5s,2.25s,3.375s,5.0625s -- a deterministic worst case of
+	// 2*13.1875s = 26.375s before Session.Wait() unblocks and superviseBackend
+	// clears this backend's tools. 15s (this test's original deadline) is
+	// provably too tight; 40s leaves comfortable margin above that bound.
+	deadline := time.Now().Add(40 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := toolNames(t, session); len(got) == 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := toolNames(t, session); len(got) != 0 {
+		t.Fatalf("tools after backend stopped = %v, want [] (backend removed from routing table)", got)
+	}
+
+	// Restart a backend listening on the SAME address: superviseBackend's
+	// unbounded retry loop (production backoff: 1s..60s, unshrinkable from
+	// this external test package) reconnects to it automatically.
+	backendListener2, err := net.Listen("tcp", backendAddr)
+	if err != nil {
+		t.Fatalf("re-listening on %s: %v", backendAddr, err)
+	}
+	backendHTTP2 := &http.Server{Handler: newBackendHandler()}
+	go func() { _ = backendHTTP2.Serve(backendListener2) }()
+	defer func() { _ = backendHTTP2.Close() }()
+
+	deadline = time.Now().Add(90 * time.Second)
+	var got []string
+	for time.Now().Before(deadline) {
+		got = toolNames(t, session)
+		if len(got) == 1 && got[0] == "ping" {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if len(got) != 1 || got[0] != "ping" {
+		t.Fatalf("tools after backend restart = %v, want [ping] (automatic reconnect)", got)
+	}
+
+	_ = session.Close()
+	cancel()
+	if err := <-execErr; err != nil {
+		t.Fatalf("server exited with error: %v", err)
+	}
+}
+
 // toggleFailHandler wraps an MCP StreamableHTTP handler so that, once
 // failing.Store(true) is called, any JSON-RPC request whose method is
 // method gets a synthetic "Internal error" (-32603) response instead of
