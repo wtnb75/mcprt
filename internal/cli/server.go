@@ -545,12 +545,53 @@ func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.Backen
 }
 
 // indexedConnectResult pairs a connectResult with configs' original index,
-// for connectBackends' collection loop (see below) to restore config order
-// after gathering results off a channel in whatever order their concurrent
+// for connectConnectResults (see below) to restore config order after
+// gathering results off a channel in whatever order their concurrent
 // connects actually finish in.
 type indexedConnectResult struct {
 	i int
 	c *connectResult
+}
+
+// collectConnectResults drains resultCh until every one of n backend
+// indices has landed at least one result, or deadline fires first -- n is
+// always len(configs) from connectBackends' perspective, one slot per
+// configured backend, indexed by indexedConnectResult.i.
+//
+// It counts DISTINCT indices filled, not raw channel receives: a backend
+// index can report more than once inside the collection window (connect,
+// disconnect, reconnect, all before this loop even sees the first result --
+// e.g. a crash-looping backend flapping while mcprt is starting, since
+// superviseBackend's onFirstConnect fires on every successful connect while
+// gwH.ptr is still nil, with no backoff on that graceful-disconnect ->
+// immediate-reconnect path). Counting raw receives instead would let that
+// one flapping index's extra send consume a slot meant for a DIFFERENT,
+// perfectly healthy backend's result, silently excluding it from the
+// founding set even though it connected fine -- with its supervisor now
+// parked in Session.Wait() believing it already reported, so it never joins
+// later via ConnectBackend either (this plan's Task 2 review, finding 2).
+//
+// A later result for an index that already has one replaces it (the newest
+// connection is the live one), but the connectResult it replaces is closed
+// here first: nothing else owns it once it's overwritten, and leaving it
+// open would orphan that *backend.Backend's connection forever.
+func collectConnectResults(resultCh <-chan indexedConnectResult, n int, deadline <-chan time.Time) []*connectResult {
+	results := make([]*connectResult, n)
+	received := 0
+	for received < n {
+		select {
+		case r := <-resultCh:
+			if results[r.i] == nil {
+				received++
+			} else {
+				_ = results[r.i].backend.Close()
+			}
+			results[r.i] = r.c
+		case <-deadline:
+			return results
+		}
+	}
+	return results
 }
 
 // connectBackends spawns a persistent superviseBackend goroutine for every
@@ -580,17 +621,7 @@ func connectBackends(ctx context.Context, logger *slog.Logger, configs []config.
 		go superviseBackend(ctx, logger, bc, gwH, func(c *connectResult) { resultCh <- indexedConnectResult{i, c} })
 	}
 
-	results := make([]*connectResult, len(configs))
-	deadline := time.After(backendConnectTimeout)
-collect:
-	for range configs {
-		select {
-		case r := <-resultCh:
-			results[r.i] = r.c
-		case <-deadline:
-			break collect
-		}
-	}
+	results := collectConnectResults(resultCh, len(configs), time.After(backendConnectTimeout))
 
 	result := connected{backends: make(map[string]*backend.Backend, len(configs))}
 	for _, c := range results {

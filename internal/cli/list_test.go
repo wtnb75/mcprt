@@ -42,7 +42,21 @@ backends:
 	root.SetOut(&out)
 	root.SetArgs([]string{"list", "--config", configPath})
 
-	if err := root.ExecuteContext(context.Background()); err != nil {
+	// A cancellable context, not context.Background(): runList's
+	// connectBackends (gwH == nil, a production-correct choice for a
+	// one-shot CLI command whose process exits right after) spawns a
+	// persistent superviseBackend goroutine per backend that keeps retrying
+	// for as long as ctx stays alive. In a real `mcprt list` invocation the
+	// process exits right after and takes that goroutine with it, but in a
+	// test the process doesn't exit, so context.Background() would leak it
+	// into later tests, racing their writes to package-level vars like
+	// backendConnectTimeout under `go test -race` (see this plan's Task 2
+	// review, finding 1). cancel() runs (via defer, LIFO) before
+	// backendA.Close() above, so any straggling supervisor stops retrying
+	// before the backend it would retry against goes away.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
 	}
 
@@ -68,7 +82,11 @@ backends:
 	root.SetOut(&out)
 	root.SetArgs([]string{"list", "--config", configPath, "--json"})
 
-	if err := root.ExecuteContext(context.Background()); err != nil {
+	// See TestListCommand_Text's matching comment: a cancellable context so
+	// runList's backend supervisor goroutine doesn't outlive this test.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
 	}
 
@@ -122,7 +140,11 @@ backends:
 	root.SetOut(&out)
 	root.SetArgs([]string{"list", "--config", configPath, "--json"})
 
-	if err := root.ExecuteContext(context.Background()); err != nil {
+	// See TestListCommand_Text's matching comment: a cancellable context so
+	// runList's backend supervisor goroutines don't outlive this test.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
 	}
 

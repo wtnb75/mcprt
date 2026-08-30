@@ -50,7 +50,21 @@ backends:
 	root.SetOut(&out)
 	root.SetArgs([]string{"call", "--config", configPath, "--args", `{"message":"hi"}`, "echo"})
 
-	if err := root.ExecuteContext(context.Background()); err != nil {
+	// A cancellable context, not context.Background(): runCall's
+	// connectBackends (gwH == nil, a production-correct choice for a
+	// one-shot CLI command whose process exits right after) spawns a
+	// persistent superviseBackend goroutine per backend that keeps retrying
+	// for as long as ctx stays alive. In a real `mcprt call` invocation the
+	// process exits right after and takes that goroutine with it, but in a
+	// test the process doesn't exit, so context.Background() would leak it
+	// into later tests, racing their writes to package-level vars like
+	// backendConnectTimeout under `go test -race` (see this plan's Task 2
+	// review, finding 1). cancel() runs (via defer, LIFO) before
+	// backendA.Close() above, so any straggling supervisor stops retrying
+	// before the backend it would retry against goes away.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
 	}
 
@@ -76,7 +90,11 @@ backends:
 	root.SetOut(&out)
 	root.SetArgs([]string{"call", "--config", configPath, "--args", `{"message":"hi"}`, "--json", "echo"})
 
-	if err := root.ExecuteContext(context.Background()); err != nil {
+	// See TestCallCommand_Text's matching comment: a cancellable context so
+	// runCall's backend supervisor goroutine doesn't outlive this test.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
 	}
 
@@ -109,8 +127,11 @@ backends:
     url: %q
 `, backendA.URL))
 
-	err := cli.Execute(context.Background(), []string{"call", "--config", configPath, "echo"})
-	if err != nil {
+	// See TestCallCommand_Text's matching comment: a cancellable context so
+	// runCall's backend supervisor goroutine doesn't outlive this test.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := cli.Execute(ctx, []string{"call", "--config", configPath, "echo"}); err != nil {
 		t.Fatalf("Execute: unexpected error calling with no --args: %v", err)
 	}
 }
@@ -126,8 +147,11 @@ backends:
     url: %q
 `, backendA.URL))
 
-	err := cli.Execute(context.Background(), []string{"call", "--config", configPath, "does-not-exist"})
-	if err == nil {
+	// See TestCallCommand_Text's matching comment: a cancellable context so
+	// runCall's backend supervisor goroutine doesn't outlive this test.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := cli.Execute(ctx, []string{"call", "--config", configPath, "does-not-exist"}); err == nil {
 		t.Fatal("Execute: expected error for unknown tool name, got nil")
 	}
 }
@@ -143,8 +167,16 @@ backends:
     url: %q
 `, backendA.URL))
 
-	err := cli.Execute(context.Background(), []string{"call", "--config", configPath, "--args", "not json", "echo"})
-	if err == nil {
+	// See TestCallCommand_Text's matching comment: a cancellable context so
+	// runCall's backend supervisor goroutine doesn't outlive this test. (This
+	// particular call fails before connectBackends even runs -- --args is
+	// validated first -- but the context is fixed uniformly across this file
+	// rather than special-cased per test, since it costs nothing here and
+	// keeps the pattern obviously safe against a future reordering inside
+	// runCall.)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := cli.Execute(ctx, []string{"call", "--config", configPath, "--args", "not json", "echo"}); err == nil {
 		t.Fatal("Execute: expected error for invalid --args JSON, got nil")
 	}
 }
@@ -160,8 +192,11 @@ backends:
     url: %q
 `, backendA.URL))
 
-	err := cli.Execute(context.Background(), []string{"call", "--config", configPath, "boom"})
-	if err == nil {
+	// See TestCallCommand_Text's matching comment: a cancellable context so
+	// runCall's backend supervisor goroutine doesn't outlive this test.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := cli.Execute(ctx, []string{"call", "--config", configPath, "boom"}); err == nil {
 		t.Fatal("Execute: expected a non-nil error when the tool result has IsError=true, got nil")
 	}
 }

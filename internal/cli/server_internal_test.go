@@ -603,6 +603,81 @@ func TestSuperviseBackend_StopsRetryingWhenContextCancelled(t *testing.T) {
 	}
 }
 
+// TestCollectConnectResults_FlappingBackendDoesNotDropHealthyBackend checks
+// that a backend index which reports MORE THAN ONCE inside the collection
+// window (a flapping backend: connect, disconnect, reconnect, all before
+// connectBackends' deadline fires -- superviseBackend's onFirstConnect fires
+// on every successful connect for as long as gwH.ptr is still nil, see its
+// doc comment) does not consume a slot meant for a DIFFERENT, healthy
+// backend's result -- this plan's Task 2 review, finding 2.
+//
+// The OLD collection loop ("for range configs { select { case r :=
+// <-resultCh: results[r.i] = r.c } }") counted raw channel receives against
+// len(configs), not distinct backend indices. With 2 configs and this exact
+// arrival order -- flappy's (index 0) two results both already buffered
+// ahead of healthy's (index 1) single result -- that loop would spend both
+// of its 2 permitted iterations reading index 0's two sends and never reach
+// healthy's already-buffered result: a backend that connected fine gets
+// silently excluded from the founding set, and since its supervisor is now
+// parked in Session.Wait() believing it already reported, it never joins
+// later via ConnectBackend either. collectConnectResults fixes this by
+// counting DISTINCT indices filled, not raw receives, and closing whichever
+// result an in-window reconnect supersedes.
+func TestCollectConnectResults_FlappingBackendDoesNotDropHealthyBackend(t *testing.T) {
+	backendHTTP := newFakeBackendHTTP("ping")
+	defer backendHTTP.Close()
+
+	connectOne := func(name string) *backend.Backend {
+		t.Helper()
+		b, err := backend.Connect(context.Background(), config.BackendConfig{Name: name, Transport: "http", URL: backendHTTP.URL}, backend.ChangeCallbacks{})
+		if err != nil {
+			t.Fatalf("connecting fake backend %q: %v", name, err)
+		}
+		return b
+	}
+
+	// flappyFirst simulates the connection that a flapping backend's
+	// supervisor reports first, before disconnecting and reconnecting --
+	// flappySecond is the reconnect's result. healthy is a different,
+	// perfectly healthy backend that connects exactly once.
+	flappyFirst := &connectResult{backend: connectOne("flappy")}
+	flappySecond := &connectResult{backend: connectOne("flappy")}
+	healthy := &connectResult{backend: connectOne("healthy")}
+	defer func() {
+		// flappyFirst is expected to already be closed BY
+		// collectConnectResults itself (it's the result an in-window
+		// reconnect supersedes); the other two are still live here and
+		// owned by this test.
+		_ = flappySecond.backend.Close()
+		_ = healthy.backend.Close()
+	}()
+
+	resultCh := make(chan indexedConnectResult, 4)
+	// Exactly the arrival order that broke the OLD collection loop: both of
+	// flappy's (index 0) results land before healthy's (index 1) result.
+	resultCh <- indexedConnectResult{0, flappyFirst}
+	resultCh <- indexedConnectResult{0, flappySecond}
+	resultCh <- indexedConnectResult{1, healthy}
+
+	results := collectConnectResults(resultCh, 2, make(chan time.Time)) // a deadline that never fires
+
+	if results[0] != flappySecond {
+		t.Fatalf("results[0] = %+v, want flappySecond (the latest connect for a flapping backend wins)", results[0])
+	}
+	if results[1] != healthy {
+		t.Fatalf("results[1] = %v, want healthy's result -- it must not be dropped just because a DIFFERENT backend (flappy) reported twice", results[1])
+	}
+
+	// flappyFirst must have been closed as part of being superseded --
+	// verify by confirming it can no longer serve a request, bounded so a
+	// bug here fails the test instead of hanging it.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := flappyFirst.backend.ListTools(ctx); err == nil {
+		t.Fatal("flappyFirst.ListTools succeeded after being superseded, want collectConnectResults to have closed it")
+	}
+}
+
 // TestBuildGateway_NoListenerConfigured checks that buildGateway itself
 // validates a listener is configured, independent of runServer's own
 // earlier check -- watchSIGHUP (Task 5) relies on buildGateway to reject a
@@ -637,8 +712,18 @@ func TestBuildGateway_Success(t *testing.T) {
 		},
 	}
 
-	srv, err := buildGateway(context.Background(), logger, cfg)
+	// A cancellable context, not context.Background(): buildGateway's
+	// connectBackends spawns a persistent superviseBackend goroutine for
+	// "fake" that retries forever for as long as its ctx stays alive.
+	// context.Background() is never cancelled, so that goroutine would
+	// outlive this test and go on reading package-level vars like
+	// backendConnectTimeout in the background, racing a LATER test's writes
+	// to them -- reproduced as a genuine `go test -race` failure (this
+	// plan's Task 2 review, finding 1) before this fix.
+	ctx, cancel := context.WithCancel(context.Background())
+	srv, err := buildGateway(ctx, logger, cfg)
 	if err != nil {
+		cancel()
 		t.Fatalf("buildGateway: %v", err)
 	}
 	// Close the backend connection before the deferred backendHTTP.Close()
@@ -652,6 +737,14 @@ func TestBuildGateway_Success(t *testing.T) {
 			_ = b.Close()
 		}
 	}()
+	// Registered last (LIFO) -> runs first, before the backend-close loop
+	// above: cancel the supervisor's ctx before closing its connection, so
+	// it can't win a race and reconnect one more time between the Close()
+	// above unblocking its Session.Wait() and the goroutine actually seeing
+	// ctx.Done() -- matching the pattern already established for
+	// TestConnectBackends_* (see e.g.
+	// TestConnectBackends_ResourceListFailureKeepsBackendTools).
+	defer cancel()
 	if len(srv.Backends()) != 1 {
 		t.Fatalf("Backends() = %v, want 1 entry", srv.Backends())
 	}
