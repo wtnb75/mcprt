@@ -85,13 +85,32 @@ func (s *Server) MCP() *mcp.Server { return s.mcp }
 
 // Backend looks up a connected backend by name, for the cli layer's
 // list_changed callbacks (see internal/cli/server.go) to re-list from
-// without keeping their own separate reference.
-func (s *Server) Backend(name string) *backend.Backend { return s.backends[name] }
+// without keeping their own separate reference. Locked: since
+// ConnectBackend (backend reconnect/late-join), s.backends can be mutated
+// concurrently by a supervisor goroutine at any time, not just during
+// startup construction.
+func (s *Server) Backend(name string) *backend.Backend {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.backends[name]
+}
 
-// Backends returns every currently connected backend, keyed by name, for
-// scheduleDrain (see internal/cli/server.go) to force-close a superseded
-// generation's connections after its drain timeout.
-func (s *Server) Backends() map[string]*backend.Backend { return s.backends }
+// Backends returns a snapshot of every currently connected backend, keyed by
+// name, for scheduleDrain (see internal/cli/server.go) to force-close a
+// superseded generation's connections after its drain timeout. Returns a
+// copy rather than the live map: since ConnectBackend, s.backends can be
+// mutated concurrently by a supervisor goroutine at any time, so handing out
+// the live map would let a caller ranging over it race with that mutation
+// after this call returns.
+func (s *Server) Backends() map[string]*backend.Backend {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]*backend.Backend, len(s.backends))
+	for k, v := range s.backends {
+		out[k] = v
+	}
+	return out
+}
 
 // emptyTable returns t, or a fresh empty table if t is nil -- New is called
 // with tables.X == nil when a category has no items anywhere (see New's
