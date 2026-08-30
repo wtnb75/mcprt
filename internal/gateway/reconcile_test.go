@@ -361,14 +361,14 @@ func TestConnectBackend_AddsNewBackendNotInEntries(t *testing.T) {
 		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil)
 
 	newConn := &backend.Backend{Name: "new"}
-	srv.ConnectBackend("new", newConn, "",
+	srv.ConnectBackend("new", newConn, "new-",
 		[]*mcp.Tool{{Name: "fresh", InputSchema: toolSchema}}, nil, nil, nil)
 
 	if srv.Backends()["new"] != newConn {
 		t.Fatalf("Backends()[\"new\"] = %v, want %v", srv.Backends()["new"], newConn)
 	}
-	if got := downstreamToolNames(t, ctx, srv.MCP()); !equalStrings(got, []string{"existing", "fresh"}) {
-		t.Fatalf("tools after ConnectBackend = %v, want [existing fresh]", got)
+	if got := downstreamToolNames(t, ctx, srv.MCP()); !equalStrings(got, []string{"existing", "new-fresh"}) {
+		t.Fatalf("tools after ConnectBackend = %v, want [existing new-fresh]", got)
 	}
 }
 
@@ -400,8 +400,8 @@ func TestConnectBackend_ReconnectsExistingBackend(t *testing.T) {
 	if srv.Backends()["a"] != newConn {
 		t.Fatalf("Backends()[\"a\"] = %v, want the new connection %v", srv.Backends()["a"], newConn)
 	}
-	if got := downstreamToolNames(t, ctx, srv.MCP()); !equalStrings(got, []string{"reconnected"}) {
-		t.Fatalf("tools after ConnectBackend reconnect = %v, want [reconnected]", got)
+	if got := downstreamToolNames(t, ctx, srv.MCP()); !equalStrings(got, []string{"a-reconnected"}) {
+		t.Fatalf("tools after ConnectBackend reconnect = %v, want [a-reconnected]", got)
 	}
 }
 

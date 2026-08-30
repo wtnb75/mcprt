@@ -192,7 +192,6 @@ func upsertEntry[T any](entries []router.Entry[T], backendName, prefix string, i
 	copy(out, entries)
 	for i, e := range out {
 		if e.BackendName == backendName {
-			out[i].Prefix = prefix
 			out[i].Items = items
 			return out
 		}
@@ -219,10 +218,10 @@ func upsertEntry[T any](entries []router.Entry[T], backendName, prefix string, i
 func (s *Server) ConnectBackend(name string, b *backend.Backend, prefix string, tools []*mcp.Tool, resources []*mcp.Resource, templates []*mcp.ResourceTemplate, prompts []*mcp.Prompt) {
 	s.mu.Lock()
 	s.backends[name] = b
-	s.toolEntries = upsertEntry(s.toolEntries, name, "", nil)
+	s.toolEntries = upsertEntry(s.toolEntries, name, prefix, nil)
 	s.resourceEntries = upsertEntry(s.resourceEntries, name, "", nil)
 	s.resourceTemplateEntries = upsertEntry(s.resourceTemplateEntries, name, "", nil)
-	s.promptEntries = upsertEntry(s.promptEntries, name, "", nil)
+	s.promptEntries = upsertEntry(s.promptEntries, name, prefix, nil)
 	s.mu.Unlock()
 
 	s.UpdateTools(name, tools)
