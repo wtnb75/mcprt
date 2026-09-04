@@ -64,13 +64,13 @@ func TestProgressRegistry_RegisterRelaySummary(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := gateway.NewProgressRegistry()
 
-	internalToken, entry, cleanup := reg.Register(session, "original-token")
+	internalToken, entry, cleanup := reg.Register(session, "original-token", "backend-a")
 	defer cleanup()
 
-	reg.Relay(context.Background(), logger, &mcp.ProgressNotificationParams{ProgressToken: internalToken, Progress: 1, Total: 2, Message: "step1"})
+	reg.Relay(context.Background(), logger, "backend-a", &mcp.ProgressNotificationParams{ProgressToken: internalToken, Progress: 1, Total: 2, Message: "step1"})
 	// A relay carrying the token as float64 (as it would arrive after a real
 	// JSON round-trip) must resolve to the same entry.
-	reg.Relay(context.Background(), logger, &mcp.ProgressNotificationParams{ProgressToken: float64(internalToken), Progress: 2, Total: 2, Message: "step2"})
+	reg.Relay(context.Background(), logger, "backend-a", &mcp.ProgressNotificationParams{ProgressToken: float64(internalToken), Progress: 2, Total: 2, Message: "step2"})
 
 	var got []*mcp.ProgressNotificationParams
 	deadline := time.Now().Add(5 * time.Second)
@@ -104,10 +104,10 @@ func TestProgressRegistry_RelayIgnoredAfterCleanup(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	reg := gateway.NewProgressRegistry()
 
-	internalToken, _, cleanup := reg.Register(session, "original-token")
+	internalToken, _, cleanup := reg.Register(session, "original-token", "backend-a")
 	cleanup() // call already completed before any progress notification arrived
 
-	reg.Relay(context.Background(), logger, &mcp.ProgressNotificationParams{ProgressToken: internalToken, Progress: 1, Message: "too-late"})
+	reg.Relay(context.Background(), logger, "backend-a", &mcp.ProgressNotificationParams{ProgressToken: internalToken, Progress: 1, Message: "too-late"})
 
 	select {
 	case p := <-progressCh:
@@ -121,9 +121,60 @@ func TestProgressRegistry_RelayIgnoresUnknownToken(t *testing.T) {
 	reg := gateway.NewProgressRegistry()
 
 	// No Register call at all: Relay must not panic on a nil session lookup.
-	reg.Relay(context.Background(), logger, &mcp.ProgressNotificationParams{ProgressToken: uint64(999), Progress: 1})
-	reg.Relay(context.Background(), logger, &mcp.ProgressNotificationParams{ProgressToken: "not-a-number", Progress: 1})
+	reg.Relay(context.Background(), logger, "backend-a", &mcp.ProgressNotificationParams{ProgressToken: uint64(999), Progress: 1})
+	reg.Relay(context.Background(), logger, "backend-a", &mcp.ProgressNotificationParams{ProgressToken: "not-a-number", Progress: 1})
 }
+
+// TestProgressRegistry_RelayDropsBackendMismatch proves that a notification
+// claiming a token that was Registered for a DIFFERENT backend is silently
+// dropped, exactly like an unknown/stale token -- this is the fix for the
+// cross-backend token injection finding: backend "b" echoing (or guessing)
+// an internal token that currently belongs to backend "a"'s in-flight call
+// must not be relayed into that call's downstream stream.
+func TestProgressRegistry_RelayDropsBackendMismatch(t *testing.T) {
+	session, progressCh, cleanupSession := newCapturedDownstreamSession(t)
+	defer cleanupSession()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := gateway.NewProgressRegistry()
+
+	internalToken, entry, cleanup := reg.Register(session, "original-token", "backend-a")
+	defer cleanup()
+
+	// A notification arriving as if from "backend-b" claiming backend-a's
+	// internal token must be dropped, not relayed.
+	reg.Relay(context.Background(), logger, "backend-b", &mcp.ProgressNotificationParams{ProgressToken: internalToken, Progress: 1, Message: "injected"})
+
+	select {
+	case p := <-progressCh:
+		t.Fatalf("received progress notification %+v from mismatched backend, want none relayed", p)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if count, lastMessage := entry.Summary(); count != 0 || lastMessage != "" {
+		t.Fatalf("Summary() after mismatched relay = (%d, %q), want (0, \"\")", count, lastMessage)
+	}
+
+	// The same token relayed under its CORRECT backend name must still work
+	// (regression guard: the mismatch check must not have broken the normal
+	// path).
+	reg.Relay(context.Background(), logger, "backend-a", &mcp.ProgressNotificationParams{ProgressToken: internalToken, Progress: 1, Message: "legit"})
+
+	select {
+	case p := <-progressCh:
+		if p.ProgressToken != "original-token" || p.Message != "legit" {
+			t.Fatalf("relayed notification = %+v, want ProgressToken=original-token Message=legit", p)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for correctly-matched relay")
+	}
+}
+
+// Coverage for progressRelayTimeout being a shrinkable, test-usable knob
+// lives in gateway_internal_test.go (package gateway, where the unexported
+// var is reachable) -- see TestProgressRegistry_RelayTimeoutIsShrinkable
+// there, which follows the same pattern as
+// TestServeHTTP_ShutdownTimeoutReturnsError for shutdownTimeout.
 
 // TestProgressRegistry_ConcurrentRegisterRelayCleanup exercises Register,
 // Relay, and cleanup from many goroutines at once against one shared
@@ -140,19 +191,19 @@ func TestProgressRegistry_ConcurrentRegisterRelayCleanup(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			internalToken, _, cleanup := reg.Register(session, i)
+			internalToken, _, cleanup := reg.Register(session, i, "backend-a")
 			defer cleanup()
 			for j := 0; j < 3; j++ {
-				reg.Relay(context.Background(), logger, &mcp.ProgressNotificationParams{ProgressToken: internalToken, Progress: float64(j)})
+				reg.Relay(context.Background(), logger, "backend-a", &mcp.ProgressNotificationParams{ProgressToken: internalToken, Progress: float64(j)})
 			}
 		}(i)
 	}
 	wg.Wait()
 
 	// The registry must still be usable afterward.
-	internalToken, entry, cleanup := reg.Register(session, "final")
+	internalToken, entry, cleanup := reg.Register(session, "final", "backend-a")
 	defer cleanup()
-	reg.Relay(context.Background(), logger, &mcp.ProgressNotificationParams{ProgressToken: internalToken, Progress: 1, Message: "final-msg"})
+	reg.Relay(context.Background(), logger, "backend-a", &mcp.ProgressNotificationParams{ProgressToken: internalToken, Progress: 1, Message: "final-msg"})
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if count, _ := entry.Summary(); count == 1 {

@@ -371,7 +371,7 @@ func callHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, ori
 			if token := req.Params.GetProgressToken(); token != nil {
 				var internalToken uint64
 				var cleanup func()
-				internalToken, entry, cleanup = progress.Register(req.Session, token)
+				internalToken, entry, cleanup = progress.Register(req.Session, token, b.Name)
 				defer cleanup()
 				// SetProgressToken only accepts int/int32/int64/string (see
 				// go-sdk's setProgressToken); progress.Register hands out a

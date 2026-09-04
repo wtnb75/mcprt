@@ -527,7 +527,7 @@ func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.Backen
 		}
 		if gwH.progress != nil {
 			cb.OnProgress = func(ctx context.Context, req *mcp.ProgressNotificationClientRequest) {
-				gwH.progress.Relay(ctx, logger, req.Params)
+				gwH.progress.Relay(ctx, logger, bc.Name, req.Params)
 			}
 		}
 	}

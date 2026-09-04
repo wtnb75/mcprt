@@ -5,6 +5,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -67,6 +69,91 @@ func TestServeHTTP_ShutdownTimeoutReturnsError(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("ServeHTTP did not return within 5s of context cancellation")
+	}
+}
+
+// TestProgressRegistry_RelayTimeoutIsShrinkable checks that
+// progressRelayTimeout (progress.go) is a package-level var a test can
+// shrink, following the exact same pattern
+// TestServeHTTP_ShutdownTimeoutReturnsError above uses for shutdownTimeout.
+// A real downstream-hang test would need a *mcp.ServerSession backed by a
+// Transport whose Write blocks forever; the go-sdk offers no clean way to
+// construct one outside a live connection under genuine TCP backpressure,
+// which a tiny progress-notification payload won't reliably trigger. So
+// this test proves the knob is there and usable, and leaves Relay's normal
+// and backend-mismatch-drop behavior to progress_test.go's
+// TestProgressRegistry_RegisterRelaySummary and
+// TestProgressRegistry_RelayDropsBackendMismatch.
+func TestProgressRegistry_RelayTimeoutIsShrinkable(t *testing.T) {
+	orig := progressRelayTimeout
+	progressRelayTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { progressRelayTimeout = orig })
+
+	if progressRelayTimeout != 50*time.Millisecond {
+		t.Fatalf("progressRelayTimeout = %v after shrinking, want 50ms", progressRelayTimeout)
+	}
+
+	// Relay's ordinary successful-write path must still work unaffected by
+	// a shrunk (but still ample for a loopback write) timeout.
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	reg := NewProgressRegistry()
+	session, progressCh, cleanupSession := newCapturedDownstreamSessionForInternalTest(t)
+	defer cleanupSession()
+
+	internalToken, _, cleanup := reg.Register(session, "original-token", "backend-a")
+	defer cleanup()
+	reg.Relay(context.Background(), logger, "backend-a", &mcp.ProgressNotificationParams{ProgressToken: internalToken, Progress: 1, Message: "ok"})
+
+	select {
+	case p := <-progressCh:
+		if p.Message != "ok" {
+			t.Fatalf("relayed notification = %+v, want Message=ok", p)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for relay under shrunk progressRelayTimeout")
+	}
+}
+
+// newCapturedDownstreamSessionForInternalTest mirrors progress_test.go's
+// newCapturedDownstreamSession (unexported to that external test package,
+// so this internal test package needs its own copy) -- it spins up a tiny
+// MCP server with one tool, connects a client with progressCh wired as its
+// ProgressNotificationHandler, calls the tool once to capture the
+// server-side *mcp.ServerSession, and returns it plus progressCh and a
+// cleanup func.
+func newCapturedDownstreamSessionForInternalTest(t *testing.T) (session *mcp.ServerSession, progressCh <-chan *mcp.ProgressNotificationParams, cleanup func()) {
+	t.Helper()
+
+	srv := mcp.NewServer(&mcp.Implementation{Name: "probe", Version: "v1"}, nil)
+	var captured *mcp.ServerSession
+	srv.AddTool(&mcp.Tool{Name: "probe", InputSchema: map[string]any{"type": "object"}},
+		func(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			captured = req.Session
+			return &mcp.CallToolResult{}, nil
+		})
+	httpSrv := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+
+	ch := make(chan *mcp.ProgressNotificationParams, 128)
+	client := mcp.NewClient(&mcp.Implementation{Name: "probe-client", Version: "v1"}, &mcp.ClientOptions{
+		ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+			ch <- req.Params
+		},
+	})
+	clientSession, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{Endpoint: httpSrv.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect probe client: %v", err)
+	}
+
+	if _, err := clientSession.CallTool(context.Background(), &mcp.CallToolParams{Name: "probe", Arguments: map[string]any{}}); err != nil {
+		t.Fatalf("call probe: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("probe tool handler never ran; no server-side session captured")
+	}
+
+	return captured, ch, func() {
+		_ = clientSession.Close()
+		httpSrv.Close()
 	}
 }
 

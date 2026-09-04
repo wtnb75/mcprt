@@ -1154,7 +1154,7 @@ func TestGateway_CallHandlerRelaysProgressAndLogsSummary(t *testing.T) {
 	progressReg := gateway.NewProgressRegistry()
 	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{
 		OnProgress: func(ctx context.Context, req *mcp.ProgressNotificationClientRequest) {
-			progressReg.Relay(ctx, logger, req.Params)
+			progressReg.Relay(ctx, logger, "backend-a", req.Params)
 		},
 	})
 	if err != nil {
