@@ -25,8 +25,9 @@ type Backend struct {
 }
 
 // ChangeCallbacks are invoked when a connected backend reports that its
-// tool/prompt/resource list has changed, or sends a progress notification
-// for an in-flight call. Each OnXChanged func takes no arguments: MCP's
+// tool/prompt/resource list has changed, sends a progress notification for
+// an in-flight call, or asks for structured input mid-call via
+// elicitation/create. Each OnXChanged func takes no arguments: MCP's
 // list_changed notifications carry no payload, they only signal "go
 // re-list." A nil field means "not interested" and leaves the corresponding
 // SDK handler unset.
@@ -39,6 +40,13 @@ type ChangeCallbacks struct {
 	// callbacks above, progress notifications carry a payload, so this
 	// field's signature matches the SDK handler's exactly.
 	OnProgress func(context.Context, *mcp.ProgressNotificationClientRequest)
+	// OnElicit, if non-nil, is wired as the backend-facing mcp.Client's
+	// ElicitationHandler. Like OnProgress, this one both takes a payload
+	// and returns a result -- its signature matches the SDK handler's
+	// exactly. Setting it also causes the SDK to automatically advertise
+	// the elicitation capability to the backend (see go-sdk's
+	// ClientOptions.ElicitationHandler doc).
+	OnElicit func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error)
 }
 
 // Connect starts (for stdio) or dials (for http) the backend described by
@@ -58,6 +66,9 @@ func Connect(ctx context.Context, cfg config.BackendConfig, cb ChangeCallbacks) 
 	}
 	if cb.OnProgress != nil {
 		clientOpts.ProgressNotificationHandler = cb.OnProgress
+	}
+	if cb.OnElicit != nil {
+		clientOpts.ElicitationHandler = cb.OnElicit
 	}
 	client := mcp.NewClient(&mcp.Implementation{Name: "mcprt", Version: "v1"}, clientOpts)
 

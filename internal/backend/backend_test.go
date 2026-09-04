@@ -457,6 +457,52 @@ func TestConnect_ProgressNotificationCallback(t *testing.T) {
 	}
 }
 
+// TestConnect_ElicitationCallback checks that ChangeCallbacks.OnElicit
+// fires with the backend's elicitation/create payload when the backend
+// asks for input mid-call, and that the handler's response reaches the
+// backend as the tool call's result.
+func TestConnect_ElicitationCallback(t *testing.T) {
+	fakeServer := mcp.NewServer(&mcp.Implementation{Name: "fake", Version: "v1"}, nil)
+	fakeServer.AddTool(&mcp.Tool{Name: "ask", InputSchema: map[string]any{"type": "object"}},
+		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			res, err := req.Session.Elicit(ctx, &mcp.ElicitParams{
+				Message:         "confirm?",
+				RequestedSchema: map[string]any{"type": "object"},
+			})
+			if err != nil {
+				return nil, err
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: res.Action}}}, nil
+		})
+
+	srv := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return fakeServer }, nil))
+	defer srv.Close()
+
+	ctx := context.Background()
+	var gotMessage string
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL},
+		backend.ChangeCallbacks{OnElicit: func(_ context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			gotMessage = req.Params.Message
+			return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"confirmed": true}}, nil
+		}})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	res, err := b.Session.CallTool(ctx, &mcp.CallToolParams{Name: "ask", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if gotMessage != "confirm?" {
+		t.Fatalf("OnElicit message = %q, want \"confirm?\"", gotMessage)
+	}
+	text, ok := res.Content[0].(*mcp.TextContent)
+	if !ok || text.Text != "accept" {
+		t.Fatalf("tool result = %+v, want text \"accept\"", res.Content)
+	}
+}
+
 // TestConnect_NilChangeCallbacks_NoHandlersRegistered checks that a nil
 // field on ChangeCallbacks leaves the corresponding SDK handler unset
 // (rather than, say, panicking or wiring a no-op that still advertises
