@@ -1224,3 +1224,106 @@ backends:
 		t.Fatalf("server exited with error: %v", err)
 	}
 }
+
+// TestServerCommand_RelaysToolCallProgress checks the progress-relay
+// feature end-to-end through the real server command: a downstream
+// tools/call carrying a progressToken reaches a backend that sends two
+// notifications/progress mid-call, and both arrive at the downstream
+// client under its ORIGINAL progressToken.
+func TestServerCommand_RelaysToolCallProgress(t *testing.T) {
+	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	backendSrv.AddTool(&mcp.Tool{Name: "slow", Description: "slow", InputSchema: map[string]any{"type": "object"}},
+		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if token := req.Params.GetProgressToken(); token != nil {
+				_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{ProgressToken: token, Progress: 1, Total: 2, Message: "step1"})
+				_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{ProgressToken: token, Progress: 2, Total: 2, Message: "step2"})
+				// go-sdk's jsonrpc2.Connection retires an outgoing call the
+				// instant its Response message is read, on the read loop
+				// itself -- independent of, and without waiting for, the
+				// handlerQueue goroutine that is concurrently dispatching
+				// the notifications sent just above to callHandler's
+				// progress.Relay. Returning immediately therefore races the
+				// tool's response against its own last progress
+				// notifications (this is the "expected race" progress.go's
+				// Relay doc mentions -- an in-flight notification losing to
+				// cleanup is silently dropped, not an error). A short pause
+				// here gives the relay its ordinary run of the field before
+				// the response retires the call, so the assertions below
+				// exercise the intended path instead of that documented
+				// race.
+				time.Sleep(50 * time.Millisecond)
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "ok"}}}, nil
+		})
+	backendHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil))
+	defer backendHTTP.Close()
+
+	gatewayAddr := freePort(t)
+	configPath := writeConfig(t, fmt.Sprintf(`
+listen:
+  http: %q
+
+backends:
+  - name: fake
+    transport: http
+    url: %q
+`, gatewayAddr, backendHTTP.URL))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	execErr := make(chan error, 1)
+	go func() {
+		execErr <- cli.Execute(ctx, []string{"server", "--config", configPath})
+	}()
+
+	progressCh := make(chan *mcp.ProgressNotificationParams, 4)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, &mcp.ClientOptions{
+		ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+			progressCh <- req.Params
+		},
+	})
+	var session *mcp.ClientSession
+	var connectErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		session, connectErr = client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: "http://" + gatewayAddr}, nil)
+		if connectErr == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if connectErr != nil {
+		t.Fatalf("connecting to gateway: %v", connectErr)
+	}
+	waitForToolNames(t, ctx, session, []string{"slow"})
+
+	params := &mcp.CallToolParams{Name: "slow", Arguments: map[string]any{}}
+	params.SetProgressToken("original-token")
+	if _, err := session.CallTool(ctx, params); err != nil {
+		t.Fatalf("call slow: %v", err)
+	}
+
+	var got []*mcp.ProgressNotificationParams
+	deadline = time.Now().Add(5 * time.Second)
+	for len(got) < 2 && time.Now().Before(deadline) {
+		select {
+		case p := <-progressCh:
+			got = append(got, p)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("received %d progress notifications, want 2", len(got))
+	}
+	if got[0].ProgressToken != "original-token" || got[0].Message != "step1" {
+		t.Fatalf("first progress = %+v, want ProgressToken=original-token Message=step1", got[0])
+	}
+	if got[1].ProgressToken != "original-token" || got[1].Message != "step2" {
+		t.Fatalf("second progress = %+v, want ProgressToken=original-token Message=step2", got[1])
+	}
+
+	_ = session.Close()
+	cancel()
+	if err := <-execErr; err != nil {
+		t.Fatalf("server exited with error: %v", err)
+	}
+}

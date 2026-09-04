@@ -250,6 +250,7 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 	}
 
 	var gwH gwHolder
+	gwH.progress = gateway.NewProgressRegistry()
 	conn := connectBackends(ctx, logger, cfg.Backends, &gwH)
 
 	toolTable := router.Resolve(conn.toolEntries, gateway.ToolNameOf, gateway.ToolRename, cfg.Overrides)
@@ -287,7 +288,7 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 		Resources:         cfg.ResourceOverrides,
 		ResourceTemplates: cfg.ResourceTemplateOverrides,
 		Prompts:           cfg.PromptOverrides,
-	}, cfg.Logging.MaskKeys)
+	}, cfg.Logging.MaskKeys, gwH.progress)
 	gwH.ptr.Store(srv)
 
 	return srv, nil
@@ -301,8 +302,16 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 // initial ListTools/ListResources/ListResourceTemplates/ListPrompts that
 // runServer is about to do anyway will reflect the same change, so nothing
 // is permanently lost.
+//
+// progress is set once, before connectBackends spawns any supervisor
+// goroutine, and never mutated afterward -- so reading it from those
+// goroutines needs no lock (the write happens-before every goroutine's
+// creation). A nil progress (buildGateway always sets one; only some tests
+// construct a bare gwHolder{} without it) means "no progress relay for this
+// generation," matching a nil *gateway.ProgressRegistry everywhere else.
 type gwHolder struct {
-	ptr atomic.Pointer[gateway.Server]
+	ptr      atomic.Pointer[gateway.Server]
+	progress *gateway.ProgressRegistry
 }
 
 // toolsChangedCallback returns a func to use as backend.ChangeCallbacks.
@@ -515,6 +524,11 @@ func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.Backen
 			OnToolsChanged:     toolsChangedCallback(ctx, logger, bc.Name, gwH),
 			OnResourcesChanged: resourcesChangedCallback(ctx, logger, bc.Name, gwH),
 			OnPromptsChanged:   promptsChangedCallback(ctx, logger, bc.Name, gwH),
+		}
+		if gwH.progress != nil {
+			cb.OnProgress = func(ctx context.Context, req *mcp.ProgressNotificationClientRequest) {
+				gwH.progress.Relay(ctx, logger, req.Params)
+			}
 		}
 	}
 
