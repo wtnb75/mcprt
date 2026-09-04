@@ -162,7 +162,7 @@ func TestLogCall_Success(t *testing.T) {
 	start := time.Now().Add(-5 * time.Millisecond)
 
 	logCall(context.Background(), logger, "tool", "tool", "mytool", "backend-a", sess,
-		json.RawMessage(`{"user":"alice"}`), nil, start, nil)
+		json.RawMessage(`{"user":"alice"}`), nil, start, nil, nil)
 
 	rec := decodeLastLogLine(t, buf.String())
 	if rec["msg"] != "tool call" {
@@ -195,7 +195,7 @@ func TestLogCall_Failure(t *testing.T) {
 	sess := &mcp.ServerSession{}
 
 	logCall(context.Background(), logger, "tool", "tool", "mytool", "backend-a", sess,
-		nil, nil, time.Now(), errors.New("boom"))
+		nil, nil, time.Now(), errors.New("boom"), nil)
 
 	rec := decodeLastLogLine(t, buf.String())
 	if rec["msg"] != "tool call failed" {
@@ -219,7 +219,7 @@ func TestLogCall_ToolCallNoArguments(t *testing.T) {
 
 	// Tool call with no Arguments set (typed-nil json.RawMessage on wire)
 	logCall(context.Background(), logger, "tool", "tool", "mytool", "backend-a", sess,
-		json.RawMessage(nil), nil, time.Now(), nil)
+		json.RawMessage(nil), nil, time.Now(), nil, nil)
 
 	rec := decodeLastLogLine(t, buf.String())
 	if rec["msg"] != "tool call" {
@@ -237,7 +237,7 @@ func TestLogCall_PromptCallNoArguments(t *testing.T) {
 
 	// Prompt call with no Arguments (empty map[string]string)
 	logCall(context.Background(), logger, "prompt", "prompt", "myprompt", "backend-a", sess,
-		map[string]string{}, nil, time.Now(), nil)
+		map[string]string{}, nil, time.Now(), nil, nil)
 
 	rec := decodeLastLogLine(t, buf.String())
 	if rec["msg"] != "prompt call" {
@@ -254,7 +254,7 @@ func TestLogCall_RemoteAddrFromContext(t *testing.T) {
 	sess := &mcp.ServerSession{}
 	ctx := context.WithValue(context.Background(), remoteAddrKey{}, "127.0.0.1:5555")
 
-	logCall(ctx, logger, "resource", "uri", "file:///a", "backend-a", sess, nil, nil, time.Now(), nil)
+	logCall(ctx, logger, "resource", "uri", "file:///a", "backend-a", sess, nil, nil, time.Now(), nil, nil)
 
 	rec := decodeLastLogLine(t, buf.String())
 	if rec["remote_addr"] != "127.0.0.1:5555" {
@@ -321,7 +321,7 @@ func TestLogCall_IncludesTraceIDAndSpanIDWhenSpanValid(t *testing.T) {
 	})
 	ctx := trace.ContextWithSpanContext(context.Background(), sc)
 
-	logCall(ctx, logger, "tool", "tool", "x", "backend-a", &mcp.ServerSession{}, nil, nil, time.Now(), nil)
+	logCall(ctx, logger, "tool", "tool", "x", "backend-a", &mcp.ServerSession{}, nil, nil, time.Now(), nil, nil)
 
 	var rec map[string]any
 	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
@@ -339,7 +339,7 @@ func TestLogCall_OmitsTraceIDAndSpanIDWhenNoSpan(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
 
-	logCall(context.Background(), logger, "tool", "tool", "x", "backend-a", &mcp.ServerSession{}, nil, nil, time.Now(), nil)
+	logCall(context.Background(), logger, "tool", "tool", "x", "backend-a", &mcp.ServerSession{}, nil, nil, time.Now(), nil, nil)
 
 	var rec map[string]any
 	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {

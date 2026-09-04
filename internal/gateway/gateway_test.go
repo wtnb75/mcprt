@@ -87,7 +87,7 @@ func TestGateway_Backends(t *testing.T) {
 	defer func() { _ = connB.Close() }()
 
 	want := map[string]*backend.Backend{"backend-a": connA, "backend-b": connB}
-	srv := gateway.New(logger, want, gateway.Tables{}, gateway.Entries{}, gateway.Overrides{}, nil)
+	srv := gateway.New(logger, want, gateway.Tables{}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
 
 	got := srv.Backends()
 	if len(got) != len(want) {
@@ -121,7 +121,7 @@ func TestGateway_CallOnDeadBackendReturnsError(t *testing.T) {
 	}
 
 	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-dead", Items: tools}}, toolNameOf, toolRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
 	defer gw.Close()
@@ -185,7 +185,7 @@ func TestGateway_FallsBackWhenWinnerSchemaInvalid(t *testing.T) {
 		},
 	}
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-b": connB}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-b": connB}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
 	defer gw.Close()
@@ -248,7 +248,7 @@ func TestGateway_RoutesByPriorityAndExposesUniqueTools(t *testing.T) {
 		t.Fatalf("unexpected conflicts: %+v", table.Conflicts)
 	}
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA, "backend-b": connB}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA, "backend-b": connB}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
 	defer gw.Close()
@@ -380,7 +380,7 @@ func TestGateway_ResourceReadExact(t *testing.T) {
 		{BackendName: "backend-a", Items: resources},
 	}, resourceNameOf, resourceRename, nil)
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Resources: table}, gateway.Entries{}, gateway.Overrides{}, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Resources: table}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
 	defer gw.Close()
@@ -433,7 +433,7 @@ func TestGateway_ResourceTemplateReadForwardsActualURI(t *testing.T) {
 		{BackendName: "backend-a", Items: templates},
 	}, templateNameOf, templateRename, nil)
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{ResourceTemplates: table}, gateway.Entries{}, gateway.Overrides{}, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{ResourceTemplates: table}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
 	defer gw.Close()
@@ -495,7 +495,7 @@ func TestGateway_ResourceFallsBackWhenWinnerURIInvalid(t *testing.T) {
 		},
 	}
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-b": connB}, gateway.Tables{Resources: table}, gateway.Entries{}, gateway.Overrides{}, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-b": connB}, gateway.Tables{Resources: table}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
 	defer gw.Close()
@@ -545,7 +545,7 @@ func TestGateway_PromptGetForwardsArgumentsAndResult(t *testing.T) {
 	}
 
 	table := router.Resolve([]router.Entry[*mcp.Prompt]{{BackendName: "backend", Items: prompts}}, promptNameOf, promptRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend": conn}, gateway.Tables{Prompts: table}, gateway.Entries{}, gateway.Overrides{}, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend": conn}, gateway.Tables{Prompts: table}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
 	defer gw.Close()
@@ -614,7 +614,7 @@ func TestGateway_PromptRoutesByPriorityAndExposesUniquePrompts(t *testing.T) {
 		t.Fatalf("unexpected conflicts: %+v", table.Conflicts)
 	}
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA, "backend-b": connB}, gateway.Tables{Prompts: table}, gateway.Entries{}, gateway.Overrides{}, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA, "backend-b": connB}, gateway.Tables{Prompts: table}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
 	defer gw.Close()
@@ -680,7 +680,7 @@ func TestGateway_PromptGetOnDeadBackendReturnsError(t *testing.T) {
 	}
 
 	table := router.Resolve([]router.Entry[*mcp.Prompt]{{BackendName: "backend-dead", Items: prompts}}, promptNameOf, promptRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, gateway.Tables{Prompts: table}, gateway.Entries{}, gateway.Overrides{}, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, gateway.Tables{Prompts: table}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
 	defer gw.Close()
@@ -726,7 +726,7 @@ func TestGateway_CallLogsSuccessWithMaskedArguments(t *testing.T) {
 	}
 	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-a", Items: toolsA}}, toolNameOf, toolRename, nil)
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, []string{"secret_value"})
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, []string{"secret_value"}, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
 	defer gw.Close()
@@ -789,7 +789,7 @@ func TestGateway_CallLogsNoArguments(t *testing.T) {
 	}
 	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-a", Items: toolsA}}, toolNameOf, toolRename, nil)
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
 	defer gw.Close()
@@ -837,7 +837,7 @@ func TestGateway_CallLogsFailure(t *testing.T) {
 		t.Fatalf("list backend-dead tools: %v", err)
 	}
 	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-dead", Items: tools}}, toolNameOf, toolRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-dead": conn}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
 	defer gw.Close()
@@ -905,7 +905,7 @@ func TestGateway_ServeHTTP_LogsRemoteAddr(t *testing.T) {
 		t.Fatalf("list backend-a tools: %v", err)
 	}
 	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-a", Items: toolsA}}, toolNameOf, toolRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -979,7 +979,7 @@ func TestGateway_CallCreatesSpanWithParentFromTraceparent(t *testing.T) {
 	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-a", Items: toolsA}}, toolNameOf, toolRename, nil)
 
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
 	defer gw.Close()
@@ -1074,7 +1074,7 @@ func TestGateway_ResourceReadCreatesSpan(t *testing.T) {
 	table := router.Resolve([]router.Entry[*mcp.Resource]{{BackendName: "backend-a", Items: resourcesA}}, resourceNameOf, resourceRename, nil)
 
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Resources: table}, gateway.Entries{}, gateway.Overrides{}, nil)
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Resources: table}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
 	defer gw.Close()
@@ -1103,5 +1103,165 @@ func TestGateway_ResourceReadCreatesSpan(t *testing.T) {
 	attrs := attribute.NewSet(readSpan.Attributes...)
 	if v, ok := attrs.Value("mcp.resource.uri"); !ok || v.AsString() != "file:///a.txt" {
 		t.Fatalf("mcp.resource.uri attribute = %v (ok=%v), want file:///a.txt", v, ok)
+	}
+}
+
+// TestGateway_CallHandlerRelaysProgressAndLogsSummary checks the full
+// tools/call progress-relay path: a downstream call carrying a
+// progressToken gets a fresh internal token forwarded to the backend, the
+// backend's notifications/progress (sent via req.Session.NotifyProgress in
+// the fake backend's tool handler) is relayed back to the downstream
+// client under its ORIGINAL token, and the resulting "tool call" audit log
+// line carries progress_count/progress_last_message.
+func TestGateway_CallHandlerRelaysProgressAndLogsSummary(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	backendServer := mcp.NewServer(&mcp.Implementation{Name: "backend-a", Version: "v1"}, nil)
+	backendServer.AddTool(&mcp.Tool{Name: "progressive", Description: "progressive", InputSchema: map[string]any{"type": "object"}},
+		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if token := req.Params.GetProgressToken(); token != nil {
+				_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{ProgressToken: token, Progress: 1, Total: 2, Message: "half"})
+				_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{ProgressToken: token, Progress: 2, Total: 2, Message: "done"})
+				// go-sdk's jsonrpc2.Connection retires an outgoing call the
+				// instant its Response message is read, on the read loop
+				// itself -- independent of, and without waiting for, the
+				// handlerQueue goroutine that is concurrently dispatching
+				// the notifications sent just above to callHandler's
+				// progress.Relay. Returning immediately therefore races the
+				// tool's response against its own last progress
+				// notifications (this is the "expected race" progress.go's
+				// Relay doc mentions -- an in-flight notification losing to
+				// cleanup is silently dropped, not an error). A short pause
+				// here gives the relay its ordinary run of the field before
+				// the response retires the call, so the assertions below
+				// exercise the intended path instead of that documented
+				// race.
+				time.Sleep(50 * time.Millisecond)
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "ok"}}}, nil
+		})
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpA.Close()
+
+	ctx := context.Background()
+
+	// progressReg's Relay must be wired as the backend-facing client's
+	// ProgressNotificationHandler (backend.ChangeCallbacks.OnProgress) --
+	// in production this wiring happens in internal/cli/server.go (Task
+	// 4, not yet landed), so this test wires it directly to exercise the
+	// full relay path within the gateway package alone.
+	progressReg := gateway.NewProgressRegistry()
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{
+		OnProgress: func(ctx context.Context, req *mcp.ProgressNotificationClientRequest) {
+			progressReg.Relay(ctx, logger, req.Params)
+		},
+	})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = connA.Close() }()
+
+	toolsA, err := connA.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a tools: %v", err)
+	}
+	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-a", Items: toolsA}}, toolNameOf, toolRename, nil)
+
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil, progressReg)
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+
+	progressCh := make(chan *mcp.ProgressNotificationParams, 4)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, &mcp.ClientOptions{
+		ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+			progressCh <- req.Params
+		},
+	})
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	params := &mcp.CallToolParams{Name: "progressive", Arguments: map[string]any{}}
+	params.SetProgressToken("downstream-token")
+	if _, err := session.CallTool(ctx, params); err != nil {
+		t.Fatalf("call progressive: %v", err)
+	}
+
+	var got []*mcp.ProgressNotificationParams
+	deadline := time.Now().Add(5 * time.Second)
+	for len(got) < 2 && time.Now().Before(deadline) {
+		select {
+		case p := <-progressCh:
+			got = append(got, p)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("received %d progress notifications, want 2", len(got))
+	}
+	if got[0].ProgressToken != "downstream-token" || got[0].Message != "half" {
+		t.Fatalf("first notification = %+v, want ProgressToken=downstream-token Message=half", got[0])
+	}
+	if got[1].ProgressToken != "downstream-token" || got[1].Message != "done" {
+		t.Fatalf("second notification = %+v, want ProgressToken=downstream-token Message=done", got[1])
+	}
+
+	rec := findLogLine(t, buf.String(), "tool call")
+	countVal, ok := rec["progress_count"].(float64) // JSON numbers decode as float64
+	if !ok || countVal != 2 {
+		t.Fatalf("progress_count = %v, want 2", rec["progress_count"])
+	}
+	if rec["progress_last_message"] != "done" {
+		t.Fatalf("progress_last_message = %v, want done", rec["progress_last_message"])
+	}
+}
+
+// TestGateway_CallHandlerNoProgressTokenSkipsRelay checks that a tools/call
+// without a progressToken is unaffected by a non-nil ProgressRegistry: no
+// relay happens, and the audit log carries no progress fields.
+func TestGateway_CallHandlerNoProgressTokenSkipsRelay(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	backendServer := newFakeBackendServer("backend-a", "plain")
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpA.Close()
+
+	ctx := context.Background()
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = connA.Close() }()
+
+	toolsA, err := connA.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a tools: %v", err)
+	}
+	table := router.Resolve([]router.Entry[*mcp.Tool]{{BackendName: "backend-a", Items: toolsA}}, toolNameOf, toolRename, nil)
+
+	srv := gateway.New(logger, map[string]*backend.Backend{"backend-a": connA}, gateway.Tables{Tools: table}, gateway.Entries{}, gateway.Overrides{}, nil, gateway.NewProgressRegistry())
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "plain", Arguments: map[string]any{}}); err != nil {
+		t.Fatalf("call plain: %v", err)
+	}
+
+	rec := findLogLine(t, buf.String(), "tool call")
+	if _, ok := rec["progress_count"]; ok {
+		t.Fatalf("log line %v has progress_count, want it omitted for a call with no progressToken", rec)
 	}
 }

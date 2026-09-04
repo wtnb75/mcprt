@@ -68,6 +68,7 @@ type Server struct {
 	logger   *slog.Logger
 	backends map[string]*backend.Backend
 	maskKeys []string
+	progress *ProgressRegistry
 
 	mu sync.Mutex
 
@@ -136,7 +137,7 @@ func emptyTable[T any](t *router.Table[T]) *router.Table[T] {
 // re-run router.Resolve when a backend reports its list has changed.
 // backends must contain an entry for every BackendName referenced in
 // tables (the caller builds both from the same set of connected backends).
-func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Tables, entries Entries, overrides Overrides, maskKeys []string) *Server {
+func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Tables, entries Entries, overrides Overrides, maskKeys []string, progress *ProgressRegistry) *Server {
 	mcpSrv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{Logger: logger})
 
 	s := &Server{
@@ -144,6 +145,7 @@ func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Table
 		logger:   logger,
 		backends: backends,
 		maskKeys: maskKeys,
+		progress: progress,
 
 		toolEntries:   entries.Tools,
 		toolTable:     emptyTable(tables.Tools),
@@ -163,7 +165,7 @@ func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Table
 
 	if tables.Tools != nil {
 		for _, resolved := range tables.Tools.Items {
-			registerTool(mcpSrv, logger, backends, resolved, maskKeys)
+			registerTool(mcpSrv, logger, backends, resolved, maskKeys, progress)
 		}
 	}
 	if tables.Resources != nil {
@@ -191,7 +193,7 @@ func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Table
 // need to take a validly-defined loser down with it. It reports whether
 // anything was registered, so a reconcile caller (see reconcile.go) can
 // clean up a stale prior registration when every candidate fails.
-func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Tool], maskKeys []string) (ok bool) {
+func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Tool], maskKeys []string, progress *ProgressRegistry) (ok bool) {
 	candidates := append([]router.Candidate[*mcp.Tool]{{
 		Item:         resolved.Item,
 		BackendName:  resolved.BackendName,
@@ -200,7 +202,7 @@ func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*bac
 
 	for _, c := range candidates {
 		b := backends[c.BackendName]
-		if addTool(srv, logger, c.Item, callHandler(logger, maskKeys, b, c.OriginalName)) {
+		if addTool(srv, logger, c.Item, callHandler(logger, maskKeys, b, c.OriginalName, progress)) {
 			return true
 		}
 	}
@@ -242,7 +244,7 @@ func resourceReadHandler(logger *slog.Logger, maskKeys []string, b *backend.Back
 
 		result, err := b.Session.ReadResource(ctx, &mcp.ReadResourceParams{URI: originalURI})
 		recordOutcome(span, err)
-		logCall(ctx, logger, "resource", "uri", originalURI, b.Name, req.Session, nil, maskKeys, start, err)
+		logCall(ctx, logger, "resource", "uri", originalURI, b.Name, req.Session, nil, maskKeys, start, err, nil)
 		return result, err
 	}
 }
@@ -296,7 +298,7 @@ func resourceTemplateReadHandler(logger *slog.Logger, maskKeys []string, b *back
 
 		result, err := b.Session.ReadResource(ctx, &mcp.ReadResourceParams{URI: req.Params.URI})
 		recordOutcome(span, err)
-		logCall(ctx, logger, "resource template", "uri", req.Params.URI, b.Name, req.Session, nil, maskKeys, start, err)
+		logCall(ctx, logger, "resource template", "uri", req.Params.URI, b.Name, req.Session, nil, maskKeys, start, err, nil)
 		return result, err
 	}
 }
@@ -340,7 +342,7 @@ func promptGetHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend
 			Arguments: req.Params.Arguments,
 		})
 		recordOutcome(span, err)
-		logCall(ctx, logger, "prompt", "prompt", originalName, b.Name, req.Session, req.Params.Arguments, maskKeys, start, err)
+		logCall(ctx, logger, "prompt", "prompt", originalName, b.Name, req.Session, req.Params.Arguments, maskKeys, start, err, nil)
 		return result, err
 	}
 }
@@ -349,8 +351,12 @@ func promptGetHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend
 // the raw arguments through unchanged. It wraps the call in a span
 // (startCallSpan is a no-op for stdio-originated calls) and logs it via
 // logCall, success or failure, so a dead or erroring backend — and normal
-// usage — is visible to the operator.
-func callHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, originalName string) mcp.ToolHandler {
+// usage — is visible to the operator. When progress is non-nil and the
+// downstream request carries a progressToken, it registers a fresh
+// correlation entry so a notifications/progress the backend sends mid-call
+// (relayed via progress.Relay, wired through backend.ChangeCallbacks.
+// OnProgress) reaches the downstream caller under its own token.
+func callHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, originalName string, progress *ProgressRegistry) mcp.ToolHandler {
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		start := time.Now()
 		ctx, span := startCallSpan(ctx, req.Extra, "tools/call",
@@ -358,12 +364,27 @@ func callHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, ori
 			attribute.String("mcp.tool.name", originalName))
 		defer span.End()
 
-		result, err := b.Session.CallTool(ctx, &mcp.CallToolParams{
-			Name:      originalName,
-			Arguments: req.Params.Arguments,
-		})
+		params := &mcp.CallToolParams{Name: originalName, Arguments: req.Params.Arguments}
+
+		var entry *progressEntry
+		if progress != nil {
+			if token := req.Params.GetProgressToken(); token != nil {
+				var internalToken uint64
+				var cleanup func()
+				internalToken, entry, cleanup = progress.Register(req.Session, token)
+				defer cleanup()
+				// SetProgressToken only accepts int/int32/int64/string (see
+				// go-sdk's setProgressToken); progress.Register hands out a
+				// uint64, so it must be narrowed to int64 here.
+				// normalizeProgressToken (progress.go) accepts int64 back,
+				// so this round-trips correctly on the relay side.
+				params.SetProgressToken(int64(internalToken))
+			}
+		}
+
+		result, err := b.Session.CallTool(ctx, params)
 		recordOutcome(span, err)
-		logCall(ctx, logger, "tool", "tool", originalName, b.Name, req.Session, req.Params.Arguments, maskKeys, start, err)
+		logCall(ctx, logger, "tool", "tool", originalName, b.Name, req.Session, req.Params.Arguments, maskKeys, start, err, entry)
 		return result, err
 	}
 }

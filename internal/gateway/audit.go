@@ -118,8 +118,11 @@ func hasArgs(args any) bool {
 // kind labels the log message ("tool"/"resource"/"resource template"/"prompt");
 // nameKey is the field name for name ("tool"/"uri"/"prompt" — resource and
 // resource template both use "uri"). args is nil for resource reads, which
-// have no call arguments.
-func logCall(ctx context.Context, logger *slog.Logger, kind, nameKey, name, backend string, sess *mcp.ServerSession, args any, maskKeys []string, start time.Time, err error) {
+// have no call arguments. progress is non-nil only for a tools/call that
+// carried a downstream progressToken (see callHandler); a nil progress, or
+// one whose Summary() count is zero, adds no progress fields to the log
+// line.
+func logCall(ctx context.Context, logger *slog.Logger, kind, nameKey, name, backend string, sess *mcp.ServerSession, args any, maskKeys []string, start time.Time, err error, progress *progressEntry) {
 	attrs := []any{
 		"backend", backend,
 		nameKey, name,
@@ -137,6 +140,14 @@ func logCall(ctx context.Context, logger *slog.Logger, kind, nameKey, name, back
 	}
 	if hasArgs(args) {
 		attrs = append(attrs, "arguments", maskArguments(args, maskKeys))
+	}
+	if progress != nil {
+		if count, lastMessage := progress.Summary(); count > 0 {
+			attrs = append(attrs, "progress_count", count)
+			if lastMessage != "" {
+				attrs = append(attrs, "progress_last_message", lastMessage)
+			}
+		}
 	}
 	if err != nil {
 		logger.Error(kind+" call failed", append(attrs, "error", err)...)
