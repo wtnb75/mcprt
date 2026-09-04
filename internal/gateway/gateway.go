@@ -69,6 +69,7 @@ type Server struct {
 	backends map[string]*backend.Backend
 	maskKeys []string
 	progress *ProgressRegistry
+	elicit   *ElicitationRouter
 
 	mu sync.Mutex
 
@@ -137,7 +138,7 @@ func emptyTable[T any](t *router.Table[T]) *router.Table[T] {
 // re-run router.Resolve when a backend reports its list has changed.
 // backends must contain an entry for every BackendName referenced in
 // tables (the caller builds both from the same set of connected backends).
-func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Tables, entries Entries, overrides Overrides, maskKeys []string, progress *ProgressRegistry) *Server {
+func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Tables, entries Entries, overrides Overrides, maskKeys []string, progress *ProgressRegistry, elicit *ElicitationRouter) *Server {
 	mcpSrv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{Logger: logger})
 
 	s := &Server{
@@ -146,6 +147,7 @@ func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Table
 		backends: backends,
 		maskKeys: maskKeys,
 		progress: progress,
+		elicit:   elicit,
 
 		toolEntries:   entries.Tools,
 		toolTable:     emptyTable(tables.Tools),
@@ -165,7 +167,7 @@ func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Table
 
 	if tables.Tools != nil {
 		for _, resolved := range tables.Tools.Items {
-			registerTool(mcpSrv, logger, backends, resolved, maskKeys, progress)
+			registerTool(mcpSrv, logger, backends, resolved, maskKeys, progress, elicit)
 		}
 	}
 	if tables.Resources != nil {
@@ -193,7 +195,7 @@ func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Table
 // need to take a validly-defined loser down with it. It reports whether
 // anything was registered, so a reconcile caller (see reconcile.go) can
 // clean up a stale prior registration when every candidate fails.
-func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Tool], maskKeys []string, progress *ProgressRegistry) (ok bool) {
+func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Tool], maskKeys []string, progress *ProgressRegistry, elicit *ElicitationRouter) (ok bool) {
 	candidates := append([]router.Candidate[*mcp.Tool]{{
 		Item:         resolved.Item,
 		BackendName:  resolved.BackendName,
@@ -202,7 +204,7 @@ func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*bac
 
 	for _, c := range candidates {
 		b := backends[c.BackendName]
-		if addTool(srv, logger, c.Item, callHandler(logger, maskKeys, b, c.OriginalName, progress)) {
+		if addTool(srv, logger, c.Item, callHandler(logger, maskKeys, b, c.OriginalName, progress, elicit)) {
 			return true
 		}
 	}
@@ -355,14 +357,24 @@ func promptGetHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend
 // downstream request carries a progressToken, it registers a fresh
 // correlation entry so a notifications/progress the backend sends mid-call
 // (relayed via progress.Relay, wired through backend.ChangeCallbacks.
-// OnProgress) reaches the downstream caller under its own token.
-func callHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, originalName string, progress *ProgressRegistry) mcp.ToolHandler {
+// OnProgress) reaches the downstream caller under its own token. When
+// elicit is non-nil, it records this call as in-flight against b for the
+// whole duration of the backend call, so a backend's elicitation/create
+// (relayed via elicit.Route, wired through backend.ChangeCallbacks.
+// OnElicit) can be routed back to req.Session when -- and only when --
+// this is the sole tools/call in flight against b.
+func callHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, originalName string, progress *ProgressRegistry, elicit *ElicitationRouter) mcp.ToolHandler {
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		start := time.Now()
 		ctx, span := startCallSpan(ctx, req.Extra, "tools/call",
 			attribute.String("mcp.backend", b.Name),
 			attribute.String("mcp.tool.name", originalName))
 		defer span.End()
+
+		if elicit != nil {
+			leave := elicit.Enter(b.Name, req.Session)
+			defer leave()
+		}
 
 		params := &mcp.CallToolParams{Name: originalName, Arguments: req.Params.Arguments}
 
