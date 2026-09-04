@@ -411,6 +411,52 @@ func TestConnect_PromptListChangedCallback(t *testing.T) {
 	}
 }
 
+// TestConnect_ProgressNotificationCallback checks that ChangeCallbacks.OnProgress
+// fires with the backend's notifications/progress payload when the backend
+// sends one mid-call, echoing back the progress token the client set on its
+// request.
+func TestConnect_ProgressNotificationCallback(t *testing.T) {
+	fakeServer := mcp.NewServer(&mcp.Implementation{Name: "fake", Version: "v1"}, nil)
+	fakeServer.AddTool(&mcp.Tool{Name: "slow", InputSchema: map[string]any{"type": "object"}},
+		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			if token := req.Params.GetProgressToken(); token != nil {
+				_ = req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
+					ProgressToken: token, Progress: 1, Total: 2, Message: "working",
+				})
+			}
+			return &mcp.CallToolResult{}, nil
+		})
+
+	srv := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return fakeServer }, nil))
+	defer srv.Close()
+
+	ctx := context.Background()
+	received := make(chan *mcp.ProgressNotificationParams, 1)
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL},
+		backend.ChangeCallbacks{OnProgress: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+			received <- req.Params
+		}})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	params := &mcp.CallToolParams{Name: "slow", Arguments: map[string]any{}}
+	params.SetProgressToken("client-token")
+	if _, err := b.Session.CallTool(ctx, params); err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+
+	select {
+	case p := <-received:
+		if p.ProgressToken != "client-token" || p.Message != "working" || p.Progress != 1 || p.Total != 2 {
+			t.Fatalf("OnProgress params = %+v, want ProgressToken=client-token Progress=1 Total=2 Message=working", p)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnProgress did not fire within 5s of the backend sending a progress notification")
+	}
+}
+
 // TestConnect_NilChangeCallbacks_NoHandlersRegistered checks that a nil
 // field on ChangeCallbacks leaves the corresponding SDK handler unset
 // (rather than, say, panicking or wiring a no-op that still advertises

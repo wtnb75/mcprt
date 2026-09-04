@@ -25,7 +25,8 @@ type Backend struct {
 }
 
 // ChangeCallbacks are invoked when a connected backend reports that its
-// tool/prompt/resource list has changed. Each func takes no arguments: MCP's
+// tool/prompt/resource list has changed, or sends a progress notification
+// for an in-flight call. Each OnXChanged func takes no arguments: MCP's
 // list_changed notifications carry no payload, they only signal "go
 // re-list." A nil field means "not interested" and leaves the corresponding
 // SDK handler unset.
@@ -33,6 +34,11 @@ type ChangeCallbacks struct {
 	OnToolsChanged     func()
 	OnPromptsChanged   func()
 	OnResourcesChanged func() // fires for notifications/resources/list_changed, which covers BOTH resources and resource templates per the MCP spec -- there is no separate resource-template notification
+	// OnProgress, if non-nil, is wired as the backend-facing mcp.Client's
+	// ProgressNotificationHandler -- unlike the three notification
+	// callbacks above, progress notifications carry a payload, so this
+	// field's signature matches the SDK handler's exactly.
+	OnProgress func(context.Context, *mcp.ProgressNotificationClientRequest)
 }
 
 // Connect starts (for stdio) or dials (for http) the backend described by
@@ -49,6 +55,9 @@ func Connect(ctx context.Context, cfg config.BackendConfig, cb ChangeCallbacks) 
 	}
 	if cb.OnResourcesChanged != nil {
 		clientOpts.ResourceListChangedHandler = func(context.Context, *mcp.ResourceListChangedRequest) { cb.OnResourcesChanged() }
+	}
+	if cb.OnProgress != nil {
+		clientOpts.ProgressNotificationHandler = cb.OnProgress
 	}
 	client := mcp.NewClient(&mcp.Implementation{Name: "mcprt", Version: "v1"}, clientOpts)
 
