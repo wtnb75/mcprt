@@ -213,9 +213,7 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 			<-sighupDone
 		}
 		for _, s := range live.takeAll() {
-			for _, b := range s.Backends() {
-				_ = b.Close()
-			}
+			closeBackends(logger, s.Backends())
 		}
 	}()
 
@@ -618,10 +616,24 @@ func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.Backen
 	}
 
 	backoff := backendBackoffMin
+	// consecutiveFailures tracks this backend's current run of connect
+	// failures, so only the first one logs at Error (an operator should
+	// notice a backend going down immediately) -- every failure after that,
+	// for as long as it stays down, logs at Warn instead. Without this, a
+	// backend down for hours logs a fresh Error line at least once a minute
+	// even at max backoff, which either pages on-call for a condition
+	// that's already known and retrying on its own, or trains them to
+	// ignore Error-level alerts altogether.
+	consecutiveFailures := 0
 	for {
 		c, err := connectAndList(ctx, logger, bc, cb)
 		if err != nil {
-			logger.Error("backend connect failed, retrying", "backend", bc.Name, "error", err, "retry_in", backoff)
+			consecutiveFailures++
+			level := slog.LevelWarn
+			if consecutiveFailures == 1 {
+				level = slog.LevelError
+			}
+			logger.Log(ctx, level, "backend connect failed, retrying", "backend", bc.Name, "error", err, "retry_in", backoff)
 			reportFirstAttempt()
 			select {
 			case <-ctx.Done():
@@ -632,6 +644,7 @@ func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.Backen
 			continue
 		}
 		backoff = backendBackoffMin
+		consecutiveFailures = 0
 
 		var gw *gateway.Server
 		if gwH != nil {
@@ -982,10 +995,19 @@ func scheduleDrain(logger *slog.Logger, oldSrv *gateway.Server, oldGenCancel con
 		if !live.take(oldSrv) {
 			return
 		}
-		for name, b := range oldSrv.Backends() {
-			if err := b.Close(); err != nil {
-				logger.Warn("closing superseded backend connection", "backend", name, "error", err)
-			}
-		}
+		closeBackends(logger, oldSrv.Backends())
 	})
+}
+
+// closeBackends closes every backend in backends, logging (at Warn) any
+// error Close returns instead of discarding it -- shared by runServer's
+// final shutdown and scheduleDrain's forced close, so a backend that fails
+// to shut down cleanly is visible in both paths rather than only the reload
+// one.
+func closeBackends(logger *slog.Logger, backends map[string]*backend.Backend) {
+	for name, b := range backends {
+		if err := b.Close(); err != nil {
+			logger.Warn("closing backend connection", "backend", name, "error", err)
+		}
+	}
 }
