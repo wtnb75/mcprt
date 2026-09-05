@@ -11,6 +11,50 @@ import (
 	"github.com/wtnb75/mcprt/internal/cli"
 )
 
+// TestInitAndImport_DefaultHTTPListenMatch checks that `mcprt init` and
+// `mcprt import` generate the exact same default HTTP listen address --
+// both are independent template generators for the same config.yaml shape,
+// and a default hardcoded separately in each risks drifting apart if one is
+// ever edited without the other.
+func TestInitAndImport_DefaultHTTPListenMatch(t *testing.T) {
+	initPath := filepath.Join(t.TempDir(), "init-config.yaml")
+	if err := cli.Execute(context.Background(), []string{"init", initPath}); err != nil {
+		t.Fatalf("Execute init: unexpected error: %v", err)
+	}
+	initData, err := os.ReadFile(initPath)
+	if err != nil {
+		t.Fatalf("reading init config: %v", err)
+	}
+	initCfg, err := config.Parse(initData)
+	if err != nil {
+		t.Fatalf("init config did not parse: %v\ncontent:\n%s", err, initData)
+	}
+
+	jsonPath := filepath.Join(t.TempDir(), "mcp.json")
+	if err := os.WriteFile(jsonPath, []byte(`{"mcpServers":{"fs":{"command":"npx","args":["-y","mcp-server-filesystem"]}}}`), 0o600); err != nil {
+		t.Fatalf("writing mcp.json: %v", err)
+	}
+	importPath := filepath.Join(t.TempDir(), "import-config.yaml")
+	root := cli.NewRootCmd()
+	root.SetArgs([]string{"import", jsonPath, importPath})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("Execute import: unexpected error: %v", err)
+	}
+	importData, err := os.ReadFile(importPath)
+	if err != nil {
+		t.Fatalf("reading import config: %v", err)
+	}
+	importCfg, err := config.Parse(importData)
+	if err != nil {
+		t.Fatalf("import config did not parse: %v\ncontent:\n%s", err, importData)
+	}
+
+	if initCfg.Listen.HTTP != importCfg.Listen.HTTP {
+		t.Fatalf("mcprt init default HTTP listen = %q, mcprt import default HTTP listen = %q, want them to match (both should come from the same shared default)",
+			initCfg.Listen.HTTP, importCfg.Listen.HTTP)
+	}
+}
+
 func TestInitCommand_WritesParsableConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 
