@@ -102,14 +102,12 @@ func TestElicitationRouter_DifferentBackendsAreIndependent(t *testing.T) {
 func TestElicitationRouter_ConcurrentEnterRouteLeave(t *testing.T) {
 	r := gateway.NewElicitationRouter()
 	var wg sync.WaitGroup
-	for i := 0; i < 50; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 50 {
+		wg.Go(func() {
 			leave := r.Enter("backend-a", &mcp.ServerSession{})
 			_, _ = r.Route("backend-a")
 			leave()
-		}()
+		})
 	}
 	wg.Wait()
 

@@ -92,8 +92,7 @@ func TestConnectBackends_TimesOutHungBackend(t *testing.T) {
 		{Name: "hung", Transport: "stdio", Command: []string{"sleep", "30"}},
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // stop the "hung" backend's supervisor from retrying forever after this test returns
+	ctx := t.Context() // stop the "hung" backend's supervisor from retrying forever after this test returns
 
 	done := make(chan struct{})
 	var conn connected
@@ -267,7 +266,7 @@ func TestConnectBackends_LogsSuccessfulConnect(t *testing.T) {
 	defer cancel()
 
 	var found bool
-	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(buf.String()), "\n") {
 		var rec struct {
 			Msg       string `json:"msg"`
 			Backend   string `json:"backend"`
@@ -613,7 +612,7 @@ func TestSuperviseBackend_LogsErrorOnceThenWarnForRepeatedFailures(t *testing.T)
 	}
 
 	var levels []string
-	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(buf.String()), "\n") {
 		var rec struct {
 			Level string `json:"level"`
 			Msg   string `json:"msg"`
@@ -768,7 +767,7 @@ func TestConnectBackends_ReturnsWithoutWaitingOutTimeoutForADeadBackend(t *testi
 // either. The iteration count below turns that coin flip into a
 // deterministic failure.
 func TestCollectConnectResults_KeepsResultAlreadyBufferedWhenDeadlineFires(t *testing.T) {
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		healthy := &connectResult{backend: &backend.Backend{Name: "healthy"}}
 		resultCh := make(chan indexedConnectResult, 2)
 		resultCh <- indexedConnectResult{1, healthy}
@@ -819,8 +818,7 @@ func serveIdenticalToolBackend(ln net.Listener, payload string) *http.Server {
 // re-registration of everything the (re)connecting backend owns.
 func TestConnectBackend_ReconnectRebindsHandlerAfterDisconnectMissedWhileHolderNil(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	addr := freeAddr(t)
 	ln, err := net.Listen("tcp", addr)
@@ -1017,7 +1015,7 @@ func TestBuildGateway_LogsNameConflictWithSingularKind(t *testing.T) {
 	defer cancel()
 
 	var rec map[string]any
-	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(buf.String()), "\n") {
 		var r map[string]any
 		if err := json.Unmarshal([]byte(line), &r); err == nil && r["event"] == gateway.EventNameConflict {
 			rec = r
@@ -1105,7 +1103,7 @@ func TestRunServer_LogsListening(t *testing.T) {
 	}
 
 	var found bool
-	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(buf.String()), "\n") {
 		var rec struct {
 			Msg   string `json:"msg"`
 			Stdio bool   `json:"stdio"`
@@ -2023,7 +2021,7 @@ func TestCloseBackends_LogsErrorInsteadOfDiscarding(t *testing.T) {
 	closeBackends(logger, map[string]*backend.Backend{"flaky": b})
 
 	var found bool
-	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(buf.String()), "\n") {
 		var rec struct {
 			Level   string `json:"level"`
 			Msg     string `json:"msg"`
@@ -2205,7 +2203,7 @@ func TestSuperviseBackend_OnElicit_BoundedByElicitTimeout(t *testing.T) {
 	// the same errors.Is(err, context.DeadlineExceeded) check in server.go,
 	// and nothing before this test asserted which one actually fires here.
 	var sawTimeout, sawFailed bool
-	for _, line := range strings.Split(strings.TrimSpace(logBuf.String()), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(logBuf.String()), "\n") {
 		var rec map[string]any
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
 			continue
@@ -2270,7 +2268,7 @@ func TestToolsChangedCallback_LogsReconciledEventOnSuccess(t *testing.T) {
 	toolsChangedCallback(ctx, logger, "fake", gwH)()
 
 	var rec map[string]any
-	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(buf.String()), "\n") {
 		var r map[string]any
 		if err := json.Unmarshal([]byte(line), &r); err == nil && r["event"] == gateway.EventListChangedReconciled {
 			rec = r

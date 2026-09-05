@@ -810,13 +810,11 @@ func superviseBackends(ctx context.Context, logger *slog.Logger, configs []confi
 	var firstAttempts, supervisors sync.WaitGroup
 	firstAttempts.Add(len(configs))
 	for i, bc := range configs {
-		supervisors.Add(1)
-		go func() {
-			defer supervisors.Done()
+		supervisors.Go(func() {
 			superviseBackend(ctx, logger, bc, gwH,
 				func(c *connectResult) { resultCh <- indexedConnectResult{i, c} },
 				firstAttempts.Done)
-		}()
+		})
 	}
 	firstAttemptsDone := make(chan struct{})
 	go func() { firstAttempts.Wait(); close(firstAttemptsDone) }()

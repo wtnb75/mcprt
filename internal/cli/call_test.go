@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -63,8 +64,7 @@ backends:
 	// review, finding 1). cancel() runs (via defer, LIFO) before
 	// backendA.Close() above, so any straggling supervisor stops retrying
 	// before the backend it would retry against goes away.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
 	}
@@ -93,8 +93,7 @@ backends:
 
 	// See TestCallCommand_Text's matching comment: a cancellable context so
 	// runCall's backend supervisor goroutine doesn't outlive this test.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
 	}
@@ -130,8 +129,7 @@ backends:
 
 	// See TestCallCommand_Text's matching comment: a cancellable context so
 	// runCall's backend supervisor goroutine doesn't outlive this test.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := cli.Execute(ctx, []string{"call", "--config", configPath, "echo"}); err != nil {
 		t.Fatalf("Execute: unexpected error calling with no --args: %v", err)
 	}
@@ -150,8 +148,7 @@ backends:
 
 	// See TestCallCommand_Text's matching comment: a cancellable context so
 	// runCall's backend supervisor goroutine doesn't outlive this test.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := cli.Execute(ctx, []string{"call", "--config", configPath, "does-not-exist"}); err == nil {
 		t.Fatal("Execute: expected error for unknown tool name, got nil")
 	}
@@ -175,8 +172,7 @@ backends:
 	// rather than special-cased per test, since it costs nothing here and
 	// keeps the pattern obviously safe against a future reordering inside
 	// runCall.)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := cli.Execute(ctx, []string{"call", "--config", configPath, "--args", "not json", "echo"}); err == nil {
 		t.Fatal("Execute: expected error for invalid --args JSON, got nil")
 	}
@@ -195,8 +191,7 @@ backends:
 
 	// See TestCallCommand_Text's matching comment: a cancellable context so
 	// runCall's backend supervisor goroutine doesn't outlive this test.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := cli.Execute(ctx, []string{"call", "--config", configPath, "boom"}); err == nil {
 		t.Fatal("Execute: expected a non-nil error when the tool result has IsError=true, got nil")
 	}
@@ -251,8 +246,7 @@ backends:
 	root.SetErr(&errOut)
 	root.SetArgs([]string{"call", "--config", configPath, "--args", `{"message":"hi","api_key":"secret-value"}`, "echo"})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("call: %v", err)
 	}
@@ -285,7 +279,7 @@ backends:
 // buffer for debugging) if no line matches.
 func findLogLine(t *testing.T, logged, anchor string) string {
 	t.Helper()
-	for _, line := range strings.Split(logged, "\n") {
+	for line := range strings.SplitSeq(logged, "\n") {
 		if strings.Contains(line, anchor) {
 			return line
 		}
@@ -307,12 +301,7 @@ func findLogLine(t *testing.T, logged, anchor string) string {
 // into strings.Contains.
 func hasField(line, key, value string) bool {
 	want := key + "=" + value
-	for _, tok := range strings.Fields(line) {
-		if tok == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(strings.Fields(line), want)
 }
 
 // TestCallCommand_LogsAuditLineOnFailure checks the failure path: a tool
@@ -350,8 +339,7 @@ backends:
 	root.SetErr(&errOut)
 	root.SetArgs([]string{"call", "--config", configPath, "explode"})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := root.ExecuteContext(ctx); err == nil {
 		t.Fatal("call explode: got no error, want one (the tool handler always returns an error)")
 	}

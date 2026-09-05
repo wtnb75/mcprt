@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"sync"
 	"time"
@@ -138,9 +139,7 @@ func (s *Server) Backends() map[string]*backend.Backend {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make(map[string]*backend.Backend, len(s.backends))
-	for k, v := range s.backends {
-		out[k] = v
-	}
+	maps.Copy(out, s.backends)
 	return out
 }
 

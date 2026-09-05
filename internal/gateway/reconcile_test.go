@@ -221,7 +221,7 @@ func TestUpdateTools_ConcurrentCallsDoNotRace(t *testing.T) {
 	})
 
 	var wg sync.WaitGroup
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		wg.Add(2)
 		go func(i int) {
 			defer wg.Done()
@@ -360,7 +360,7 @@ func TestUpdateResourcesAndUpdatePrompts_ConcurrentCallsDoNotRace(t *testing.T) 
 	})
 
 	var wg sync.WaitGroup
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
@@ -591,7 +591,7 @@ func TestConnectBackend_ConcurrentWithUpdateToolsDoesNotRace(t *testing.T) {
 	})
 
 	var wg sync.WaitGroup
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
