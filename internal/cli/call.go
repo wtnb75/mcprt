@@ -90,7 +90,7 @@ func runCall(ctx context.Context, cmd *cobra.Command, configPath, toolName, args
 
 	start := time.Now()
 	result, err := b.Session.CallTool(ctx, &mcp.CallToolParams{Name: resolved.OriginalName, Arguments: arguments})
-	logCLICall(logger, resolved.BackendName, toolName, arguments, cfg.Logging.MaskKeys, start, err)
+	logCLICall(logger, resolved.BackendName, toolName, resolved.OriginalName, arguments, cfg.Logging.MaskKeys, start, err)
 	if err != nil {
 		return fmt.Errorf("calling tool %q: %w", toolName, err)
 	}
@@ -118,10 +118,21 @@ func runCall(ctx context.Context, cmd *cobra.Command, configPath, toolName, args
 // (distinct from logCall's "tool call"/"tool call failed") so a log
 // pipeline that also ingests mcprt server's audit log can tell a
 // human-operator-invoked call apart from one the gateway relayed.
-func logCLICall(logger *slog.Logger, backendName, tool string, arguments any, maskKeys []string, start time.Time, err error) {
+//
+// tool and originalTool can differ: tool is the gateway-exposed name the
+// operator typed on the command line (the more intuitive value for a human
+// reading this invocation's own log line), while originalTool is the name
+// as the backend itself knows it -- the same value logCall logs under its
+// own "tool" key. A backend config's prefix or the gateway's overrides
+// config can rename a tool between the two, so for a call through such a
+// backend these two names diverge for what is otherwise the exact same
+// underlying call. Logging both lets an operator grep either name and find
+// the matching line in both mcprt call's and mcprt server's audit logs.
+func logCLICall(logger *slog.Logger, backendName, tool, originalTool string, arguments any, maskKeys []string, start time.Time, err error) {
 	attrs := []any{
 		"backend", backendName,
 		"tool", tool,
+		"original_tool", originalTool,
 		"duration_ms", time.Since(start).Milliseconds(),
 	}
 	if arguments != nil {

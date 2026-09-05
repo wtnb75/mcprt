@@ -258,21 +258,40 @@ backends:
 	}
 
 	logged := errOut.String()
-	if !strings.Contains(logged, "cli tool call") {
-		t.Fatalf("log output = %q, want a \"cli tool call\" line", logged)
+	line := findLogLine(t, logged, `msg="cli tool call"`)
+	if !strings.Contains(line, "backend=backend-a") {
+		t.Fatalf("log line = %q, want backend=backend-a", line)
 	}
-	if !strings.Contains(logged, "backend=backend-a") {
-		t.Fatalf("log output = %q, want backend=backend-a", logged)
+	if !strings.Contains(line, "tool=echo") {
+		t.Fatalf("log line = %q, want tool=echo", line)
 	}
-	if !strings.Contains(logged, "tool=echo") {
-		t.Fatalf("log output = %q, want tool=echo", logged)
+	if !strings.Contains(line, "original_tool=echo") {
+		t.Fatalf("log line = %q, want original_tool=echo", line)
 	}
-	if strings.Contains(logged, "secret-value") {
-		t.Fatalf("log output = %q, want api_key's value masked, not present in plaintext", logged)
+	if strings.Contains(line, "secret-value") {
+		t.Fatalf("log line = %q, want api_key's value masked, not present in plaintext", line)
 	}
-	if !strings.Contains(logged, "***") {
-		t.Fatalf("log output = %q, want a masked (***) value present", logged)
+	if !strings.Contains(line, "***") {
+		t.Fatalf("log line = %q, want a masked (***) value present", line)
 	}
+}
+
+// findLogLine splits logged on newlines and returns the first line
+// containing anchor -- a msg="..." fragment naming the exact log message
+// (slog's TextHandler quotes a message containing spaces, so e.g.
+// msg="cli tool call" is not a substring of msg="cli tool call failed",
+// which lets callers pick out one specific line rather than accidentally
+// matching a similarly-named one). It fails the test (showing the whole
+// buffer for debugging) if no line matches.
+func findLogLine(t *testing.T, logged, anchor string) string {
+	t.Helper()
+	for _, line := range strings.Split(logged, "\n") {
+		if strings.Contains(line, anchor) {
+			return line
+		}
+	}
+	t.Fatalf("log output = %q, want a line containing %s", logged, anchor)
+	return ""
 }
 
 // TestCallCommand_LogsAuditLineOnFailure checks the failure path: a tool
@@ -317,10 +336,14 @@ backends:
 	}
 
 	logged := errOut.String()
-	if !strings.Contains(logged, "cli tool call failed") {
-		t.Fatalf("log output = %q, want a \"cli tool call failed\" line", logged)
+	line := findLogLine(t, logged, `msg="cli tool call failed"`)
+	if !strings.Contains(line, "backend=backend-a") || !strings.Contains(line, "tool=explode") {
+		t.Fatalf("log line = %q, want backend=backend-a and tool=explode", line)
 	}
-	if !strings.Contains(logged, "backend=backend-a") || !strings.Contains(logged, "tool=explode") {
-		t.Fatalf("log output = %q, want backend=backend-a and tool=explode", logged)
+	if !strings.Contains(line, "error=") {
+		t.Fatalf("log line = %q, want an error= field", line)
+	}
+	if !strings.Contains(line, "boom") {
+		t.Fatalf("log line = %q, want the error message (\"boom\") present", line)
 	}
 }
