@@ -121,7 +121,7 @@ func TestHeaderRoundTripper(t *testing.T) {
 		gotHeader = req.Header.Get("Authorization")
 		return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
 	})
-	rt := headerRoundTripper{headers: map[string]string{"Authorization": "Bearer xyz"}, base: base}
+	rt := headerRoundTripper{headers: map[string]string{"Authorization": "Bearer xyz"}, host: "example.com", base: base}
 	req, err := http.NewRequest(http.MethodGet, "http://example.com", nil)
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
@@ -131,5 +131,29 @@ func TestHeaderRoundTripper(t *testing.T) {
 	}
 	if gotHeader != "Bearer xyz" {
 		t.Fatalf("Authorization header = %q, want %q", gotHeader, "Bearer xyz")
+	}
+}
+
+func TestHeaderRoundTripper_CrossHostRedirect_DoesNotLeakHeaders(t *testing.T) {
+	var gotHeader string
+	var sawHeader bool
+	base := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		gotHeader = req.Header.Get("Authorization")
+		_, sawHeader = req.Header["Authorization"]
+		return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
+	})
+	rt := headerRoundTripper{headers: map[string]string{"Authorization": "Bearer xyz"}, host: "example.com", base: base}
+	// Simulates the request net/http builds for a cross-host redirect hop:
+	// same RoundTripper, but req.URL now points at a different host, and
+	// net/http has already stripped Authorization from req.Header.
+	req, err := http.NewRequest(http.MethodGet, "http://attacker.example.com", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	if _, err := rt.RoundTrip(req); err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	if sawHeader {
+		t.Fatalf("Authorization header leaked to cross-host redirect target: %q", gotHeader)
 	}
 }

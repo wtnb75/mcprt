@@ -92,9 +92,13 @@ func Connect(ctx context.Context, cfg config.BackendConfig, cb ChangeCallbacks) 
 		if err != nil {
 			return nil, fmt.Errorf("backend %q: %w", cfg.Name, err)
 		}
+		endpoint, err := url.Parse(cfg.URL)
+		if err != nil {
+			return nil, fmt.Errorf("backend %q: invalid url: %w", cfg.Name, err)
+		}
 		transport = &mcp.StreamableClientTransport{
 			Endpoint:   cfg.URL,
-			HTTPClient: &http.Client{Transport: tracingRoundTripper{base: headerRoundTripper{headers: cfg.Headers, base: base}}},
+			HTTPClient: &http.Client{Transport: tracingRoundTripper{base: headerRoundTripper{headers: cfg.Headers, host: endpoint.Host, base: base}}},
 		}
 	default:
 		return nil, fmt.Errorf("backend %q: unknown transport %q", cfg.Name, cfg.Transport)
@@ -293,16 +297,25 @@ var defaultTransportTemplate = func() *http.Transport {
 }()
 
 // headerRoundTripper injects fixed headers (e.g. an Authorization token)
-// into every outgoing request to a remote HTTP backend.
+// into outgoing requests to a remote HTTP backend. It only injects them
+// when req.URL.Host matches the backend's configured host: net/http calls
+// the same RoundTripper again for a redirect hop, after already stripping
+// sensitive headers (Authorization, Cookie, ...) from req.Header if the
+// hop crosses hosts, and re-adding them unconditionally here would defeat
+// that protection and leak credentials to whatever host the backend (or an
+// attacker controlling it) redirects to.
 type headerRoundTripper struct {
 	headers map[string]string
+	host    string
 	base    http.RoundTripper
 }
 
 func (h headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	req = req.Clone(req.Context())
-	for k, v := range h.headers {
-		req.Header.Set(k, v)
+	if req.URL.Host == h.host {
+		for k, v := range h.headers {
+			req.Header.Set(k, v)
+		}
 	}
 	return h.base.RoundTrip(req)
 }
