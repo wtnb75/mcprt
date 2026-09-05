@@ -262,10 +262,10 @@ backends:
 	if !strings.Contains(line, "backend=backend-a") {
 		t.Fatalf("log line = %q, want backend=backend-a", line)
 	}
-	if !strings.Contains(line, "tool=echo") {
+	if !hasField(line, "tool", "echo") {
 		t.Fatalf("log line = %q, want tool=echo", line)
 	}
-	if !strings.Contains(line, "original_tool=echo") {
+	if !hasField(line, "original_tool", "echo") {
 		t.Fatalf("log line = %q, want original_tool=echo", line)
 	}
 	if strings.Contains(line, "secret-value") {
@@ -292,6 +292,27 @@ func findLogLine(t *testing.T, logged, anchor string) string {
 	}
 	t.Fatalf("log output = %q, want a line containing %s", logged, anchor)
 	return ""
+}
+
+// hasField reports whether line -- a single slog TextHandler log line --
+// carries a space-separated key=value token exactly matching key=value.
+// This is NOT the same as strings.Contains(line, key+"="+value): logCLICall
+// emits both "tool" and "original_tool" on the same line, and
+// "original_tool=echo" contains "tool=echo" as a plain substring (the
+// "_tool=echo" tail of "original_tool=echo"), so a bare Contains check for
+// "tool=echo" would still pass even if the "tool" key itself were dropped
+// and only "original_tool" remained. Splitting on spaces (TextHandler
+// always separates key=value pairs with exactly one space) and comparing a
+// whole token avoids that collision. Do not "simplify" callers of this back
+// into strings.Contains.
+func hasField(line, key, value string) bool {
+	want := key + "=" + value
+	for _, tok := range strings.Fields(line) {
+		if tok == want {
+			return true
+		}
+	}
+	return false
 }
 
 // TestCallCommand_LogsAuditLineOnFailure checks the failure path: a tool
@@ -337,7 +358,7 @@ backends:
 
 	logged := errOut.String()
 	line := findLogLine(t, logged, `msg="cli tool call failed"`)
-	if !strings.Contains(line, "backend=backend-a") || !strings.Contains(line, "tool=explode") {
+	if !strings.Contains(line, "backend=backend-a") || !hasField(line, "tool", "explode") {
 		t.Fatalf("log line = %q, want backend=backend-a and tool=explode", line)
 	}
 	if !strings.Contains(line, "error=") {
