@@ -202,9 +202,27 @@ func validate(cfg *Config) error {
 			if len(b.Command) == 0 {
 				return fmt.Errorf("backend %q: stdio transport requires command", b.Name)
 			}
+			if b.URL != "" {
+				return fmt.Errorf("backend %q: url is only valid for http transport", b.Name)
+			}
+			if len(b.Headers) > 0 {
+				return fmt.Errorf("backend %q: headers is only valid for http transport", b.Name)
+			}
+			if b.Proxy != "" {
+				return fmt.Errorf("backend %q: proxy is only valid for http transport", b.Name)
+			}
 		case "http":
 			if b.URL == "" {
 				return fmt.Errorf("backend %q: http transport requires url", b.Name)
+			}
+			if len(b.Command) > 0 {
+				return fmt.Errorf("backend %q: command is only valid for stdio transport", b.Name)
+			}
+			if b.Dir != "" {
+				return fmt.Errorf("backend %q: dir is only valid for stdio transport", b.Name)
+			}
+			if len(b.Env) > 0 {
+				return fmt.Errorf("backend %q: env is only valid for stdio transport", b.Name)
 			}
 		default:
 			return fmt.Errorf("backend %q: unknown transport %q (must be \"stdio\" or \"http\")", b.Name, b.Transport)

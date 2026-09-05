@@ -113,6 +113,86 @@ backends:
 	}
 }
 
+func TestParse_StdioWithURLSetErrors(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: stdio
+    command: ["a"]
+    url: "http://localhost:9090/mcp"
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for stdio backend with url set (likely a stale transport left over from an http->stdio migration mistake), got nil")
+	}
+}
+
+func TestParse_StdioWithHeadersSetErrors(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: stdio
+    command: ["a"]
+    headers:
+      Authorization: "Bearer xyz"
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for stdio backend with headers set, got nil")
+	}
+}
+
+func TestParse_StdioWithProxySetErrors(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: stdio
+    command: ["a"]
+    proxy: "http://proxy.example.com:8080"
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for stdio backend with proxy set, got nil")
+	}
+}
+
+func TestParse_HTTPWithCommandSetErrors(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: http
+    url: "http://localhost:9090/mcp"
+    command: ["a"]
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for http backend with command set (likely a stale transport left over from a stdio->http migration mistake), got nil")
+	}
+}
+
+func TestParse_HTTPWithDirSetErrors(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: http
+    url: "http://localhost:9090/mcp"
+    dir: "/some/dir"
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for http backend with dir set, got nil")
+	}
+}
+
+func TestParse_HTTPWithEnvSetErrors(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: http
+    url: "http://localhost:9090/mcp"
+    env:
+      FOO: bar
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for http backend with env set, got nil")
+	}
+}
+
 func TestParse_EnvFile(t *testing.T) {
 	// BAR references FOO within the file itself: godotenv expands ${VAR}
 	// refs against vars already parsed from the same file, not the host
