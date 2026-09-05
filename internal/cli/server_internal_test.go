@@ -359,8 +359,12 @@ func TestSuperviseBackend_ReconnectsAfterDisconnect(t *testing.T) {
 	}
 
 	toolTable := router.Resolve(conn.toolEntries, gateway.ToolNameOf, gateway.ToolRename, nil)
-	srv := gateway.New(logger, conn.backends, gateway.Tables{Tools: toolTable},
-		gateway.Entries{Tools: conn.toolEntries}, gateway.Overrides{}, nil, nil, nil)
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: conn.backends,
+		Tables:   gateway.Tables{Tools: toolTable},
+		Entries:  gateway.Entries{Tools: conn.toolEntries},
+	})
 	gwH.ptr.Store(srv)
 	// These three defers run in the OPPOSITE order they're registered in
 	// (LIFO), so registering them bottom-to-top of the intended sequence
@@ -499,7 +503,7 @@ func TestSuperviseBackend_LateConnectJoinsViaConnectBackend(t *testing.T) {
 		t.Fatalf("backends = %v, want \"late\" excluded (nothing was listening within backendConnectTimeout)", conn.backends)
 	}
 
-	srv := gateway.New(logger, conn.backends, gateway.Tables{}, gateway.Entries{}, gateway.Overrides{}, nil, nil, nil)
+	srv := gateway.New(gateway.NewConfig{Logger: logger, Backends: conn.backends})
 	gwH.ptr.Store(srv) // matches buildGateway: gwH.ptr is populated right after gateway.New
 
 	// Now start listening on the SAME address the config already points at.
@@ -777,8 +781,12 @@ func TestConnectBackend_ReconnectRebindsHandlerAfterDisconnectMissedWhileHolderN
 	}
 	entries := []router.Entry[*mcp.Tool]{{BackendName: bc.Name, Items: c1.tools}}
 	table := router.Resolve(entries, gateway.ToolNameOf, gateway.ToolRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{bc.Name: c1.backend},
-		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil, nil, nil)
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{bc.Name: c1.backend},
+		Tables:   gateway.Tables{Tools: table},
+		Entries:  gateway.Entries{Tools: entries},
+	})
 
 	// 2. The disconnect lands while gwH.ptr is still nil, so no clear runs:
 	//    the gateway keeps serving "ping" through c1's dead connection.
@@ -1842,16 +1850,16 @@ func TestScheduleDrain_ForceClosesBackendsAfterTimeout(t *testing.T) {
 //
 // It wires the real production path (connectBackendsWaitable, i.e.
 // superviseBackends/superviseBackend, with a real *gateway.ElicitationRouter
-// in gwH.elicit) against a real backend whose "ask" tool calls
+// in gwH.relays.Elicit) against a real backend whose "ask" tool calls
 // req.Session.Elicit. Rather than routing that elicitation through a full
 // gateway.Server and a downstream client connected to it (already covered
 // end-to-end by TestServerCommand_RoutesElicitationToDownstreamClient in
 // server_test.go), it Enters a stand-in downstream session directly into
-// gwH.elicit -- exactly what gateway.callHandler would do around a real
-// tools/call, just done here by hand so the test can control precisely how
-// that session behaves. That stand-in session's ElicitationHandler blocks
-// on a channel the test only closes at cleanup, so it never itself answers;
-// the only thing that can end the wait is cb.OnElicit's own
+// gwH.relays.Elicit -- exactly what gateway.callHandler would do around a
+// real tools/call, just done here by hand so the test can control precisely
+// how that session behaves. That stand-in session's ElicitationHandler
+// blocks on a channel the test only closes at cleanup, so it never itself
+// answers; the only thing that can end the wait is cb.OnElicit's own
 // context.WithTimeout(ctx, elicitTimeout).
 func TestSuperviseBackend_OnElicit_BoundedByElicitTimeout(t *testing.T) {
 	origElicitTimeout := elicitTimeout
@@ -1866,7 +1874,7 @@ func TestSuperviseBackend_OnElicit_BoundedByElicitTimeout(t *testing.T) {
 	t.Cleanup(func() { close(blockElicit) })
 
 	// stubSrv/stubClient exist solely to hand this test a real
-	// *mcp.ServerSession to Enter into gwH.elicit -- ElicitationRouter's
+	// *mcp.ServerSession to Enter into gwH.relays.Elicit -- ElicitationRouter's
 	// live map is typed *mcp.ServerSession, which cannot be faked with an
 	// interface, so a genuine (if otherwise unused) MCP connection is the
 	// only way to get one. Capturing req.Session from a tool call is the
@@ -1933,7 +1941,7 @@ func TestSuperviseBackend_OnElicit_BoundedByElicitTimeout(t *testing.T) {
 	// just cancelling ctx and trusting it happens eventually.
 	defer func() { waitSupervisorsDone(t, supervisorsDone) }()
 
-	gwH := &gwHolder{elicit: gateway.NewElicitationRouter()}
+	gwH := &gwHolder{relays: gateway.Relays{Elicit: gateway.NewElicitationRouter()}}
 	conn, supervisorsDone := connectBackendsWaitable(ctx, logger,
 		[]config.BackendConfig{{Name: "fake", Transport: "http", URL: backendHTTP.URL}}, gwH)
 	b, ok := conn.backends["fake"]
@@ -1947,7 +1955,7 @@ func TestSuperviseBackend_OnElicit_BoundedByElicitTimeout(t *testing.T) {
 	// "fake", exactly as gateway.callHandler's Enter/leave pair would do
 	// around a real tools/call -- done directly here since this test only
 	// needs cb.OnElicit's timeout behavior, not the routing machinery.
-	leave := gwH.elicit.Enter("fake", capturedSession)
+	leave := gwH.relays.Elicit.Enter("fake", capturedSession)
 	defer leave()
 
 	callCtx, callCancel := context.WithTimeout(context.Background(), 5*time.Second)

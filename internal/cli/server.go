@@ -279,8 +279,10 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 	}
 
 	var gwH gwHolder
-	gwH.progress = gateway.NewProgressRegistry()
-	gwH.elicit = gateway.NewElicitationRouter()
+	gwH.relays = gateway.Relays{
+		Progress: gateway.NewProgressRegistry(),
+		Elicit:   gateway.NewElicitationRouter(),
+	}
 	conn := connectBackends(ctx, logger, cfg.Backends, &gwH)
 
 	toolTable := router.Resolve(conn.toolEntries, gateway.ToolNameOf, gateway.ToolRename, cfg.Overrides)
@@ -303,22 +305,30 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 		logger.Warn("prompt name conflict", "prompt", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
 
-	srv := gateway.New(logger, conn.backends, gateway.Tables{
-		Tools:             toolTable,
-		Resources:         resourceTable,
-		ResourceTemplates: resourceTemplateTable,
-		Prompts:           promptTable,
-	}, gateway.Entries{
-		Tools:             conn.toolEntries,
-		Resources:         conn.resourceEntries,
-		ResourceTemplates: conn.resourceTemplateEntries,
-		Prompts:           conn.promptEntries,
-	}, gateway.Overrides{
-		Tools:             cfg.Overrides,
-		Resources:         cfg.ResourceOverrides,
-		ResourceTemplates: cfg.ResourceTemplateOverrides,
-		Prompts:           cfg.PromptOverrides,
-	}, cfg.Logging.MaskKeys, gwH.progress, gwH.elicit)
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: conn.backends,
+		Tables: gateway.Tables{
+			Tools:             toolTable,
+			Resources:         resourceTable,
+			ResourceTemplates: resourceTemplateTable,
+			Prompts:           promptTable,
+		},
+		Entries: gateway.Entries{
+			Tools:             conn.toolEntries,
+			Resources:         conn.resourceEntries,
+			ResourceTemplates: conn.resourceTemplateEntries,
+			Prompts:           conn.promptEntries,
+		},
+		Overrides: gateway.Overrides{
+			Tools:             cfg.Overrides,
+			Resources:         cfg.ResourceOverrides,
+			ResourceTemplates: cfg.ResourceTemplateOverrides,
+			Prompts:           cfg.PromptOverrides,
+		},
+		MaskKeys: cfg.Logging.MaskKeys,
+		Relays:   gwH.relays,
+	})
 	gwH.ptr.Store(srv)
 
 	return srv, nil
@@ -333,17 +343,16 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 // runServer is about to do anyway will reflect the same change, so nothing
 // is permanently lost.
 //
-// progress and elicit are each set once, before connectBackends spawns any
-// supervisor goroutine, and never mutated afterward -- so reading either
-// from those goroutines needs no lock (the write happens-before every
-// goroutine's creation). A nil progress/elicit (buildGateway always sets
-// both; only some tests construct a bare gwHolder{} without them) means "no
-// progress relay/elicitation routing for this generation," matching a nil
-// *gateway.ProgressRegistry/*gateway.ElicitationRouter everywhere else.
+// relays is set once, before connectBackends spawns any supervisor
+// goroutine, and never mutated afterward -- so reading it from those
+// goroutines needs no lock (the write happens-before every goroutine's
+// creation). A zero-value relays (buildGateway always sets both of its
+// fields; only some tests construct a bare gwHolder{} without them) means
+// "no progress relay/elicitation routing for this generation," matching a
+// nil *gateway.ProgressRegistry/*gateway.ElicitationRouter everywhere else.
 type gwHolder struct {
-	ptr      atomic.Pointer[gateway.Server]
-	progress *gateway.ProgressRegistry
-	elicit   *gateway.ElicitationRouter
+	ptr    atomic.Pointer[gateway.Server]
+	relays gateway.Relays
 }
 
 // toolsChangedCallback returns a func to use as backend.ChangeCallbacks.
@@ -557,14 +566,14 @@ func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.Backen
 			OnResourcesChanged: resourcesChangedCallback(ctx, logger, bc.Name, gwH),
 			OnPromptsChanged:   promptsChangedCallback(ctx, logger, bc.Name, gwH),
 		}
-		if gwH.progress != nil {
+		if gwH.relays.Progress != nil {
 			cb.OnProgress = func(ctx context.Context, req *mcp.ProgressNotificationClientRequest) {
-				gwH.progress.Relay(ctx, logger, bc.Name, req.Params)
+				gwH.relays.Progress.Relay(ctx, logger, bc.Name, req.Params)
 			}
 		}
-		if gwH.elicit != nil {
+		if gwH.relays.Elicit != nil {
 			cb.OnElicit = func(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
-				session, err := gwH.elicit.Route(bc.Name)
+				session, err := gwH.relays.Elicit.Route(bc.Name)
 				if err != nil {
 					logger.Warn("elicitation: cannot route to a downstream session, refusing", "backend", bc.Name, "error", err)
 					return nil, err
