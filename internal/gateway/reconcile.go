@@ -109,6 +109,27 @@ func boundTo[T any](resolved *router.Resolved[T], backendName string) bool {
 	return false
 }
 
+// touchedBy reports whether name's resolution could possibly have changed
+// as a result of backendName's own entry changing -- true if backendName is
+// a candidate (winner or fallback, see boundTo) for name in EITHER the old
+// resolved value (old, valid only when hadOld) or the new one (resolved).
+//
+// router.Resolve builds an exposed name's candidate set entirely from the
+// entries that currently produce that name (see Resolve): a single
+// UpdateTools/UpdateResources/UpdatePrompts call only ever changes
+// backendName's own entry, so if backendName was not a candidate for name
+// before AND is not one now, nothing about name's candidate set changed at
+// all, and its resolution is therefore guaranteed byte-for-byte identical
+// to before -- reflect.DeepEqual would always report "unchanged" for it.
+// Skipping those names outright, instead of running reflect.DeepEqual
+// against every name in the WHOLE merged table on every single backend's
+// list_changed, is what keeps one backend's reconcile cost proportional to
+// that backend's own item count, not the total across every connected
+// backend.
+func touchedBy[T any](resolved, old *router.Resolved[T], hadOld bool, backendName string) bool {
+	return boundTo(resolved, backendName) || (hadOld && boundTo(old, backendName))
+}
+
 // UpdateTools replaces backendName's tool entry with items, re-resolves the
 // merged table, and applies the diff (Remove vanished names, Add
 // new/changed names) to the underlying *mcp.Server. Called from the cli
@@ -143,6 +164,9 @@ func (s *Server) updateToolsLocked(backendName string, items []*mcp.Tool, rebind
 	}
 	for name, resolved := range newTable.Items {
 		old, ok := s.toolTable.Items[name]
+		if !touchedBy(resolved, old, ok, backendName) {
+			continue
+		}
 		unchanged := ok && reflect.DeepEqual(old, resolved)
 		if unchanged && (!rebind || !boundTo(resolved, backendName)) {
 			continue
@@ -185,6 +209,9 @@ func (s *Server) updateResourcesLocked(backendName string, resources []*mcp.Reso
 	}
 	for name, resolved := range newResourceTable.Items {
 		old, ok := s.resourceTable.Items[name]
+		if !touchedBy(resolved, old, ok, backendName) {
+			continue
+		}
 		unchanged := ok && reflect.DeepEqual(old, resolved)
 		if unchanged && (!rebind || !boundTo(resolved, backendName)) {
 			continue
@@ -203,6 +230,9 @@ func (s *Server) updateResourcesLocked(backendName string, resources []*mcp.Reso
 	}
 	for name, resolved := range newTemplateTable.Items {
 		old, ok := s.resourceTemplateTable.Items[name]
+		if !touchedBy(resolved, old, ok, backendName) {
+			continue
+		}
 		unchanged := ok && reflect.DeepEqual(old, resolved)
 		if unchanged && (!rebind || !boundTo(resolved, backendName)) {
 			continue
@@ -235,6 +265,9 @@ func (s *Server) updatePromptsLocked(backendName string, items []*mcp.Prompt, re
 	}
 	for name, resolved := range newTable.Items {
 		old, ok := s.promptTable.Items[name]
+		if !touchedBy(resolved, old, ok, backendName) {
+			continue
+		}
 		unchanged := ok && reflect.DeepEqual(old, resolved)
 		if unchanged && (!rebind || !boundTo(resolved, backendName)) {
 			continue
