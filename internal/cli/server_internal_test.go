@@ -1976,3 +1976,63 @@ func TestSuperviseBackend_OnElicit_BoundedByElicitTimeout(t *testing.T) {
 		t.Fatalf("call \"ask\" result = %+v, err = %v; want an error surfaced once the relayed elicitation timed out", res, callErr)
 	}
 }
+
+// TestToolsChangedCallback_LogsReconciledEventOnSuccess checks that a
+// successful list_changed reconcile now emits a "list_changed_reconciled"
+// gateway event (via gateway.LogEvent) -- previously nothing was logged on
+// this path at all, only on failure.
+func TestToolsChangedCallback_LogsReconciledEventOnSuccess(t *testing.T) {
+	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	mcp.AddTool(backendSrv, &mcp.Tool{Name: "ping", Description: "ping"},
+		func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
+			return nil, struct{}{}, nil
+		})
+	httpBackend := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil))
+	defer httpBackend.Close()
+
+	ctx := context.Background()
+	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: httpBackend.URL}, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	tools, err := conn.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("list tools: %v", err)
+	}
+
+	entries := []router.Entry[*mcp.Tool]{{BackendName: "fake", Items: tools}}
+	table := router.Resolve(entries, gateway.ToolNameOf, gateway.ToolRename, nil)
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"fake": conn},
+		Tables:   gateway.Tables{Tools: table},
+		Entries:  gateway.Entries{Tools: entries},
+	})
+
+	gwH := &gwHolder{}
+	gwH.ptr.Store(srv)
+
+	toolsChangedCallback(ctx, logger, "fake", gwH)()
+
+	var rec map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var r map[string]any
+		if err := json.Unmarshal([]byte(line), &r); err == nil && r["event"] == "list_changed_reconciled" {
+			rec = r
+			break
+		}
+	}
+	if rec == nil {
+		t.Fatalf("log output = %q, want a line with event=list_changed_reconciled", buf.String())
+	}
+	if rec["backend"] != "fake" || rec["kind"] != "tools" {
+		t.Fatalf("backend/kind = %v/%v, want fake/tools", rec["backend"], rec["kind"])
+	}
+	if rec["count"] != float64(1) { // JSON numbers decode as float64
+		t.Fatalf("count = %v, want 1", rec["count"])
+	}
+}

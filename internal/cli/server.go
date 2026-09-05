@@ -287,22 +287,22 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 
 	toolTable := router.Resolve(conn.toolEntries, gateway.ToolNameOf, gateway.ToolRename, cfg.Overrides)
 	for _, c := range toolTable.Conflicts {
-		logger.Warn("tool name conflict", "tool", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
+		gateway.LogEvent(ctx, logger, slog.LevelWarn, "name_conflict", "kind", "tool", "name", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
 
 	resourceTable := router.Resolve(conn.resourceEntries, gateway.ResourceNameOf, gateway.ResourceRename, cfg.ResourceOverrides)
 	for _, c := range resourceTable.Conflicts {
-		logger.Warn("resource URI conflict", "uri", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
+		gateway.LogEvent(ctx, logger, slog.LevelWarn, "name_conflict", "kind", "resource", "name", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
 
 	resourceTemplateTable := router.Resolve(conn.resourceTemplateEntries, gateway.ResourceTemplateNameOf, gateway.ResourceTemplateRename, cfg.ResourceTemplateOverrides)
 	for _, c := range resourceTemplateTable.Conflicts {
-		logger.Warn("resource template URI conflict", "uriTemplate", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
+		gateway.LogEvent(ctx, logger, slog.LevelWarn, "name_conflict", "kind", "resourceTemplate", "name", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
 
 	promptTable := router.Resolve(conn.promptEntries, gateway.PromptNameOf, gateway.PromptRename, cfg.PromptOverrides)
 	for _, c := range promptTable.Conflicts {
-		logger.Warn("prompt name conflict", "prompt", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
+		gateway.LogEvent(ctx, logger, slog.LevelWarn, "name_conflict", "kind", "prompt", "name", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
 
 	srv := gateway.New(gateway.NewConfig{
@@ -377,6 +377,7 @@ func toolsChangedCallback(ctx context.Context, logger *slog.Logger, backendName 
 			return
 		}
 		gw.UpdateTools(backendName, tools)
+		gateway.LogEvent(ctx, logger, slog.LevelInfo, "list_changed_reconciled", "backend", backendName, "kind", "tools", "count", len(tools))
 	}
 }
 
@@ -407,6 +408,7 @@ func resourcesChangedCallback(ctx context.Context, logger *slog.Logger, backendN
 			return
 		}
 		gw.UpdateResources(backendName, resources, templates)
+		gateway.LogEvent(ctx, logger, slog.LevelInfo, "list_changed_reconciled", "backend", backendName, "kind", "resources", "resource_count", len(resources), "template_count", len(templates))
 	}
 }
 
@@ -430,6 +432,7 @@ func promptsChangedCallback(ctx context.Context, logger *slog.Logger, backendNam
 			return
 		}
 		gw.UpdatePrompts(backendName, prompts)
+		gateway.LogEvent(ctx, logger, slog.LevelInfo, "list_changed_reconciled", "backend", backendName, "kind", "prompts", "count", len(prompts))
 	}
 }
 
@@ -575,7 +578,7 @@ func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.Backen
 			cb.OnElicit = func(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
 				session, err := gwH.relays.Elicit.Route(bc.Name)
 				if err != nil {
-					logger.Warn("elicitation: cannot route to a downstream session, refusing", "backend", bc.Name, "error", err)
+					gateway.LogEvent(ctx, logger, slog.LevelWarn, "elicitation_routing_refused", "backend", bc.Name, "error", err)
 					return nil, err
 				}
 				ectx, cancel := context.WithTimeout(ctx, elicitTimeout)
@@ -591,9 +594,9 @@ func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.Backen
 					// the real cause could be that, a disconnected client,
 					// or anything else session.Elicit can return.
 					if errors.Is(err, context.DeadlineExceeded) {
-						logger.Warn("elicitation: downstream did not respond within timeout", "backend", bc.Name, "error", err)
+						gateway.LogEvent(ctx, logger, slog.LevelWarn, "elicitation_timeout", "backend", bc.Name, "error", err)
 					} else {
-						logger.Warn("elicitation: downstream request failed", "backend", bc.Name, "error", err)
+						gateway.LogEvent(ctx, logger, slog.LevelWarn, "elicitation_failed", "backend", bc.Name, "error", err)
 					}
 				}
 				return res, err
