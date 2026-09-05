@@ -216,6 +216,155 @@ func TestGateway_FallsBackWhenWinnerSchemaInvalid(t *testing.T) {
 	}
 }
 
+// TestGateway_FallsBackWhenWinnerBackendMissing checks that a resolved
+// winner referencing a backend absent from Backends -- New's documented
+// "cfg.Backends must include every referenced BackendName" contract broken,
+// e.g. by a stale table racing a backend disconnect -- is skipped in favor
+// of a valid fallback candidate, instead of panicking the first time the
+// tool is called (this plan's Task 3 review, finding 3).
+func TestGateway_FallsBackWhenWinnerBackendMissing(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendBServer := newFakeBackendServer("backend-b", "search")
+	httpB := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendBServer }, nil))
+	defer httpB.Close()
+
+	ctx := context.Background()
+	connB, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-b", Transport: "http", URL: httpB.URL}, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("connect backend-b: %v", err)
+	}
+	defer func() { _ = connB.Close() }()
+
+	toolsB, err := connB.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("list backend-b tools: %v", err)
+	}
+
+	// The winner ("backend-a") has a perfectly valid tool definition -- the
+	// bug this guards is unrelated to the schema-invalid case
+	// TestGateway_FallsBackWhenWinnerSchemaInvalid covers above -- but no
+	// entry for "backend-a" exists in Backends at all.
+	table := &router.Table[*mcp.Tool]{
+		Items: map[string]*router.Resolved[*mcp.Tool]{
+			"search": {
+				Item:         &mcp.Tool{Name: "search", InputSchema: map[string]any{"type": "object"}},
+				BackendName:  "backend-a",
+				OriginalName: "search",
+				Fallbacks: []router.Candidate[*mcp.Tool]{{
+					Item:         toolsB[0],
+					BackendName:  "backend-b",
+					OriginalName: "search",
+				}},
+			},
+		},
+	}
+
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"backend-b": connB},
+		Tables:   gateway.Tables{Tools: table},
+	})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "search", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatalf("call search: %v", err)
+	}
+	structured, ok := res.StructuredContent.(map[string]any)
+	if !ok || structured["source"] != "backend-b" {
+		t.Fatalf("search result = %+v, want structured content with source=backend-b (the fallback)", res.StructuredContent)
+	}
+}
+
+// TestGateway_ToolUnavailableWhenBackendMissing checks that when EVERY
+// candidate for a resolved tool (here, just the winner -- no fallbacks)
+// references a backend absent from Backends, the tool is simply not
+// registered -- callers get a normal "tool not found" error, not a panic.
+func TestGateway_ToolUnavailableWhenBackendMissing(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	table := &router.Table[*mcp.Tool]{
+		Items: map[string]*router.Resolved[*mcp.Tool]{
+			"search": {
+				Item:         &mcp.Tool{Name: "search", InputSchema: map[string]any{"type": "object"}},
+				BackendName:  "backend-a",
+				OriginalName: "search",
+			},
+		},
+	}
+
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{},
+		Tables:   gateway.Tables{Tools: table},
+	})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+
+	ctx := context.Background()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if _, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "search", Arguments: map[string]any{}}); err == nil {
+		t.Fatal("CallTool(search) succeeded, want an error: backend missing, tool should not have been registered")
+	}
+}
+
+// TestGateway_PromptUnavailableWhenBackendMissing is
+// TestGateway_ToolUnavailableWhenBackendMissing's registerPrompt
+// counterpart: unlike registerTool, registerPrompt has no candidate/
+// fallback loop at all (see its doc comment), so this exercises a
+// structurally different code path for the same underlying bug.
+func TestGateway_PromptUnavailableWhenBackendMissing(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	table := &router.Table[*mcp.Prompt]{
+		Items: map[string]*router.Resolved[*mcp.Prompt]{
+			"greet": {
+				Item:         &mcp.Prompt{Name: "greet"},
+				BackendName:  "backend-a",
+				OriginalName: "greet",
+			},
+		},
+	}
+
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{},
+		Tables:   gateway.Tables{Prompts: table},
+	})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+
+	ctx := context.Background()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if _, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "greet"}); err == nil {
+		t.Fatal("GetPrompt(greet) succeeded, want an error: backend missing, prompt should not have been registered")
+	}
+}
+
 func TestGateway_RoutesByPriorityAndExposesUniqueTools(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 

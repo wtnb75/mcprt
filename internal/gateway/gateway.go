@@ -227,6 +227,15 @@ func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*bac
 
 	for _, c := range candidates {
 		b := backends[c.BackendName]
+		if b == nil {
+			// New's contract requires every referenced BackendName to have
+			// an entry in backends; a nil b here means that contract broke
+			// (e.g. a stale table racing a backend disconnect). Skip this
+			// candidate rather than registering a handler that would panic
+			// on nil b the first time the tool is actually called.
+			logger.Error("tool candidate skipped: backend not found", "tool", resolved.Item.Name, "backend", c.BackendName)
+			continue
+		}
 		if addTool(srv, logger, c.Item, callHandler(logger, maskKeys, b, c.OriginalName, relays)) {
 			return true
 		}
@@ -248,6 +257,10 @@ func registerResource(srv *mcp.Server, logger *slog.Logger, backends map[string]
 
 	for _, c := range candidates {
 		b := backends[c.BackendName]
+		if b == nil {
+			logger.Error("resource candidate skipped: backend not found", "uri", resolved.Item.URI, "backend", c.BackendName)
+			continue
+		}
 		if addResource(srv, logger, c.Item, resourceReadHandler(logger, maskKeys, b, c.OriginalName)) {
 			return
 		}
@@ -301,6 +314,10 @@ func registerResourceTemplate(srv *mcp.Server, logger *slog.Logger, backends map
 
 	for _, c := range candidates {
 		b := backends[c.BackendName]
+		if b == nil {
+			logger.Error("resource template candidate skipped: backend not found", "uriTemplate", resolved.Item.URITemplate, "backend", c.BackendName)
+			continue
+		}
 		if addResourceTemplate(srv, logger, c.Item, resourceTemplateReadHandler(logger, maskKeys, b)) {
 			return
 		}
@@ -349,6 +366,15 @@ func addResourceTemplate(srv *mcp.Server, logger *slog.Logger, t *mcp.ResourceTe
 // is always registerable.
 func registerPrompt(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Prompt], maskKeys []string) {
 	b := backends[resolved.BackendName]
+	if b == nil {
+		// New's contract requires every referenced BackendName to have an
+		// entry in backends; a nil b here means that contract broke (e.g. a
+		// stale table racing a backend disconnect). Skip registration
+		// entirely rather than registering a handler that would panic on
+		// nil b the first time the prompt is actually requested.
+		logger.Error("prompt unavailable: backend not found", "prompt", resolved.Item.Name, "backend", resolved.BackendName)
+		return
+	}
 	srv.AddPrompt(resolved.Item, promptGetHandler(logger, maskKeys, b, resolved.OriginalName))
 }
 
