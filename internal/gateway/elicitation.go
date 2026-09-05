@@ -72,6 +72,25 @@ func (r *ElicitationRouter) Enter(backendName string, session *mcp.ServerSession
 // wrong would route a backend's question to an unrelated client -- even
 // when every in-flight call happens to belong to the same session, the
 // count alone decides, never the sessions' identity.
+//
+// This "exactly one" invariant is honest about in-flight calls Enter still
+// knows about, but call cancellation can make that count go stale faster
+// than the backend's own processing does: go-sdk's outgoing-call bookkeeping
+// retires a tools/call the instant its context is done, without waiting for
+// the backend to actually stop working (see jsonrpc2.AsyncCall.Await --
+// on <-ctx.Done() it returns ctx.Err() immediately, it does not block on the
+// backend's eventual response). callHandler's `defer leave()` runs right
+// after CallTool returns, so a downstream client A that cancels or
+// disconnects mid-call frees A's slot at that instant even though backend B
+// may still be running A's call and can still emit elicitation/create for
+// it moments later. If, at that exact moment, some unrelated client C
+// happens to be the only other call in flight to B, Route will hand B's
+// question -- meant for A's now-abandoned call -- to C instead, because
+// Route has no way to tell "B is still working on a call whose slot was
+// freed early" from "B is idle." Closing this gap -- for example, by
+// keeping a cancelled call's slot counted toward ambiguity for a short
+// grace window after cancellation, instead of dropping it the instant
+// CallTool returns -- is a deliberate future decision, not attempted here.
 func (r *ElicitationRouter) Route(backendName string) (*mcp.ServerSession, error) {
 	r.mu.Lock()
 	bc, ok := r.calls[backendName]

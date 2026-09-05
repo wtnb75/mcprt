@@ -43,6 +43,25 @@ var reloadDrainTimeout = 5 * time.Minute
 // YAML config, matching the existing convention for this class of
 // hardcoded timeout (see backendConnectTimeout/reloadDrainTimeout). A var
 // so tests can shrink it.
+//
+// This timeout is also, today, the only thing standing between a hung
+// tools/call and a real, currently-inherent SDK/protocol-version
+// limitation: go-sdk v1.7.0 defaults to negotiating MCP protocol version
+// 2026-07-28 (SEP-2322) unless something forces a downgrade, and under that
+// version ServerSession.Elicit unconditionally refuses to run mid-request
+// ("... cannot be sent while serving a request on protocol version
+// 2026-07-28: return an InputRequests map instead") -- on BOTH legs of this
+// relay, a backend calling Elicit on its own session and mcprt calling
+// Elicit on the downstream session. mcprt's streamable-HTTP listener
+// happens to trigger a downgrade to a version where elicitation still
+// works, which is why the existing tests for this feature pass, but a
+// listen.stdio deployment (or a stdio-transport backend) gets no such
+// downgrade: every elicitation attempt there fails immediately with that
+// protocol error, not a timeout, and not a hang. It surfaces via the
+// non-timeout branch of cb.OnElicit's Warn log below, not a crash. This is
+// a known constraint of the SDK/protocol version in use, not a bug in
+// mcprt's own logic, and pinning an older protocol version globally to
+// route around it is a bigger decision than this fix is scoped to make.
 var elicitTimeout = 5 * time.Minute
 
 // telemetryShutdownTimeout bounds internal/telemetry.Setup's returned
@@ -554,7 +573,19 @@ func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.Backen
 				defer cancel()
 				res, err := session.Elicit(ectx, req.Params)
 				if err != nil {
-					logger.Warn("elicitation: downstream did not respond", "backend", bc.Name, "error", err)
+					// Distinguish "nobody answered in time" from every other
+					// failure: the latter includes, notably, the SDK's own
+					// protocol-version refusal of server-initiated
+					// elicitation under MCP 2026-07-28+ (see elicitTimeout's
+					// doc comment) -- an operator reading logs should not be
+					// misled into thinking a human simply took too long when
+					// the real cause could be that, a disconnected client,
+					// or anything else session.Elicit can return.
+					if errors.Is(err, context.DeadlineExceeded) {
+						logger.Warn("elicitation: downstream did not respond within timeout", "backend", bc.Name, "error", err)
+					} else {
+						logger.Warn("elicitation: downstream request failed", "backend", bc.Name, "error", err)
+					}
 				}
 				return res, err
 			}

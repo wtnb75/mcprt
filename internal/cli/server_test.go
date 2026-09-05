@@ -1407,3 +1407,89 @@ backends:
 		t.Fatalf("server exited with error: %v", err)
 	}
 }
+
+// TestServerCommand_ElicitationWithoutCapability_FailsCleanly checks that
+// when the downstream client has no ElicitationHandler configured -- so it
+// never advertises the elicitation capability at initialize -- a backend's
+// mid-call req.Session.Elicit is refused immediately by go-sdk's own
+// capability check (ServerSession.Elicit: "client does not support
+// elicitation"), and mcprt's relay surfaces that as a clean tools/call
+// failure. The point of this test is what it must NOT do: hang until
+// elicitTimeout, or until the server itself gives up -- no special handling
+// mcprt adds is needed for the SDK's own refusal to come through cleanly.
+func TestServerCommand_ElicitationWithoutCapability_FailsCleanly(t *testing.T) {
+	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	backendSrv.AddTool(&mcp.Tool{Name: "ask", Description: "ask", InputSchema: map[string]any{"type": "object"}},
+		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			res, err := req.Session.Elicit(ctx, &mcp.ElicitParams{
+				Message:         "confirm?",
+				RequestedSchema: map[string]any{"type": "object"},
+			})
+			if err != nil {
+				return nil, err
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: res.Action}}}, nil
+		})
+	backendHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil))
+	defer backendHTTP.Close()
+
+	gatewayAddr := freePort(t)
+	configPath := writeConfig(t, fmt.Sprintf(`
+listen:
+  http: %q
+
+backends:
+  - name: fake
+    transport: http
+    url: %q
+`, gatewayAddr, backendHTTP.URL))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	execErr := make(chan error, 1)
+	go func() {
+		execErr <- cli.Execute(ctx, []string{"server", "--config", configPath})
+	}()
+
+	// Deliberately no ElicitationHandler -- a plain *mcp.ClientOptions (here,
+	// nil) leaves the client's Capabilities.Elicitation unset, unlike
+	// TestServerCommand_RoutesElicitationToDownstreamClient's client above.
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	var session *mcp.ClientSession
+	var connectErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		session, connectErr = client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: "http://" + gatewayAddr}, nil)
+		if connectErr == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if connectErr != nil {
+		t.Fatalf("connecting to gateway: %v", connectErr)
+	}
+	waitForToolNames(t, ctx, session, []string{"ask"})
+
+	callCtx, callCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer callCancel()
+
+	start := time.Now()
+	res, callErr := session.CallTool(callCtx, &mcp.CallToolParams{Name: "ask", Arguments: map[string]any{}})
+	elapsed := time.Since(start)
+
+	// 2s gives generous headroom for a local round trip while remaining far
+	// short of both the 5s callCtx deadline and the default 5-minute
+	// elicitTimeout -- this must be a fast, clean refusal, not something
+	// that merely eventually times out.
+	if elapsed > 2*time.Second {
+		t.Fatalf("call \"ask\" took %v; want a fast, clean failure from the SDK's own capability check, not a hang", elapsed)
+	}
+	if callErr == nil && (res == nil || !res.IsError) {
+		t.Fatalf("call \"ask\" result = %+v, err = %v; want a clean error/IsError once elicitation was refused for lacking the capability", res, callErr)
+	}
+
+	_ = session.Close()
+	cancel()
+	if err := <-execErr; err != nil {
+		t.Fatalf("server exited with error: %v", err)
+	}
+}

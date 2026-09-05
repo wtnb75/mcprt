@@ -1831,3 +1831,140 @@ func TestScheduleDrain_ForceClosesBackendsAfterTimeout(t *testing.T) {
 	}
 	t.Fatal("backend was not force-closed within 2s of reloadDrainTimeout elapsing")
 }
+
+// TestSuperviseBackend_OnElicit_BoundedByElicitTimeout checks that
+// elicitTimeout genuinely bounds how long superviseBackend's OnElicit
+// closure waits on a downstream session that never answers -- the same
+// "package var a test can shrink" convention already proven for
+// backendConnectTimeout (TestConnectBackends_TimesOutHungBackend) and
+// reloadDrainTimeout (above), extended to elicitTimeout, which had no such
+// test despite its doc comment claiming the same property.
+//
+// It wires the real production path (connectBackendsWaitable, i.e.
+// superviseBackends/superviseBackend, with a real *gateway.ElicitationRouter
+// in gwH.elicit) against a real backend whose "ask" tool calls
+// req.Session.Elicit. Rather than routing that elicitation through a full
+// gateway.Server and a downstream client connected to it (already covered
+// end-to-end by TestServerCommand_RoutesElicitationToDownstreamClient in
+// server_test.go), it Enters a stand-in downstream session directly into
+// gwH.elicit -- exactly what gateway.callHandler would do around a real
+// tools/call, just done here by hand so the test can control precisely how
+// that session behaves. That stand-in session's ElicitationHandler blocks
+// on a channel the test only closes at cleanup, so it never itself answers;
+// the only thing that can end the wait is cb.OnElicit's own
+// context.WithTimeout(ctx, elicitTimeout).
+func TestSuperviseBackend_OnElicit_BoundedByElicitTimeout(t *testing.T) {
+	origElicitTimeout := elicitTimeout
+	elicitTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { elicitTimeout = origElicitTimeout })
+
+	// blockElicit is never closed until cleanup, so the stub downstream
+	// session's ElicitationHandler below blocks for as long as the test
+	// runs -- simulating a downstream client that received the elicitation
+	// but never answers it, the case elicitTimeout exists to bound.
+	blockElicit := make(chan struct{})
+	t.Cleanup(func() { close(blockElicit) })
+
+	// stubSrv/stubClient exist solely to hand this test a real
+	// *mcp.ServerSession to Enter into gwH.elicit -- ElicitationRouter's
+	// live map is typed *mcp.ServerSession, which cannot be faked with an
+	// interface, so a genuine (if otherwise unused) MCP connection is the
+	// only way to get one. Capturing req.Session from a tool call is the
+	// same technique TestConnect_ElicitationCallback (internal/backend)
+	// uses to observe a session from inside a handler.
+	sessionCh := make(chan *mcp.ServerSession, 1)
+	stubSrv := mcp.NewServer(&mcp.Implementation{Name: "stub-downstream", Version: "v1"}, nil)
+	stubSrv.AddTool(&mcp.Tool{Name: "capture", Description: "capture", InputSchema: map[string]any{"type": "object"}},
+		func(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			sessionCh <- req.Session
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "ok"}}}, nil
+		})
+	stubHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return stubSrv }, nil))
+	defer stubHTTP.Close()
+
+	stubClient := mcp.NewClient(&mcp.Implementation{Name: "stub-client", Version: "v1"}, &mcp.ClientOptions{
+		ElicitationHandler: func(ctx context.Context, _ *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			select {
+			case <-blockElicit:
+			case <-ctx.Done():
+			}
+			return nil, ctx.Err()
+		},
+	})
+	stubSession, err := stubClient.Connect(context.Background(), &mcp.StreamableClientTransport{Endpoint: stubHTTP.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect stub downstream: %v", err)
+	}
+	defer func() { _ = stubSession.Close() }()
+	if _, err := stubSession.CallTool(context.Background(), &mcp.CallToolParams{Name: "capture", Arguments: map[string]any{}}); err != nil {
+		t.Fatalf("capture call: %v", err)
+	}
+	var capturedSession *mcp.ServerSession
+	select {
+	case capturedSession = <-sessionCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stub server never captured a session")
+	}
+
+	// backendSrv is the real backend whose tool triggers cb.OnElicit under
+	// test, exactly like TestServerCommand_RoutesElicitationToDownstreamClient's
+	// "ask" tool.
+	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	backendSrv.AddTool(&mcp.Tool{Name: "ask", Description: "ask", InputSchema: map[string]any{"type": "object"}},
+		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			res, err := req.Session.Elicit(ctx, &mcp.ElicitParams{
+				Message:         "confirm?",
+				RequestedSchema: map[string]any{"type": "object"},
+			})
+			if err != nil {
+				return nil, err
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: res.Action}}}, nil
+		})
+	backendHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil))
+	defer backendHTTP.Close()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	var supervisorsDone <-chan struct{}
+	// Registered first, so LIFO runs it dead last -- see
+	// connectBackendsWaitable's doc comment on why a test must wait for the
+	// supervisor goroutine to actually exit before returning, instead of
+	// just cancelling ctx and trusting it happens eventually.
+	defer func() { waitSupervisorsDone(t, supervisorsDone) }()
+
+	gwH := &gwHolder{elicit: gateway.NewElicitationRouter()}
+	conn, supervisorsDone := connectBackendsWaitable(ctx, logger,
+		[]config.BackendConfig{{Name: "fake", Transport: "http", URL: backendHTTP.URL}}, gwH)
+	b, ok := conn.backends["fake"]
+	if !ok {
+		t.Fatalf("backends = %v, want backend \"fake\" connected", conn.backends)
+	}
+	defer func() { _ = b.Close() }()
+	defer cancel()
+
+	// Register the stub session as the one in-flight downstream call for
+	// "fake", exactly as gateway.callHandler's Enter/leave pair would do
+	// around a real tools/call -- done directly here since this test only
+	// needs cb.OnElicit's timeout behavior, not the routing machinery.
+	leave := gwH.elicit.Enter("fake", capturedSession)
+	defer leave()
+
+	callCtx, callCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer callCancel()
+
+	start := time.Now()
+	res, callErr := b.Session.CallTool(callCtx, &mcp.CallToolParams{Name: "ask", Arguments: map[string]any{}})
+	elapsed := time.Since(start)
+
+	// 2s gives generous headroom over the 100ms shrunk elicitTimeout for
+	// local httptest round trips, while still being nowhere near the
+	// default 5-minute elicitTimeout -- proving the SHRUNK value is what
+	// actually bounded this call.
+	if elapsed > 2*time.Second {
+		t.Fatalf("tools/call \"ask\" took %v; want well under the default 5-minute elicitTimeout, bounded instead by the shrunk 100ms value", elapsed)
+	}
+	if callErr == nil && (res == nil || !res.IsError) {
+		t.Fatalf("call \"ask\" result = %+v, err = %v; want an error surfaced once the relayed elicitation timed out", res, callErr)
+	}
+}
