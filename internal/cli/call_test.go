@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -198,5 +199,128 @@ backends:
 	defer cancel()
 	if err := cli.Execute(ctx, []string{"call", "--config", configPath, "boom"}); err == nil {
 		t.Fatal("Execute: expected a non-nil error when the tool result has IsError=true, got nil")
+	}
+}
+
+// syncCallLogBuffer is a bytes.Buffer guarded by a mutex, safe for the
+// background superviseBackend goroutine runCall's connectBackends spawns
+// (which keeps logging -- notably "backend disconnected", once the
+// streamable-HTTP session's Wait() returns, which can happen essentially
+// concurrently with CallTool returning) and the test's own read of the
+// captured stderr to touch at the same time. A plain bytes.Buffer here would
+// be a genuine data race under `go test -race`: nothing about a one-shot
+// CallTool guarantees the supervisor's own log write has quiesced by the
+// time ExecuteContext returns and the test reads the buffer.
+type syncCallLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncCallLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncCallLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestCallCommand_LogsAuditLineWithMaskedArguments checks that mcprt call
+// now emits a "cli tool call" audit-style log line (to stderr, via the
+// logger runCall already builds) carrying the backend name, tool name, and
+// masked arguments -- mirroring the gateway's own tools/call audit line but
+// for the standalone CLI path, which previously logged nothing at all.
+func TestCallCommand_LogsAuditLineWithMaskedArguments(t *testing.T) {
+	backendA := newFakeCallBackend("backend-a")
+	defer backendA.Close()
+
+	configPath := writeConfig(t, fmt.Sprintf(`
+backends:
+  - name: backend-a
+    transport: http
+    url: %q
+`, backendA.URL))
+
+	root := cli.NewRootCmd()
+	var out bytes.Buffer
+	var errOut syncCallLogBuffer
+	root.SetOut(&out)
+	root.SetErr(&errOut)
+	root.SetArgs([]string{"call", "--config", configPath, "--args", `{"message":"hi","api_key":"secret-value"}`, "echo"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := root.ExecuteContext(ctx); err != nil {
+		t.Fatalf("call: %v", err)
+	}
+
+	logged := errOut.String()
+	if !strings.Contains(logged, "cli tool call") {
+		t.Fatalf("log output = %q, want a \"cli tool call\" line", logged)
+	}
+	if !strings.Contains(logged, "backend=backend-a") {
+		t.Fatalf("log output = %q, want backend=backend-a", logged)
+	}
+	if !strings.Contains(logged, "tool=echo") {
+		t.Fatalf("log output = %q, want tool=echo", logged)
+	}
+	if strings.Contains(logged, "secret-value") {
+		t.Fatalf("log output = %q, want api_key's value masked, not present in plaintext", logged)
+	}
+	if !strings.Contains(logged, "***") {
+		t.Fatalf("log output = %q, want a masked (***) value present", logged)
+	}
+}
+
+// TestCallCommand_LogsAuditLineOnFailure checks the failure path: a tool
+// call that itself fails with a Go error (not just an IsError result) still
+// produces a "cli tool call failed" line with the error. The fake backend's
+// "explode" tool handler returns a non-nil error (rather than a result with
+// IsError: true, which the existing "boom" tool in newFakeCallBackend uses)
+// -- go-sdk's mcp.AddTool translates a handler's returned error into a
+// JSON-RPC error response, which surfaces at the CALLER's CallTool as a
+// genuine Go error, exactly the path logCLICall's err branch needs to
+// exercise. This is a dedicated inline backend (not the shared
+// newFakeCallBackend helper), since none of its existing tools return a Go
+// error this way and it's simpler to add one tool here than to change a
+// helper other tests also rely on.
+func TestCallCommand_LogsAuditLineOnFailure(t *testing.T) {
+	srv := mcp.NewServer(&mcp.Implementation{Name: "backend-a", Version: "v1"}, nil)
+	srv.AddTool(&mcp.Tool{Name: "explode", Description: "always fails", InputSchema: map[string]any{"type": "object"}},
+		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return nil, fmt.Errorf("boom")
+		})
+	backendA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	defer backendA.Close()
+
+	configPath := writeConfig(t, fmt.Sprintf(`
+backends:
+  - name: backend-a
+    transport: http
+    url: %q
+`, backendA.URL))
+
+	root := cli.NewRootCmd()
+	var out bytes.Buffer
+	var errOut syncCallLogBuffer
+	root.SetOut(&out)
+	root.SetErr(&errOut)
+	root.SetArgs([]string{"call", "--config", configPath, "explode"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := root.ExecuteContext(ctx); err == nil {
+		t.Fatal("call explode: got no error, want one (the tool handler always returns an error)")
+	}
+
+	logged := errOut.String()
+	if !strings.Contains(logged, "cli tool call failed") {
+		t.Fatalf("log output = %q, want a \"cli tool call failed\" line", logged)
+	}
+	if !strings.Contains(logged, "backend=backend-a") || !strings.Contains(logged, "tool=explode") {
+		t.Fatalf("log output = %q, want backend=backend-a and tool=explode", logged)
 	}
 }

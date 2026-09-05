@@ -147,9 +147,9 @@ func TestMaskArguments(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := maskArguments(c.v, c.extraKeys)
+			got := MaskArguments(c.v, c.extraKeys)
 			if !reflect.DeepEqual(got, c.want) {
-				t.Fatalf("maskArguments(%#v, %v) = %#v, want %#v", c.v, c.extraKeys, got, c.want)
+				t.Fatalf("MaskArguments(%#v, %v) = %#v, want %#v", c.v, c.extraKeys, got, c.want)
 			}
 		})
 	}

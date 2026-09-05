@@ -20,13 +20,18 @@ import (
 // token.
 var defaultMaskKeyPatterns = []string{"key", "auth", "pass", "cred", "token"}
 
-// maskArguments returns a copy of v with any object key matching (case-
+// MaskArguments returns a copy of v with any object key matching (case-
 // insensitively, by substring) one of defaultMaskKeyPatterns or extraKeys
 // replaced with "***". v is either json.RawMessage (tool arguments) or
 // map[string]string (prompt arguments); both are normalized to a walkable
 // any tree first. A v of neither type, or malformed JSON, falls back to a
 // string representation rather than panicking or dropping the field.
-func maskArguments(v any, extraKeys []string) any {
+//
+// Exported so internal/cli's standalone commands (mcprt call) can apply the
+// exact same masking rules mcprt server's own audit log (logCall, below)
+// uses -- two independently-maintained masking implementations would risk
+// silently drifting apart on which key patterns get redacted.
+func MaskArguments(v any, extraKeys []string) any {
 	switch t := v.(type) {
 	case json.RawMessage:
 		var parsed any
@@ -139,7 +144,7 @@ func logCall(ctx context.Context, logger *slog.Logger, kind, nameKey, name, back
 		attrs = append(attrs, "trace_id", sc.TraceID().String(), "span_id", sc.SpanID().String())
 	}
 	if hasArgs(args) {
-		attrs = append(attrs, "arguments", maskArguments(args, maskKeys))
+		attrs = append(attrs, "arguments", MaskArguments(args, maskKeys))
 	}
 	if progress != nil {
 		if count, lastMessage := progress.Summary(); count > 0 {

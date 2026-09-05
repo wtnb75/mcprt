@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/spf13/cobra"
@@ -87,7 +88,9 @@ func runCall(ctx context.Context, cmd *cobra.Command, configPath, toolName, args
 	}
 	b := conn.backends[resolved.BackendName]
 
+	start := time.Now()
 	result, err := b.Session.CallTool(ctx, &mcp.CallToolParams{Name: resolved.OriginalName, Arguments: arguments})
+	logCLICall(logger, resolved.BackendName, toolName, arguments, cfg.Logging.MaskKeys, start, err)
 	if err != nil {
 		return fmt.Errorf("calling tool %q: %w", toolName, err)
 	}
@@ -104,6 +107,31 @@ func runCall(ctx context.Context, cmd *cobra.Command, configPath, toolName, args
 		return fmt.Errorf("tool %q returned an error result", toolName)
 	}
 	return nil
+}
+
+// logCLICall logs one mcprt-call invocation's outcome in the same spirit as
+// the gateway's own tools/call audit line (internal/gateway/audit.go's
+// logCall) -- backend, tool, masked arguments, duration, success/failure --
+// but without the server-side identity fields (session_id, client_name/
+// version, remote_addr, trace/span id) that don't exist for a one-shot CLI
+// invocation with no downstream MCP session. Uses "cli " message prefixes
+// (distinct from logCall's "tool call"/"tool call failed") so a log
+// pipeline that also ingests mcprt server's audit log can tell a
+// human-operator-invoked call apart from one the gateway relayed.
+func logCLICall(logger *slog.Logger, backendName, tool string, arguments any, maskKeys []string, start time.Time, err error) {
+	attrs := []any{
+		"backend", backendName,
+		"tool", tool,
+		"duration_ms", time.Since(start).Milliseconds(),
+	}
+	if arguments != nil {
+		attrs = append(attrs, "arguments", gateway.MaskArguments(arguments, maskKeys))
+	}
+	if err != nil {
+		logger.Error("cli tool call failed", append(attrs, "error", err)...)
+		return
+	}
+	logger.Info("cli tool call", attrs...)
 }
 
 func printCallJSON(cmd *cobra.Command, result *mcp.CallToolResult) error {
