@@ -35,6 +35,16 @@ var backendConnectTimeout = 30 * time.Second
 // bound to it can finish naturally. A var so tests can shrink it.
 var reloadDrainTimeout = 5 * time.Minute
 
+// elicitTimeout bounds how long superviseBackend's OnElicit callback waits
+// for a downstream client to respond to a relayed elicitation/create
+// request -- it blocks the backend's in-flight tools/call for as long as
+// it runs. Deliberately much longer than backendConnectTimeout: this waits
+// on a human answering a prompt, not a network round trip. Not exposed in
+// YAML config, matching the existing convention for this class of
+// hardcoded timeout (see backendConnectTimeout/reloadDrainTimeout). A var
+// so tests can shrink it.
+var elicitTimeout = 5 * time.Minute
+
 // telemetryShutdownTimeout bounds internal/telemetry.Setup's returned
 // shutdown func, which flushes buffered spans to the configured OTLP
 // exporter. A var so tests can shrink it.
@@ -251,6 +261,7 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 
 	var gwH gwHolder
 	gwH.progress = gateway.NewProgressRegistry()
+	gwH.elicit = gateway.NewElicitationRouter()
 	conn := connectBackends(ctx, logger, cfg.Backends, &gwH)
 
 	toolTable := router.Resolve(conn.toolEntries, gateway.ToolNameOf, gateway.ToolRename, cfg.Overrides)
@@ -288,7 +299,7 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 		Resources:         cfg.ResourceOverrides,
 		ResourceTemplates: cfg.ResourceTemplateOverrides,
 		Prompts:           cfg.PromptOverrides,
-	}, cfg.Logging.MaskKeys, gwH.progress)
+	}, cfg.Logging.MaskKeys, gwH.progress, gwH.elicit)
 	gwH.ptr.Store(srv)
 
 	return srv, nil
@@ -303,15 +314,17 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 // runServer is about to do anyway will reflect the same change, so nothing
 // is permanently lost.
 //
-// progress is set once, before connectBackends spawns any supervisor
-// goroutine, and never mutated afterward -- so reading it from those
-// goroutines needs no lock (the write happens-before every goroutine's
-// creation). A nil progress (buildGateway always sets one; only some tests
-// construct a bare gwHolder{} without it) means "no progress relay for this
-// generation," matching a nil *gateway.ProgressRegistry everywhere else.
+// progress and elicit are each set once, before connectBackends spawns any
+// supervisor goroutine, and never mutated afterward -- so reading either
+// from those goroutines needs no lock (the write happens-before every
+// goroutine's creation). A nil progress/elicit (buildGateway always sets
+// both; only some tests construct a bare gwHolder{} without them) means "no
+// progress relay/elicitation routing for this generation," matching a nil
+// *gateway.ProgressRegistry/*gateway.ElicitationRouter everywhere else.
 type gwHolder struct {
 	ptr      atomic.Pointer[gateway.Server]
 	progress *gateway.ProgressRegistry
+	elicit   *gateway.ElicitationRouter
 }
 
 // toolsChangedCallback returns a func to use as backend.ChangeCallbacks.
@@ -528,6 +541,22 @@ func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.Backen
 		if gwH.progress != nil {
 			cb.OnProgress = func(ctx context.Context, req *mcp.ProgressNotificationClientRequest) {
 				gwH.progress.Relay(ctx, logger, bc.Name, req.Params)
+			}
+		}
+		if gwH.elicit != nil {
+			cb.OnElicit = func(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+				session, err := gwH.elicit.Route(bc.Name)
+				if err != nil {
+					logger.Warn("elicitation: cannot route to a downstream session, refusing", "backend", bc.Name, "error", err)
+					return nil, err
+				}
+				ectx, cancel := context.WithTimeout(ctx, elicitTimeout)
+				defer cancel()
+				res, err := session.Elicit(ectx, req.Params)
+				if err != nil {
+					logger.Warn("elicitation: downstream did not respond", "backend", bc.Name, "error", err)
+				}
+				return res, err
 			}
 		}
 	}

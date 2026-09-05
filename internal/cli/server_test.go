@@ -1327,3 +1327,83 @@ backends:
 		t.Fatalf("server exited with error: %v", err)
 	}
 }
+
+// TestServerCommand_RoutesElicitationToDownstreamClient checks the
+// elicitation-relay feature end-to-end through the real server command: a
+// backend's elicitation/create (sent mid-tools/call) reaches the
+// downstream client, and the client's response reaches the backend as the
+// elicitation result -- exercising the real production wiring
+// (superviseBackend's OnElicit, ElicitationRouter.Route, elicitTimeout).
+func TestServerCommand_RoutesElicitationToDownstreamClient(t *testing.T) {
+	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	backendSrv.AddTool(&mcp.Tool{Name: "ask", Description: "ask", InputSchema: map[string]any{"type": "object"}},
+		func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			res, err := req.Session.Elicit(ctx, &mcp.ElicitParams{
+				Message:         "confirm?",
+				RequestedSchema: map[string]any{"type": "object"},
+			})
+			if err != nil {
+				return nil, err
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: res.Action}}}, nil
+		})
+	backendHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil))
+	defer backendHTTP.Close()
+
+	gatewayAddr := freePort(t)
+	configPath := writeConfig(t, fmt.Sprintf(`
+listen:
+  http: %q
+
+backends:
+  - name: fake
+    transport: http
+    url: %q
+`, gatewayAddr, backendHTTP.URL))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	execErr := make(chan error, 1)
+	go func() {
+		execErr <- cli.Execute(ctx, []string{"server", "--config", configPath})
+	}()
+
+	var gotMessage string
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, &mcp.ClientOptions{
+		ElicitationHandler: func(_ context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			gotMessage = req.Params.Message
+			return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"ok": true}}, nil
+		},
+	})
+	var session *mcp.ClientSession
+	var connectErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		session, connectErr = client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: "http://" + gatewayAddr}, nil)
+		if connectErr == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if connectErr != nil {
+		t.Fatalf("connecting to gateway: %v", connectErr)
+	}
+	waitForToolNames(t, ctx, session, []string{"ask"})
+
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "ask", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatalf("call ask: %v", err)
+	}
+	text, ok := res.Content[0].(*mcp.TextContent)
+	if !ok || text.Text != "accept" {
+		t.Fatalf("call ask result = %+v, want text \"accept\"", res.Content)
+	}
+	if gotMessage != "confirm?" {
+		t.Fatalf("downstream ElicitationHandler message = %q, want \"confirm?\"", gotMessage)
+	}
+
+	_ = session.Close()
+	cancel()
+	if err := <-execErr; err != nil {
+		t.Fatalf("server exited with error: %v", err)
+	}
+}

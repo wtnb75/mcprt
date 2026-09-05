@@ -360,7 +360,7 @@ func TestSuperviseBackend_ReconnectsAfterDisconnect(t *testing.T) {
 
 	toolTable := router.Resolve(conn.toolEntries, gateway.ToolNameOf, gateway.ToolRename, nil)
 	srv := gateway.New(logger, conn.backends, gateway.Tables{Tools: toolTable},
-		gateway.Entries{Tools: conn.toolEntries}, gateway.Overrides{}, nil, nil)
+		gateway.Entries{Tools: conn.toolEntries}, gateway.Overrides{}, nil, nil, nil)
 	gwH.ptr.Store(srv)
 	// These three defers run in the OPPOSITE order they're registered in
 	// (LIFO), so registering them bottom-to-top of the intended sequence
@@ -499,7 +499,7 @@ func TestSuperviseBackend_LateConnectJoinsViaConnectBackend(t *testing.T) {
 		t.Fatalf("backends = %v, want \"late\" excluded (nothing was listening within backendConnectTimeout)", conn.backends)
 	}
 
-	srv := gateway.New(logger, conn.backends, gateway.Tables{}, gateway.Entries{}, gateway.Overrides{}, nil, nil)
+	srv := gateway.New(logger, conn.backends, gateway.Tables{}, gateway.Entries{}, gateway.Overrides{}, nil, nil, nil)
 	gwH.ptr.Store(srv) // matches buildGateway: gwH.ptr is populated right after gateway.New
 
 	// Now start listening on the SAME address the config already points at.
@@ -778,7 +778,7 @@ func TestConnectBackend_ReconnectRebindsHandlerAfterDisconnectMissedWhileHolderN
 	entries := []router.Entry[*mcp.Tool]{{BackendName: bc.Name, Items: c1.tools}}
 	table := router.Resolve(entries, gateway.ToolNameOf, gateway.ToolRename, nil)
 	srv := gateway.New(logger, map[string]*backend.Backend{bc.Name: c1.backend},
-		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil, nil)
+		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil, nil, nil)
 
 	// 2. The disconnect lands while gwH.ptr is still nil, so no clear runs:
 	//    the gateway keeps serving "ping" through c1's dead connection.
