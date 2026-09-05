@@ -14,6 +14,11 @@ import (
 // doesn't name one.
 const defaultInitPath = "config.yaml"
 
+// defaultHTTPListen is the HTTP listen address both `mcprt init`'s template
+// and `mcprt import`'s generated config default to -- a single shared
+// constant so the two independent template generators can't drift apart.
+const defaultHTTPListen = "127.0.0.1:8080"
+
 // exampleConfig is marshaled to produce the template `mcprt init` writes.
 // Building it from config.Config (rather than a static embedded file) means
 // the generated template automatically reflects the config struct's current
@@ -22,7 +27,7 @@ func exampleConfig() *config.Config {
 	return &config.Config{
 		Listen: config.ListenConfig{
 			Stdio: true,
-			HTTP:  "127.0.0.1:8080",
+			HTTP:  defaultHTTPListen,
 		},
 		Backends: []config.BackendConfig{
 			{

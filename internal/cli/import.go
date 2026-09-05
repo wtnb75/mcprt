@@ -122,7 +122,7 @@ func runImport(cmd *cobra.Command, inPath, outPath string, force bool) error {
 	}
 
 	cfg := &config.Config{
-		Listen:   config.ListenConfig{Stdio: true, HTTP: "127.0.0.1:8080"},
+		Listen:   config.ListenConfig{Stdio: true, HTTP: defaultHTTPListen},
 		Backends: backends,
 	}
 	out, err := yaml.Marshal(cfg)
