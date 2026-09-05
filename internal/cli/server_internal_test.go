@@ -915,6 +915,68 @@ func TestBuildGateway_Success(t *testing.T) {
 	}
 }
 
+// TestBuildGateway_LogsNameConflictWithSingularKind checks that buildGateway's
+// own name_conflict logging (the four LogEvent calls right after each
+// router.Resolve call in buildGateway) reports kind="tool" -- the SAME
+// singular spelling internal/gateway/reconcile.go's logNewConflicts uses --
+// for a real tool-name conflict between two backends, driven entirely
+// through buildGateway's actual code path (two backends each exposing a
+// tool named "dup", not a hand-constructed router.Conflict). This locks the
+// cross-file agreement Finding 1 fixed: a future edit that reintroduces a
+// "tool"/"tools" (or any other) mismatch between buildGateway and
+// logNewConflicts would fail this test.
+func TestBuildGateway_LogsNameConflictWithSingularKind(t *testing.T) {
+	backendA := newFakeBackendHTTP("dup")
+	defer backendA.Close()
+	backendB := newFakeBackendHTTP("dup")
+	defer backendB.Close()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	cfg := &config.Config{
+		Listen: config.ListenConfig{HTTP: "127.0.0.1:0"},
+		Backends: []config.BackendConfig{
+			{Name: "a", Transport: "http", URL: backendA.URL},
+			{Name: "b", Transport: "http", URL: backendB.URL},
+		},
+	}
+
+	// A cancellable context, not context.Background() -- see
+	// TestBuildGateway_Success's matching comment on why this matters for
+	// `go test -race`.
+	ctx, cancel := context.WithCancel(context.Background())
+	srv, err := buildGateway(ctx, logger, cfg)
+	if err != nil {
+		cancel()
+		t.Fatalf("buildGateway: %v", err)
+	}
+	defer func() {
+		for _, b := range srv.Backends() {
+			_ = b.Close()
+		}
+	}()
+	defer cancel()
+
+	var rec map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var r map[string]any
+		if err := json.Unmarshal([]byte(line), &r); err == nil && r["event"] == gateway.EventNameConflict {
+			rec = r
+			break
+		}
+	}
+	if rec == nil {
+		t.Fatalf("log output = %q, want a line with event=%s for the \"dup\" tool-name conflict between backends \"a\" and \"b\"", buf.String(), gateway.EventNameConflict)
+	}
+	if rec["kind"] != "tool" {
+		t.Fatalf("kind = %v, want \"tool\" (not \"tools\") -- must match logNewConflicts' vocabulary", rec["kind"])
+	}
+	if rec["name"] != "dup" {
+		t.Fatalf("name = %v, want \"dup\"", rec["name"])
+	}
+}
+
 func TestParseLogFormat(t *testing.T) {
 	if _, err := parseLogFormat("text"); err != nil {
 		t.Fatalf("parseLogFormat(\"text\"): %v", err)
@@ -1932,7 +1994,14 @@ func TestSuperviseBackend_OnElicit_BoundedByElicitTimeout(t *testing.T) {
 	backendHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil))
 	defer backendHTTP.Close()
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	// A JSON handler into a buffer (rather than the text-into-io.Discard
+	// handler most tests in this file use) so this test can also assert,
+	// below, exactly which gateway event cb.OnElicit logs for a timeout --
+	// proving "elicitation_timeout" and "elicitation_failed" aren't
+	// transposed (see gateway.EventElicitationTimeout's call site in
+	// server.go's cb.OnElicit).
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
 	ctx, cancel := context.WithCancel(context.Background())
 	var supervisorsDone <-chan struct{}
 	// Registered first, so LIFO runs it dead last -- see
@@ -1974,6 +2043,33 @@ func TestSuperviseBackend_OnElicit_BoundedByElicitTimeout(t *testing.T) {
 	}
 	if callErr == nil && (res == nil || !res.IsError) {
 		t.Fatalf("call \"ask\" result = %+v, err = %v; want an error surfaced once the relayed elicitation timed out", res, callErr)
+	}
+
+	// Confirm cb.OnElicit logged the TIMEOUT event specifically, not
+	// elicitation_failed -- the two are logged from different branches of
+	// the same errors.Is(err, context.DeadlineExceeded) check in server.go,
+	// and nothing before this test asserted which one actually fires here.
+	var sawTimeout, sawFailed bool
+	for _, line := range strings.Split(strings.TrimSpace(logBuf.String()), "\n") {
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		switch rec["event"] {
+		case gateway.EventElicitationTimeout:
+			sawTimeout = true
+			if rec["backend"] != "fake" {
+				t.Fatalf("elicitation_timeout backend = %v, want fake", rec["backend"])
+			}
+		case gateway.EventElicitationFailed:
+			sawFailed = true
+		}
+	}
+	if !sawTimeout {
+		t.Fatalf("log output = %q, want a line with event=%s", logBuf.String(), gateway.EventElicitationTimeout)
+	}
+	if sawFailed {
+		t.Fatalf("log output = %q, want no event=%s line (this is the timeout case, not a generic failure)", logBuf.String(), gateway.EventElicitationFailed)
 	}
 }
 
@@ -2021,7 +2117,7 @@ func TestToolsChangedCallback_LogsReconciledEventOnSuccess(t *testing.T) {
 	var rec map[string]any
 	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
 		var r map[string]any
-		if err := json.Unmarshal([]byte(line), &r); err == nil && r["event"] == "list_changed_reconciled" {
+		if err := json.Unmarshal([]byte(line), &r); err == nil && r["event"] == gateway.EventListChangedReconciled {
 			rec = r
 			break
 		}
@@ -2029,8 +2125,8 @@ func TestToolsChangedCallback_LogsReconciledEventOnSuccess(t *testing.T) {
 	if rec == nil {
 		t.Fatalf("log output = %q, want a line with event=list_changed_reconciled", buf.String())
 	}
-	if rec["backend"] != "fake" || rec["kind"] != "tools" {
-		t.Fatalf("backend/kind = %v/%v, want fake/tools", rec["backend"], rec["kind"])
+	if rec["backend"] != "fake" || rec["kind"] != "tool" {
+		t.Fatalf("backend/kind = %v/%v, want fake/tool", rec["backend"], rec["kind"])
 	}
 	if rec["count"] != float64(1) { // JSON numbers decode as float64
 		t.Fatalf("count = %v, want 1", rec["count"])

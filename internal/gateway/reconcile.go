@@ -84,7 +84,7 @@ func logNewConflicts(logger *slog.Logger, kind string, oldConflicts, newConflict
 	}
 	for _, c := range newConflicts {
 		if !seen[c.ExposedName] {
-			LogEvent(context.Background(), logger, slog.LevelWarn, "name_conflict",
+			LogEvent(context.Background(), logger, slog.LevelWarn, EventNameConflict,
 				"kind", kind, "name", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 		}
 	}

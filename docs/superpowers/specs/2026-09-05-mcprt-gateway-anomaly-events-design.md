@@ -238,9 +238,11 @@ After:
 			return
 		}
 		gw.UpdateTools(backendName, tools)
-		gateway.LogEvent(ctx, logger, slog.LevelInfo, "list_changed_reconciled", "backend", backendName, "kind", "tools", "count", len(tools))
+		gateway.LogEvent(ctx, logger, slog.LevelInfo, "list_changed_reconciled", "backend", backendName, "kind", "tool", "count", len(tools))
 ```
-（失敗パスの既存Warnログはそのまま——本ドキュメントは"成功パスに何もない"というギャップだけを埋める。`resourcesChangedCallback`は`resources`と`resource templates`両方の件数を1つの`LogEvent`呼び出しにまとめる: `"kind", "resources", "resource_count", len(resources), "template_count", len(templates)`。`promptsChangedCallback`は`"kind", "prompts", "count", len(prompts)`。）
+（失敗パスの既存Warnログはそのまま——本ドキュメントは"成功パスに何もない"というギャップだけを埋める。`resourcesChangedCallback`は`resources`と`resource templates`両方の件数を1つの`LogEvent`呼び出しにまとめる: `"kind", "resource", "resource_count", len(resources), "template_count", len(templates)`。`promptsChangedCallback`は`"kind", "prompt", "count", len(prompts)`。）
+
+`list_changed_reconciled`の`kind`は、`name_conflict`が使うのと**同じ単数形の語彙**（`"tool"`/`"resource"`/`"resourceTemplate"`/`"prompt"`）に揃える——同じ`kind`キーがイベントによって単数/複数どちらかバラバラでは、オペレーターが`kind`で横断的にフィルタ・集計するという`LogEvent`本来の狙いが崩れるため。ただし`"resourceTemplate"`だけは`list_changed_reconciled`側では単独の`kind`値として使わない：`resourcesChangedCallback`は`notifications/resources/list_changed`一つの通知でresourceとresource templateの両方を再解決するため、1行のログに`kind="resource"`のまま`resource_count`/`template_count`という別々のフィールドを持たせて両者を区別する（前段落の通り）。
 
 ## データフロー
 

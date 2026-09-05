@@ -134,7 +134,7 @@ func (r *ProgressRegistry) Relay(ctx context.Context, logger *slog.Logger, backe
 		return
 	}
 	if entry.backendName != backendName {
-		LogEvent(ctx, logger, slog.LevelWarn, "progress_backend_mismatch",
+		LogEvent(ctx, logger, slog.LevelWarn, EventProgressBackendMismatch,
 			"token_backend", entry.backendName, "notification_backend", backendName)
 		return
 	}
