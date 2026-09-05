@@ -1,0 +1,18 @@
+name: fix
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - uses: wtnb75/actions/golang@v1
+    - uses: wtnb75/actions/gofix@v1
+      with:
+        go-test-args: "-v ./..."
