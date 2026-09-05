@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -574,6 +575,63 @@ func TestSuperviseBackend_StopsRetryingWhenContextCancelled(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("superviseBackend did not return within 2s of ctx cancellation")
+	}
+}
+
+// TestSuperviseBackend_LogsErrorOnceThenWarnForRepeatedFailures checks that
+// a backend stuck failing to connect logs its FIRST failure at Error (so an
+// operator notices immediately), but every failure after that at Warn --
+// otherwise a backend down for hours logs an Error line at least once a
+// minute even at max backoff, which either pages on-call for a condition
+// that's already known and retrying on its own, or trains them to ignore
+// Error-level alerts altogether.
+func TestSuperviseBackend_LogsErrorOnceThenWarnForRepeatedFailures(t *testing.T) {
+	origMin, origMax := backendBackoffMin, backendBackoffMax
+	backendBackoffMin, backendBackoffMax = 10*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { backendBackoffMin, backendBackoffMax = origMin, origMax })
+
+	addr := freeAddr(t) // nothing ever listens here -- every attempt fails
+	var buf syncBuffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		superviseBackend(ctx, logger, config.BackendConfig{Name: "unreachable", Transport: "http", URL: "http://" + addr}, nil, nil, nil)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && strings.Count(buf.String(), "backend connect failed, retrying") < 3 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("superviseBackend did not return within 2s of ctx cancellation")
+	}
+
+	var levels []string
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var rec struct {
+			Level string `json:"level"`
+			Msg   string `json:"msg"`
+		}
+		if json.Unmarshal([]byte(line), &rec) == nil && rec.Msg == "backend connect failed, retrying" {
+			levels = append(levels, rec.Level)
+		}
+	}
+	if len(levels) < 3 {
+		t.Fatalf("got %d retry log lines, want at least 3 to check level downgrade: %v", len(levels), levels)
+	}
+	if levels[0] != "ERROR" {
+		t.Fatalf("first retry log level = %q, want ERROR", levels[0])
+	}
+	for i, l := range levels[1:] {
+		if l != "WARN" {
+			t.Fatalf("retry log line %d level = %q, want WARN", i+1, l)
+		}
 	}
 }
 
@@ -1900,6 +1958,103 @@ func TestScheduleDrain_ForceClosesBackendsAfterTimeout(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("backend was not force-closed within 2s of reloadDrainTimeout elapsing")
+}
+
+// closeErrConnection wraps a real mcp.Connection, forwarding everything to
+// it except Close, which closes the real connection but then returns a
+// fixed error instead of that connection's own result -- used to
+// deterministically force a *backend.Backend's Close() to return an error,
+// so tests can check that error is actually surfaced instead of discarded.
+type closeErrConnection struct {
+	mcp.Connection
+	err error
+}
+
+func (c closeErrConnection) Close() error {
+	_ = c.Connection.Close()
+	return c.err
+}
+
+// closeErrTransport wraps a real mcp.Transport, making the Connection its
+// Connect returns a closeErrConnection.
+type closeErrTransport struct {
+	inner mcp.Transport
+	err   error
+}
+
+func (t closeErrTransport) Connect(ctx context.Context) (mcp.Connection, error) {
+	conn, err := t.inner.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return closeErrConnection{conn, t.err}, nil
+}
+
+// backendWithCloseError returns a live *backend.Backend (backed by a real,
+// working in-memory MCP session) whose Close() is guaranteed to return
+// closeErr instead of nil, regardless of whether the underlying session
+// itself closes cleanly.
+func backendWithCloseError(t *testing.T, name string, closeErr error) *backend.Backend {
+	t.Helper()
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+	server := mcp.NewServer(&mcp.Implementation{Name: "fake", Version: "v1"}, nil)
+	ctx := context.Background()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, closeErrTransport{inner: clientTransport, err: closeErr}, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	return &backend.Backend{Name: name, Session: session}
+}
+
+// TestCloseBackends_LogsErrorInsteadOfDiscarding checks that closeBackends
+// (shared by runServer's final shutdown and scheduleDrain's forced close)
+// logs a backend's Close error at Warn instead of silently discarding it.
+func TestCloseBackends_LogsErrorInsteadOfDiscarding(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	b := backendWithCloseError(t, "flaky", errors.New("boom"))
+
+	closeBackends(logger, map[string]*backend.Backend{"flaky": b})
+
+	var found bool
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var rec struct {
+			Level   string `json:"level"`
+			Msg     string `json:"msg"`
+			Backend string `json:"backend"`
+			Error   string `json:"error"`
+		}
+		if json.Unmarshal([]byte(line), &rec) == nil && rec.Msg == "closing backend connection" {
+			found = true
+			if rec.Level != "WARN" || rec.Backend != "flaky" || rec.Error != "boom" {
+				t.Fatalf("log line = %+v, want level=WARN backend=flaky error=boom", rec)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("log output = %q, want a \"closing backend connection\" entry", buf.String())
+	}
+}
+
+// TestCloseBackends_NoErrorLogsNothing checks that closeBackends stays
+// silent for a backend that closes cleanly, so a normal shutdown isn't
+// polluted with a log line for every backend.
+func TestCloseBackends_NoErrorLogsNothing(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	b := backendWithCloseError(t, "clean", nil)
+
+	closeBackends(logger, map[string]*backend.Backend{"clean": b})
+
+	if buf.Len() != 0 {
+		t.Fatalf("log output = %q, want none for a clean Close", buf.String())
+	}
 }
 
 // TestSuperviseBackend_OnElicit_BoundedByElicitTimeout checks that
