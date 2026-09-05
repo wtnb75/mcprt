@@ -62,8 +62,12 @@ func TestUpdateTools_AddsRemovesAndChangesItems(t *testing.T) {
 		}},
 	}
 	table := router.Resolve(entries, toolNameOf, toolRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}},
-		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil, nil, nil)
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"a": {Name: "a"}},
+		Tables:   gateway.Tables{Tools: table},
+		Entries:  gateway.Entries{Tools: entries},
+	})
 
 	if got := downstreamToolNames(t, ctx, srv.MCP()); !equalStrings(got, []string{"gone", "keep"}) {
 		t.Fatalf("initial tools = %v, want [gone keep]", got)
@@ -92,8 +96,12 @@ func TestUpdateTools_ConflictFallbackPromotesWhenWinnerRemoved(t *testing.T) {
 	if len(table.Conflicts) != 1 || table.Conflicts[0].Winner != "a" {
 		t.Fatalf("initial table.Conflicts = %+v, want one conflict won by \"a\"", table.Conflicts)
 	}
-	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}, "b": {Name: "b"}},
-		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil, nil, nil)
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"a": {Name: "a"}, "b": {Name: "b"}},
+		Tables:   gateway.Tables{Tools: table},
+		Entries:  gateway.Entries{Tools: entries},
+	})
 
 	// backend "a" no longer serves "search": "b"'s definition should take over.
 	srv.UpdateTools("a", nil)
@@ -135,8 +143,12 @@ func TestUpdateTools_RemovesStaleRegistrationWhenNewWinnerIsInvalid(t *testing.T
 		{BackendName: "a", Items: []*mcp.Tool{{Name: "search", Description: "v1", InputSchema: toolSchema}}},
 	}
 	table := router.Resolve(entries, toolNameOf, toolRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}},
-		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil, nil, nil)
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"a": {Name: "a"}},
+		Tables:   gateway.Tables{Tools: table},
+		Entries:  gateway.Entries{Tools: entries},
+	})
 
 	if got := downstreamToolNames(t, ctx, srv.MCP()); !equalStrings(got, []string{"search"}) {
 		t.Fatalf("initial tools = %v, want [search]", got)
@@ -168,8 +180,12 @@ func TestUpdateTools_LogsOnlyNewConflicts(t *testing.T) {
 		{BackendName: "b", Items: nil},
 	}
 	table := router.Resolve(entries, toolNameOf, toolRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}, "b": {Name: "b"}},
-		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil, nil, nil)
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"a": {Name: "a"}, "b": {Name: "b"}},
+		Tables:   gateway.Tables{Tools: table},
+		Entries:  gateway.Entries{Tools: entries},
+	})
 
 	buf.reset() // discard whatever New itself may have logged (nothing, in this case, but keep the assertion below scoped to UpdateTools)
 
@@ -196,8 +212,12 @@ func TestUpdateTools_ConcurrentCallsDoNotRace(t *testing.T) {
 		{BackendName: "b", Items: []*mcp.Tool{{Name: "y", InputSchema: toolSchema}}},
 	}
 	table := router.Resolve(entries, toolNameOf, toolRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}, "b": {Name: "b"}},
-		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil, nil, nil)
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"a": {Name: "a"}, "b": {Name: "b"}},
+		Tables:   gateway.Tables{Tools: table},
+		Entries:  gateway.Entries{Tools: entries},
+	})
 
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
@@ -242,10 +262,12 @@ func TestUpdateResources_AddsRemovesResourcesAndTemplatesInOneCall(t *testing.T)
 	resourceTable := router.Resolve(resourceEntries, resourceNameOf, resourceRename, nil)
 	templateTable := router.Resolve(templateEntries, resourceTemplateNameOf, resourceTemplateRename, nil)
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}},
-		gateway.Tables{Resources: resourceTable, ResourceTemplates: templateTable},
-		gateway.Entries{Resources: resourceEntries, ResourceTemplates: templateEntries},
-		gateway.Overrides{}, nil, nil, nil)
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"a": {Name: "a"}},
+		Tables:   gateway.Tables{Resources: resourceTable, ResourceTemplates: templateTable},
+		Entries:  gateway.Entries{Resources: resourceEntries, ResourceTemplates: templateEntries},
+	})
 
 	srv.UpdateResources("a",
 		[]*mcp.Resource{{URI: "file:///keep", Name: "keep"}, {URI: "file:///new", Name: "new"}},
@@ -290,8 +312,12 @@ func TestUpdatePrompts_AddsRemovesAndChangesItems(t *testing.T) {
 		{BackendName: "a", Items: []*mcp.Prompt{{Name: "keep", Description: "v1"}, {Name: "gone", Description: "v1"}}},
 	}
 	table := router.Resolve(entries, promptNameOf, promptRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}},
-		gateway.Tables{Prompts: table}, gateway.Entries{Prompts: entries}, gateway.Overrides{}, nil, nil, nil)
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"a": {Name: "a"}},
+		Tables:   gateway.Tables{Prompts: table},
+		Entries:  gateway.Entries{Prompts: entries},
+	})
 
 	srv.UpdatePrompts("a", []*mcp.Prompt{{Name: "keep", Description: "v2"}, {Name: "new", Description: "v1"}})
 
@@ -325,10 +351,12 @@ func TestUpdateResourcesAndUpdatePrompts_ConcurrentCallsDoNotRace(t *testing.T) 
 	resourceTable := router.Resolve(resourceEntries, resourceNameOf, resourceRename, nil)
 	promptTable := router.Resolve(promptEntries, promptNameOf, promptRename, nil)
 
-	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}},
-		gateway.Tables{Resources: resourceTable, Prompts: promptTable},
-		gateway.Entries{Resources: resourceEntries, Prompts: promptEntries},
-		gateway.Overrides{}, nil, nil, nil)
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"a": {Name: "a"}},
+		Tables:   gateway.Tables{Resources: resourceTable, Prompts: promptTable},
+		Entries:  gateway.Entries{Resources: resourceEntries, Prompts: promptEntries},
+	})
 
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {
@@ -357,8 +385,12 @@ func TestConnectBackend_AddsNewBackendNotInEntries(t *testing.T) {
 		{BackendName: "a", Items: []*mcp.Tool{{Name: "existing", InputSchema: toolSchema}}},
 	}
 	table := router.Resolve(entries, toolNameOf, toolRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}},
-		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil, nil, nil)
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"a": {Name: "a"}},
+		Tables:   gateway.Tables{Tools: table},
+		Entries:  gateway.Entries{Tools: entries},
+	})
 
 	newConn := &backend.Backend{Name: "new"}
 	srv.ConnectBackend("new", newConn, "new-",
@@ -384,8 +416,12 @@ func TestConnectBackend_ReconnectsExistingBackend(t *testing.T) {
 	}
 	table := router.Resolve(entries, toolNameOf, toolRename, nil)
 	oldConn := &backend.Backend{Name: "a"}
-	srv := gateway.New(logger, map[string]*backend.Backend{"a": oldConn},
-		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil, nil, nil)
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"a": oldConn},
+		Tables:   gateway.Tables{Tools: table},
+		Entries:  gateway.Entries{Tools: entries},
+	})
 
 	// Simulate a disconnect (as superviseBackend does) before the reconnect.
 	srv.UpdateTools("a", nil)
@@ -418,8 +454,12 @@ func TestConnectBackend_ReconnectIntroducingConflictLogsIt(t *testing.T) {
 		{BackendName: "b", Items: nil}, // "b" starts with nothing, matching UpdateTools' precedent
 	}
 	table := router.Resolve(entries, toolNameOf, toolRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}, "b": {Name: "b"}},
-		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil, nil, nil)
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"a": {Name: "a"}, "b": {Name: "b"}},
+		Tables:   gateway.Tables{Tools: table},
+		Entries:  gateway.Entries{Tools: entries},
+	})
 
 	buf.reset()
 	srv.ConnectBackend("b", &backend.Backend{Name: "b"}, "",
@@ -441,8 +481,12 @@ func TestConnectBackend_ConcurrentWithUpdateToolsDoesNotRace(t *testing.T) {
 		{BackendName: "a", Items: []*mcp.Tool{{Name: "x", InputSchema: toolSchema}}},
 	}
 	table := router.Resolve(entries, toolNameOf, toolRename, nil)
-	srv := gateway.New(logger, map[string]*backend.Backend{"a": {Name: "a"}},
-		gateway.Tables{Tools: table}, gateway.Entries{Tools: entries}, gateway.Overrides{}, nil, nil, nil)
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"a": {Name: "a"}},
+		Tables:   gateway.Tables{Tools: table},
+		Entries:  gateway.Entries{Tools: entries},
+	})
 
 	var wg sync.WaitGroup
 	for i := 0; i < 20; i++ {

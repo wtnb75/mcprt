@@ -140,7 +140,7 @@ func (s *Server) updateToolsLocked(backendName string, items []*mcp.Tool, rebind
 		if unchanged && !(rebind && boundTo(resolved, backendName)) {
 			continue
 		}
-		if !registerTool(s.mcp, s.logger, s.backends, resolved, s.maskKeys, s.progress, s.elicit) {
+		if !registerTool(s.mcp, s.logger, s.backends, resolved, s.maskKeys, s.relays) {
 			// Every candidate for name was unregisterable (registerTool
 			// already logged this). Without this, a prior successful
 			// registration for the same exposed name would keep serving

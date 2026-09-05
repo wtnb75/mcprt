@@ -49,6 +49,30 @@ type Overrides struct {
 	Prompts           map[string]string
 }
 
+// Relays bundles the optional cross-call correlation services a gateway
+// can wire in. A nil field means that feature is disabled, matching the
+// existing nil-means-disabled convention each of *ProgressRegistry and
+// *ElicitationRouter already had as standalone parameters.
+type Relays struct {
+	Progress *ProgressRegistry
+	Elicit   *ElicitationRouter
+}
+
+// NewConfig bundles New's construction parameters. Fields left at their
+// zero value behave exactly as an omitted/nil positional argument did
+// before this type existed: a nil Tables/Entries/Overrides sub-field means
+// that category has no items, a nil MaskKeys means no extra masking, and a
+// nil Relays.Progress/Relays.Elicit means that relay feature is disabled.
+type NewConfig struct {
+	Logger    *slog.Logger
+	Backends  map[string]*backend.Backend
+	Tables    Tables
+	Entries   Entries
+	Overrides Overrides
+	MaskKeys  []string
+	Relays    Relays
+}
+
 // Server wraps an *mcp.Server with the reconcile state needed to react to a
 // backend's list_changed notification: its per-backend raw item lists, the
 // currently-registered routing table, and the exposed-name overrides -- all
@@ -68,8 +92,7 @@ type Server struct {
 	logger   *slog.Logger
 	backends map[string]*backend.Backend
 	maskKeys []string
-	progress *ProgressRegistry
-	elicit   *ElicitationRouter
+	relays   Relays
 
 	mu sync.Mutex
 
@@ -132,57 +155,57 @@ func emptyTable[T any](t *router.Table[T]) *router.Table[T] {
 	return &router.Table[T]{}
 }
 
-// New builds a Server that exposes tables' resolved tools/resources/prompts,
-// forwarding each call to the backend that owns it, and retains entries and
-// overrides so a later UpdateTools/UpdateResources/UpdatePrompts call can
-// re-run router.Resolve when a backend reports its list has changed.
-// backends must contain an entry for every BackendName referenced in
-// tables (the caller builds both from the same set of connected backends).
-func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Tables, entries Entries, overrides Overrides, maskKeys []string, progress *ProgressRegistry, elicit *ElicitationRouter) *Server {
-	mcpSrv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{Logger: logger})
+// New builds a Server that exposes cfg.Tables' resolved tools/resources/
+// prompts, forwarding each call to the backend that owns it, and retains
+// cfg.Entries and cfg.Overrides so a later UpdateTools/UpdateResources/
+// UpdatePrompts call can re-run router.Resolve when a backend reports its
+// list has changed. cfg.Backends must contain an entry for every
+// BackendName referenced in cfg.Tables (the caller builds both from the
+// same set of connected backends).
+func New(cfg NewConfig) *Server {
+	mcpSrv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{Logger: cfg.Logger})
 
 	s := &Server{
 		mcp:      mcpSrv,
-		logger:   logger,
-		backends: backends,
-		maskKeys: maskKeys,
-		progress: progress,
-		elicit:   elicit,
+		logger:   cfg.Logger,
+		backends: cfg.Backends,
+		maskKeys: cfg.MaskKeys,
+		relays:   cfg.Relays,
 
-		toolEntries:   entries.Tools,
-		toolTable:     emptyTable(tables.Tools),
-		toolOverrides: overrides.Tools,
+		toolEntries:   cfg.Entries.Tools,
+		toolTable:     emptyTable(cfg.Tables.Tools),
+		toolOverrides: cfg.Overrides.Tools,
 
-		resourceEntries:           entries.Resources,
-		resourceTable:             emptyTable(tables.Resources),
-		resourceOverrides:         overrides.Resources,
-		resourceTemplateEntries:   entries.ResourceTemplates,
-		resourceTemplateTable:     emptyTable(tables.ResourceTemplates),
-		resourceTemplateOverrides: overrides.ResourceTemplates,
+		resourceEntries:           cfg.Entries.Resources,
+		resourceTable:             emptyTable(cfg.Tables.Resources),
+		resourceOverrides:         cfg.Overrides.Resources,
+		resourceTemplateEntries:   cfg.Entries.ResourceTemplates,
+		resourceTemplateTable:     emptyTable(cfg.Tables.ResourceTemplates),
+		resourceTemplateOverrides: cfg.Overrides.ResourceTemplates,
 
-		promptEntries:   entries.Prompts,
-		promptTable:     emptyTable(tables.Prompts),
-		promptOverrides: overrides.Prompts,
+		promptEntries:   cfg.Entries.Prompts,
+		promptTable:     emptyTable(cfg.Tables.Prompts),
+		promptOverrides: cfg.Overrides.Prompts,
 	}
 
-	if tables.Tools != nil {
-		for _, resolved := range tables.Tools.Items {
-			registerTool(mcpSrv, logger, backends, resolved, maskKeys, progress, elicit)
+	if cfg.Tables.Tools != nil {
+		for _, resolved := range cfg.Tables.Tools.Items {
+			registerTool(mcpSrv, cfg.Logger, cfg.Backends, resolved, cfg.MaskKeys, cfg.Relays)
 		}
 	}
-	if tables.Resources != nil {
-		for _, resolved := range tables.Resources.Items {
-			registerResource(mcpSrv, logger, backends, resolved, maskKeys)
+	if cfg.Tables.Resources != nil {
+		for _, resolved := range cfg.Tables.Resources.Items {
+			registerResource(mcpSrv, cfg.Logger, cfg.Backends, resolved, cfg.MaskKeys)
 		}
 	}
-	if tables.ResourceTemplates != nil {
-		for _, resolved := range tables.ResourceTemplates.Items {
-			registerResourceTemplate(mcpSrv, logger, backends, resolved, maskKeys)
+	if cfg.Tables.ResourceTemplates != nil {
+		for _, resolved := range cfg.Tables.ResourceTemplates.Items {
+			registerResourceTemplate(mcpSrv, cfg.Logger, cfg.Backends, resolved, cfg.MaskKeys)
 		}
 	}
-	if tables.Prompts != nil {
-		for _, resolved := range tables.Prompts.Items {
-			registerPrompt(mcpSrv, logger, backends, resolved, maskKeys)
+	if cfg.Tables.Prompts != nil {
+		for _, resolved := range cfg.Tables.Prompts.Items {
+			registerPrompt(mcpSrv, cfg.Logger, cfg.Backends, resolved, cfg.MaskKeys)
 		}
 	}
 
@@ -195,7 +218,7 @@ func New(logger *slog.Logger, backends map[string]*backend.Backend, tables Table
 // need to take a validly-defined loser down with it. It reports whether
 // anything was registered, so a reconcile caller (see reconcile.go) can
 // clean up a stale prior registration when every candidate fails.
-func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Tool], maskKeys []string, progress *ProgressRegistry, elicit *ElicitationRouter) (ok bool) {
+func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*backend.Backend, resolved *router.Resolved[*mcp.Tool], maskKeys []string, relays Relays) (ok bool) {
 	candidates := append([]router.Candidate[*mcp.Tool]{{
 		Item:         resolved.Item,
 		BackendName:  resolved.BackendName,
@@ -204,7 +227,7 @@ func registerTool(srv *mcp.Server, logger *slog.Logger, backends map[string]*bac
 
 	for _, c := range candidates {
 		b := backends[c.BackendName]
-		if addTool(srv, logger, c.Item, callHandler(logger, maskKeys, b, c.OriginalName, progress, elicit)) {
+		if addTool(srv, logger, c.Item, callHandler(logger, maskKeys, b, c.OriginalName, relays)) {
 			return true
 		}
 	}
@@ -353,17 +376,17 @@ func promptGetHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend
 // the raw arguments through unchanged. It wraps the call in a span
 // (startCallSpan is a no-op for stdio-originated calls) and logs it via
 // logCall, success or failure, so a dead or erroring backend — and normal
-// usage — is visible to the operator. When progress is non-nil and the
-// downstream request carries a progressToken, it registers a fresh
+// usage — is visible to the operator. When relays.Progress is non-nil and
+// the downstream request carries a progressToken, it registers a fresh
 // correlation entry so a notifications/progress the backend sends mid-call
-// (relayed via progress.Relay, wired through backend.ChangeCallbacks.
+// (relayed via relays.Progress.Relay, wired through backend.ChangeCallbacks.
 // OnProgress) reaches the downstream caller under its own token. When
-// elicit is non-nil, it records this call as in-flight against b for the
-// whole duration of the backend call, so a backend's elicitation/create
-// (relayed via elicit.Route, wired through backend.ChangeCallbacks.
+// relays.Elicit is non-nil, it records this call as in-flight against b for
+// the whole duration of the backend call, so a backend's elicitation/create
+// (relayed via relays.Elicit.Route, wired through backend.ChangeCallbacks.
 // OnElicit) can be routed back to req.Session when -- and only when --
 // this is the sole tools/call in flight against b.
-func callHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, originalName string, progress *ProgressRegistry, elicit *ElicitationRouter) mcp.ToolHandler {
+func callHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, originalName string, relays Relays) mcp.ToolHandler {
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		start := time.Now()
 		ctx, span := startCallSpan(ctx, req.Extra, "tools/call",
@@ -371,25 +394,25 @@ func callHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, ori
 			attribute.String("mcp.tool.name", originalName))
 		defer span.End()
 
-		if elicit != nil {
-			leave := elicit.Enter(b.Name, req.Session)
+		if relays.Elicit != nil {
+			leave := relays.Elicit.Enter(b.Name, req.Session)
 			defer leave()
 		}
 
 		params := &mcp.CallToolParams{Name: originalName, Arguments: req.Params.Arguments}
 
 		var entry *progressEntry
-		if progress != nil {
+		if relays.Progress != nil {
 			if token := req.Params.GetProgressToken(); token != nil {
 				var internalToken uint64
 				var cleanup func()
-				internalToken, entry, cleanup = progress.Register(req.Session, token, b.Name)
+				internalToken, entry, cleanup = relays.Progress.Register(req.Session, token, b.Name)
 				defer cleanup()
 				// SetProgressToken only accepts int/int32/int64/string (see
-				// go-sdk's setProgressToken); progress.Register hands out a
-				// uint64, so it must be narrowed to int64 here.
-				// normalizeProgressToken (progress.go) accepts int64 back,
-				// so this round-trips correctly on the relay side.
+				// go-sdk's setProgressToken); Register hands out a uint64, so
+				// it must be narrowed to int64 here. normalizeProgressToken
+				// (progress.go) accepts int64 back, so this round-trips
+				// correctly on the relay side.
 				params.SetProgressToken(int64(internalToken))
 			}
 		}
