@@ -14,6 +14,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/wtnb75/mcprt/internal/backend"
+	"github.com/wtnb75/mcprt/internal/config"
 	"github.com/wtnb75/mcprt/internal/gateway"
 	"github.com/wtnb75/mcprt/internal/router"
 )
@@ -466,6 +467,107 @@ func TestConnectBackend_ReconnectIntroducingConflictLogsIt(t *testing.T) {
 		[]*mcp.Tool{{Name: "search", InputSchema: toolSchema}}, nil, nil, nil)
 	if !buf.contains("gateway event") || !buf.contains("event=name_conflict") || !buf.contains("kind=tool") {
 		t.Fatalf("log output = %q, want a \"gateway event\" warning with event=name_conflict and kind=tool", buf.String())
+	}
+}
+
+// TestConnectBackend_RebindsFallbackHandlerWhenLoserReconnects checks that
+// boundTo's Fallbacks branch actually matters: reconnecting a backend that
+// is only a FALLBACK candidate (not the resolved winner) for a name still
+// forces that name's handler to rebind, even though the resolved *value*
+// for the name is completely unchanged. Without this, the registered
+// handler would stay bound to the reconnecting backend's OLD (now closed)
+// connection forever, because a value-equality diff alone can't see that
+// the object identity behind an unchanged-looking fallback candidate
+// changed (this plan's Task 3 review, finding 9 -- boundTo's Fallbacks
+// branch had no test exercising it before this one).
+func TestConnectBackend_RebindsFallbackHandlerWhenLoserReconnects(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx := context.Background()
+
+	// backend "a"'s "search" has no InputSchema: mcp.Server.AddTool panics
+	// on that, registerTool's addTool wrapper recovers and falls back to
+	// the next candidate (exactly like TestGateway_FallsBackWhenWinnerSchemaInvalid),
+	// but "a" stays the nominal conflict winner (Resolved.BackendName)
+	// throughout this test -- only "b", the actually-registered fallback,
+	// reconnects.
+	backendBGen1 := newFakeBackendServer("backend-b-gen1", "search")
+	httpBGen1 := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendBGen1 }, nil))
+	defer httpBGen1.Close()
+	connBGen1, err := backend.Connect(ctx, config.BackendConfig{Name: "b", Transport: "http", URL: httpBGen1.URL}, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("connect b (gen 1): %v", err)
+	}
+	toolsBGen1, err := connBGen1.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("list b (gen 1) tools: %v", err)
+	}
+
+	entries := []router.Entry[*mcp.Tool]{
+		{BackendName: "a", Items: []*mcp.Tool{{Name: "search", Description: "invalid, no schema"}}},
+		{BackendName: "b", Items: toolsBGen1},
+	}
+	table := router.Resolve(entries, toolNameOf, toolRename, nil)
+	if len(table.Conflicts) != 1 || table.Conflicts[0].Winner != "a" {
+		t.Fatalf("initial table.Conflicts = %+v, want one conflict won by \"a\"", table.Conflicts)
+	}
+
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"a": {Name: "a"}, "b": connBGen1},
+		Tables:   gateway.Tables{Tools: table},
+		Entries:  gateway.Entries{Tools: entries},
+	})
+
+	callSearch := func() string {
+		t.Helper()
+		gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+		defer gw.Close()
+		client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+		session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+		if err != nil {
+			t.Fatalf("connect to gateway: %v", err)
+		}
+		defer func() { _ = session.Close() }()
+		res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "search", Arguments: map[string]any{}})
+		if err != nil {
+			t.Fatalf("call search: %v", err)
+		}
+		structured, ok := res.StructuredContent.(map[string]any)
+		if !ok {
+			t.Fatalf("search result = %+v, want structured content", res.StructuredContent)
+		}
+		source, _ := structured["source"].(string)
+		return source
+	}
+
+	if got := callSearch(); got != "backend-b-gen1" {
+		t.Fatalf("search result source = %q, want backend-b-gen1 (the fallback, since a's definition is invalid)", got)
+	}
+
+	// "b" disconnects and reconnects with the exact same tool definition:
+	// Resolved.BackendName for "search" is still "a" (still the nominal
+	// conflict winner) and the resolved VALUE is unchanged too (identical
+	// items from both a and b), so this exercises ONLY boundTo's Fallbacks
+	// branch -- the BackendName==target branch is already covered by
+	// TestConnectBackend_ReconnectsExistingBackend.
+	backendBGen2 := newFakeBackendServer("backend-b-gen2", "search")
+	httpBGen2 := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendBGen2 }, nil))
+	defer httpBGen2.Close()
+	connBGen2, err := backend.Connect(ctx, config.BackendConfig{Name: "b", Transport: "http", URL: httpBGen2.URL}, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("connect b (gen 2): %v", err)
+	}
+	defer func() { _ = connBGen2.Close() }()
+	toolsBGen2, err := connBGen2.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("list b (gen 2) tools: %v", err)
+	}
+
+	srv.ConnectBackend("b", connBGen2, "", toolsBGen2, nil, nil, nil)
+	_ = connBGen1.Close() // gen 1 is done: prove the handler no longer depends on it
+
+	if got := callSearch(); got != "backend-b-gen2" {
+		t.Fatalf("search result source after reconnect = %q, want backend-b-gen2 (the handler must rebind to the new connection)", got)
 	}
 }
 
