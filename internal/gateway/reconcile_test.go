@@ -191,16 +191,16 @@ func TestUpdateTools_LogsOnlyNewConflicts(t *testing.T) {
 
 	// First reconcile introduces a brand-new conflict: must log.
 	srv.UpdateTools("b", []*mcp.Tool{{Name: "search", InputSchema: toolSchema}})
-	if !buf.contains("tool name conflict") {
-		t.Fatalf("log output = %q, want a \"tool name conflict\" warning for the newly-introduced conflict", buf.String())
+	if !buf.contains("gateway event") || !buf.contains("event=name_conflict") {
+		t.Fatalf("log output = %q, want a \"gateway event\" warning with event=name_conflict for the newly-introduced conflict", buf.String())
 	}
 	buf.reset()
 
 	// Second reconcile touches an unrelated tool; the SAME conflict persists
 	// but must NOT be re-logged.
 	srv.UpdateTools("a", []*mcp.Tool{{Name: "search", InputSchema: toolSchema}, {Name: "other", InputSchema: toolSchema}})
-	if buf.contains("tool name conflict") {
-		t.Fatalf("log output = %q, want no \"tool name conflict\" warning for an already-known conflict", buf.String())
+	if buf.contains("event=name_conflict") {
+		t.Fatalf("log output = %q, want no conflict warning for an already-known conflict", buf.String())
 	}
 }
 
@@ -464,8 +464,8 @@ func TestConnectBackend_ReconnectIntroducingConflictLogsIt(t *testing.T) {
 	buf.reset()
 	srv.ConnectBackend("b", &backend.Backend{Name: "b"}, "",
 		[]*mcp.Tool{{Name: "search", InputSchema: toolSchema}}, nil, nil, nil)
-	if !buf.contains("tool name conflict") {
-		t.Fatalf("log output = %q, want a \"tool name conflict\" warning", buf.String())
+	if !buf.contains("gateway event") || !buf.contains("event=name_conflict") {
+		t.Fatalf("log output = %q, want a \"gateway event\" warning with event=name_conflict", buf.String())
 	}
 }
 

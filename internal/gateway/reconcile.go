@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"log/slog"
 	"reflect"
 
@@ -67,18 +68,24 @@ func replaceEntry[T any](entries []router.Entry[T], backendName string, items []
 	return out
 }
 
-// logNewConflicts warns about every conflict in newConflicts whose exposed
-// name wasn't already conflicting in oldConflicts -- an already-known
-// conflict isn't re-logged, and a conflict that disappears isn't logged at
-// all, matching startup's one-shot conflict logging.
-func logNewConflicts(logger *slog.Logger, msg, field string, oldConflicts, newConflicts []router.Conflict) {
+// logNewConflicts records, via LogEvent, every conflict in newConflicts
+// whose exposed name wasn't already conflicting in oldConflicts -- an
+// already-known conflict isn't re-logged, and a conflict that disappears
+// isn't logged at all, matching startup's one-shot conflict logging.
+// context.Background() is used rather than a caller-supplied ctx: this
+// fires from Server.UpdateTools/UpdateResources/UpdatePrompts, whose
+// signatures carry no ctx (they reconcile a whole backend's list, not a
+// single tracked request), so there is no request-scoped context to thread
+// through here without a larger, out-of-scope signature change.
+func logNewConflicts(logger *slog.Logger, kind string, oldConflicts, newConflicts []router.Conflict) {
 	seen := make(map[string]bool, len(oldConflicts))
 	for _, c := range oldConflicts {
 		seen[c.ExposedName] = true
 	}
 	for _, c := range newConflicts {
 		if !seen[c.ExposedName] {
-			logger.Warn(msg, field, c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
+			LogEvent(context.Background(), logger, slog.LevelWarn, "name_conflict",
+				"kind", kind, "name", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 		}
 	}
 }
@@ -150,7 +157,7 @@ func (s *Server) updateToolsLocked(backendName string, items []*mcp.Tool, rebind
 			s.mcp.RemoveTools(name)
 		}
 	}
-	logNewConflicts(s.logger, "tool name conflict", "tool", s.toolTable.Conflicts, newTable.Conflicts)
+	logNewConflicts(s.logger, "tool", s.toolTable.Conflicts, newTable.Conflicts)
 
 	s.toolTable = newTable
 }
@@ -184,7 +191,7 @@ func (s *Server) updateResourcesLocked(backendName string, resources []*mcp.Reso
 		}
 		registerResource(s.mcp, s.logger, s.backends, resolved, s.maskKeys)
 	}
-	logNewConflicts(s.logger, "resource URI conflict", "uri", s.resourceTable.Conflicts, newResourceTable.Conflicts)
+	logNewConflicts(s.logger, "resource", s.resourceTable.Conflicts, newResourceTable.Conflicts)
 	s.resourceTable = newResourceTable
 
 	s.resourceTemplateEntries = replaceEntry(s.resourceTemplateEntries, backendName, templates)
@@ -202,7 +209,7 @@ func (s *Server) updateResourcesLocked(backendName string, resources []*mcp.Reso
 		}
 		registerResourceTemplate(s.mcp, s.logger, s.backends, resolved, s.maskKeys)
 	}
-	logNewConflicts(s.logger, "resource template URI conflict", "uriTemplate", s.resourceTemplateTable.Conflicts, newTemplateTable.Conflicts)
+	logNewConflicts(s.logger, "resourceTemplate", s.resourceTemplateTable.Conflicts, newTemplateTable.Conflicts)
 	s.resourceTemplateTable = newTemplateTable
 }
 
@@ -234,7 +241,7 @@ func (s *Server) updatePromptsLocked(backendName string, items []*mcp.Prompt, re
 		}
 		registerPrompt(s.mcp, s.logger, s.backends, resolved, s.maskKeys)
 	}
-	logNewConflicts(s.logger, "prompt name conflict", "prompt", s.promptTable.Conflicts, newTable.Conflicts)
+	logNewConflicts(s.logger, "prompt", s.promptTable.Conflicts, newTable.Conflicts)
 
 	s.promptTable = newTable
 }
