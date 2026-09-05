@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -45,6 +46,8 @@ func MaskArguments(v any, extraKeys []string) any {
 			m[k] = val
 		}
 		return maskValue(m, extraKeys)
+	case map[string]any:
+		return maskValue(t, extraKeys)
 	default:
 		return fmt.Sprintf("%v", v)
 	}
@@ -91,6 +94,44 @@ func shouldMask(key string, extraKeys []string) bool {
 		}
 	}
 	return false
+}
+
+// freeTextMaskRE matches a default mask pattern immediately followed by an
+// assignment-like ':' or '=', allowing a suffix (e.g. "api_key" via "key",
+// "Authorization:" via "auth") and surrounding whitespace. Requiring the
+// assignment shape (rather than a bare substring match, as shouldMask uses
+// for object keys) avoids over-redacting ordinary prose that happens to
+// contain one of these short words, e.g. "keyword" or "auth failed".
+var freeTextMaskRE = compileFreeTextMaskRE(nil)
+
+// compileFreeTextMaskRE builds the regexp maskFreeText matches against,
+// covering defaultMaskKeyPatterns plus any extraKeys.
+func compileFreeTextMaskRE(extraKeys []string) *regexp.Regexp {
+	patterns := append(append([]string{}, defaultMaskKeyPatterns...), extraKeys...)
+	quoted := make([]string, len(patterns))
+	for i, p := range patterns {
+		quoted[i] = regexp.QuoteMeta(p)
+	}
+	return regexp.MustCompile(`(?i)(?:` + strings.Join(quoted, "|") + `)[\w.-]*\s*[:=]`)
+}
+
+// maskFreeText returns "***" if s looks like it embeds a "key=value" or
+// "key: value" pair whose key matches a default or extra mask pattern, and s
+// unchanged otherwise. Unlike maskValue, s is not a structured key/value
+// object -- it's free text (e.g. a backend-controlled progress message) that
+// may still echo back something sensitive, so the whole value is redacted
+// rather than just a matched key's value: a backend could otherwise split a
+// secret across a redacted key and trailing free text (e.g. "Authorization:
+// Bearer xyz" has no separate key for "xyz").
+func maskFreeText(s string, extraKeys []string) string {
+	re := freeTextMaskRE
+	if len(extraKeys) > 0 {
+		re = compileFreeTextMaskRE(extraKeys)
+	}
+	if re.MatchString(s) {
+		return "***"
+	}
+	return s
 }
 
 // hasArgs reports whether args carries meaningful call arguments. args is
@@ -150,7 +191,7 @@ func logCall(ctx context.Context, logger *slog.Logger, kind, nameKey, name, back
 		if count, lastMessage := progress.Summary(); count > 0 {
 			attrs = append(attrs, "progress_count", count)
 			if lastMessage != "" {
-				attrs = append(attrs, "progress_last_message", lastMessage)
+				attrs = append(attrs, "progress_last_message", maskFreeText(lastMessage, maskKeys))
 			}
 		}
 	}

@@ -129,6 +129,11 @@ func TestMaskArguments(t *testing.T) {
 			want: map[string]any{"APIKey": "***", "Credential_ID": "***", "Passwd": "***", "access_token": "***"},
 		},
 		{
+			name: "map[string]any (tool call Arguments) is masked like RawMessage",
+			v:    map[string]any{"api_key": "secret123", "name": "alice"},
+			want: map[string]any{"api_key": "***", "name": "alice"},
+		},
+		{
 			name: "scalar RawMessage is returned unchanged",
 			v:    json.RawMessage(`"hello"`),
 			want: "hello",
@@ -152,6 +157,71 @@ func TestMaskArguments(t *testing.T) {
 				t.Fatalf("MaskArguments(%#v, %v) = %#v, want %#v", c.v, c.extraKeys, got, c.want)
 			}
 		})
+	}
+}
+
+func TestMaskFreeText(t *testing.T) {
+	cases := []struct {
+		name      string
+		s         string
+		extraKeys []string
+		want      string
+	}{
+		{
+			name: "key=value shaped substring matching a default pattern is fully redacted",
+			s:    "retrying with token=sk-live-abc123",
+			want: "***",
+		},
+		{
+			name: "key: value shaped substring matching a default pattern is fully redacted",
+			s:    "Authorization: Bearer xyz",
+			want: "***",
+		},
+		{
+			name: "plain text with no key/value shape is left unchanged",
+			s:    "processing item 3 of 10",
+			want: "processing item 3 of 10",
+		},
+		{
+			name: "a default pattern appearing without an assignment is not a false positive",
+			s:    "keyword search complete",
+			want: "keyword search complete",
+		},
+		{
+			name:      "extraKeys redact in addition to the defaults",
+			s:         "custom_secret=abc",
+			extraKeys: []string{"secret"},
+			want:      "***",
+		},
+		{
+			name: "a pattern that is only an extraKey elsewhere does not redact without it",
+			s:    "custom_secret=abc",
+			want: "custom_secret=abc",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := maskFreeText(c.s, c.extraKeys)
+			if got != c.want {
+				t.Fatalf("maskFreeText(%q, %v) = %q, want %q", c.s, c.extraKeys, got, c.want)
+			}
+		})
+	}
+}
+
+func TestLogCall_MasksProgressLastMessage(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	sess := &mcp.ServerSession{}
+	progress := &progressEntry{count: 1, lastMessage: "retrying with token=sk-live-abc123"}
+
+	logCall(context.Background(), logger, "tool", "tool", "mytool", "backend-a", sess,
+		nil, nil, time.Now(), nil, progress)
+
+	rec := decodeLastLogLine(t, buf.String())
+	if rec["progress_last_message"] != "***" {
+		t.Fatalf("progress_last_message = %v, want it masked", rec["progress_last_message"])
 	}
 }
 
