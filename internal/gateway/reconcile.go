@@ -144,7 +144,7 @@ func (s *Server) updateToolsLocked(backendName string, items []*mcp.Tool, rebind
 	for name, resolved := range newTable.Items {
 		old, ok := s.toolTable.Items[name]
 		unchanged := ok && reflect.DeepEqual(old, resolved)
-		if unchanged && !(rebind && boundTo(resolved, backendName)) {
+		if unchanged && (!rebind || !boundTo(resolved, backendName)) {
 			continue
 		}
 		if !registerTool(s.mcp, s.logger, s.backends, resolved, s.maskKeys, s.relays) {
@@ -186,7 +186,7 @@ func (s *Server) updateResourcesLocked(backendName string, resources []*mcp.Reso
 	for name, resolved := range newResourceTable.Items {
 		old, ok := s.resourceTable.Items[name]
 		unchanged := ok && reflect.DeepEqual(old, resolved)
-		if unchanged && !(rebind && boundTo(resolved, backendName)) {
+		if unchanged && (!rebind || !boundTo(resolved, backendName)) {
 			continue
 		}
 		registerResource(s.mcp, s.logger, s.backends, resolved, s.maskKeys)
@@ -204,7 +204,7 @@ func (s *Server) updateResourcesLocked(backendName string, resources []*mcp.Reso
 	for name, resolved := range newTemplateTable.Items {
 		old, ok := s.resourceTemplateTable.Items[name]
 		unchanged := ok && reflect.DeepEqual(old, resolved)
-		if unchanged && !(rebind && boundTo(resolved, backendName)) {
+		if unchanged && (!rebind || !boundTo(resolved, backendName)) {
 			continue
 		}
 		registerResourceTemplate(s.mcp, s.logger, s.backends, resolved, s.maskKeys)
@@ -236,7 +236,7 @@ func (s *Server) updatePromptsLocked(backendName string, items []*mcp.Prompt, re
 	for name, resolved := range newTable.Items {
 		old, ok := s.promptTable.Items[name]
 		unchanged := ok && reflect.DeepEqual(old, resolved)
-		if unchanged && !(rebind && boundTo(resolved, backendName)) {
+		if unchanged && (!rebind || !boundTo(resolved, backendName)) {
 			continue
 		}
 		registerPrompt(s.mcp, s.logger, s.backends, resolved, s.maskKeys)
