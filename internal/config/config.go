@@ -69,6 +69,21 @@ type TimeoutsConfig struct {
 	// no effect unless BackendKeepAlive is non-zero. Zero defers to
 	// go-sdk's own default of 1.
 	BackendKeepAliveFailureThreshold int `yaml:"backend_keepalive_failure_threshold,omitempty"`
+	// DownstreamKeepAlive is BackendKeepAlive's counterpart for the other
+	// direction: if non-zero, mcprt sends a periodic MCP "ping" to every
+	// downstream client at this interval, closing that client's session
+	// after DownstreamKeepAliveFailureThreshold consecutive failures. This
+	// detects a downstream client that's gone silent (crashed, network
+	// drop) without waiting for its next request. Zero (the default)
+	// disables this entirely. Unlike BackendKeepAlive, this is applied
+	// fresh on every SIGHUP-triggered reload too, not just at process
+	// startup -- see internal/cli's buildGateway.
+	DownstreamKeepAlive Duration `yaml:"downstream_keepalive,omitempty"`
+	// DownstreamKeepAliveFailureThreshold is the number of consecutive
+	// keepalive ping failures tolerated before closing a downstream
+	// client's session. Has no effect unless DownstreamKeepAlive is
+	// non-zero. Zero defers to go-sdk's own default of 1.
+	DownstreamKeepAliveFailureThreshold int `yaml:"downstream_keepalive_failure_threshold,omitempty"`
 }
 
 // ListenConfig controls which client-facing transports the gateway serves.
@@ -309,15 +324,16 @@ func validate(cfg *Config) error {
 // internal/cli's applyTimeouts).
 func validateTimeouts(t TimeoutsConfig) error {
 	fields := map[string]Duration{
-		"shutdown":            t.Shutdown,
-		"telemetry_shutdown":  t.TelemetryShutdown,
-		"backend_connect":     t.BackendConnect,
-		"reload_drain":        t.ReloadDrain,
-		"elicit":              t.Elicit,
-		"progress_relay":      t.ProgressRelay,
-		"backend_backoff_min": t.BackendBackoffMin,
-		"backend_backoff_max": t.BackendBackoffMax,
-		"backend_keepalive":   t.BackendKeepAlive,
+		"shutdown":             t.Shutdown,
+		"telemetry_shutdown":   t.TelemetryShutdown,
+		"backend_connect":      t.BackendConnect,
+		"reload_drain":         t.ReloadDrain,
+		"elicit":               t.Elicit,
+		"progress_relay":       t.ProgressRelay,
+		"backend_backoff_min":  t.BackendBackoffMin,
+		"backend_backoff_max":  t.BackendBackoffMax,
+		"backend_keepalive":    t.BackendKeepAlive,
+		"downstream_keepalive": t.DownstreamKeepAlive,
 	}
 	for name, d := range fields {
 		if d < 0 {
@@ -330,6 +346,9 @@ func validateTimeouts(t TimeoutsConfig) error {
 	}
 	if t.BackendKeepAliveFailureThreshold < 0 {
 		return fmt.Errorf("timeouts.backend_keepalive_failure_threshold: must not be negative, got %d", t.BackendKeepAliveFailureThreshold)
+	}
+	if t.DownstreamKeepAliveFailureThreshold < 0 {
+		return fmt.Errorf("timeouts.downstream_keepalive_failure_threshold: must not be negative, got %d", t.DownstreamKeepAliveFailureThreshold)
 	}
 	return nil
 }
