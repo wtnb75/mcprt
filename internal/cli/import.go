@@ -54,12 +54,12 @@ func newImportCmd() *cobra.Command {
 	// error.
 	cmd := &cobra.Command{
 		Use:           "import <mcp.json> [output-path]",
-		Short:         "convert a generic mcp.json-style client config into an mcprt config file",
+		Short:         "convert a generic mcp.json-style client config into an mcprt config file (defaults to stdout)",
 		Args:          cobra.RangeArgs(1, 2),
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			outPath := defaultInitPath
+			outPath := ""
 			if len(args) == 2 {
 				outPath = args[1]
 			}
@@ -71,8 +71,12 @@ func newImportCmd() *cobra.Command {
 	return cmd
 }
 
+// runImport converts the mcp.json-style file at inPath into an mcprt config.
+// An empty outPath means "no path given on the command line": the content
+// goes to cmd.OutOrStdout() instead of a file, and the exists/force check is
+// skipped since there is no file to guard.
 func runImport(cmd *cobra.Command, inPath, outPath string, force bool) error {
-	if !force {
+	if outPath != "" && !force {
 		if _, err := os.Stat(outPath); err == nil {
 			return fmt.Errorf("%s already exists (use --force to overwrite)", outPath)
 		} else if !os.IsNotExist(err) {
@@ -129,11 +133,18 @@ func runImport(cmd *cobra.Command, inPath, outPath string, force bool) error {
 	if err != nil {
 		return fmt.Errorf("rendering config: %w", err)
 	}
-	if err := os.WriteFile(outPath, out, 0o600); err != nil {
+
+	dest := outPath
+	if outPath == "" {
+		dest = "stdout"
+		if _, err := cmd.OutOrStdout().Write(out); err != nil {
+			return err
+		}
+	} else if err := os.WriteFile(outPath, out, 0o600); err != nil {
 		return fmt.Errorf("writing %s: %w", outPath, err)
 	}
 
-	_, err = fmt.Fprintf(cmd.OutOrStdout(), "imported %d backend(s) from %s to %s\n", len(backends), inPath, outPath)
+	_, err = fmt.Fprintf(cmd.ErrOrStderr(), "imported %d backend(s) from %s to %s\n", len(backends), inPath, dest)
 	return err
 }
 
