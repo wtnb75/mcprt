@@ -71,6 +71,7 @@ func runList(ctx context.Context, cmd *cobra.Command, configPath string, jsonOut
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
+	applyTimeouts(cfg.Timeouts)
 
 	// list only needs to know each backend's tools long enough to resolve
 	// and print the routing table; it never starts a listener, so every

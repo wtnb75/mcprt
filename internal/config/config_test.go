@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/wtnb75/mcprt/internal/config"
 )
@@ -637,5 +638,103 @@ backends:
 	}
 	if len(cfg.Logging.MaskKeys) != 0 {
 		t.Fatalf("Logging.MaskKeys = %v, want empty", cfg.Logging.MaskKeys)
+	}
+}
+
+func TestParse_Timeouts(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+timeouts:
+  shutdown: 10s
+  telemetry_shutdown: 15s
+  backend_connect: 1m
+  reload_drain: 2m
+  elicit: 3m
+  progress_relay: 20s
+  backend_backoff_min: 2s
+  backend_backoff_max: 90s
+`)
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	want := config.TimeoutsConfig{
+		Shutdown:          config.Duration(10 * time.Second),
+		TelemetryShutdown: config.Duration(15 * time.Second),
+		BackendConnect:    config.Duration(1 * time.Minute),
+		ReloadDrain:       config.Duration(2 * time.Minute),
+		Elicit:            config.Duration(3 * time.Minute),
+		ProgressRelay:     config.Duration(20 * time.Second),
+		BackendBackoffMin: config.Duration(2 * time.Second),
+		BackendBackoffMax: config.Duration(90 * time.Second),
+	}
+	if cfg.Timeouts != want {
+		t.Fatalf("Timeouts = %+v, want %+v", cfg.Timeouts, want)
+	}
+}
+
+func TestParse_TimeoutsDefaultToZeroWhenUnset(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+`)
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Timeouts != (config.TimeoutsConfig{}) {
+		t.Fatalf("Timeouts = %+v, want zero value (all unset)", cfg.Timeouts)
+	}
+}
+
+func TestParse_TimeoutsInvalidDurationString(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+timeouts:
+  shutdown: "not-a-duration"
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for invalid duration string, got nil")
+	}
+}
+
+func TestParse_TimeoutsNegativeRejected(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+timeouts:
+  shutdown: -5s
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for negative timeout, got nil")
+	}
+}
+
+func TestParse_TimeoutsBackoffMinGreaterThanMaxRejected(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+timeouts:
+  backend_backoff_min: 10s
+  backend_backoff_max: 5s
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for backend_backoff_min > backend_backoff_max, got nil")
 	}
 }

@@ -16,12 +16,12 @@ import (
 )
 
 // TestServeHTTP_ShutdownTimeoutReturnsError checks that when a client holds
-// a connection open past shutdownTimeout, ServeHTTP surfaces the timeout as
+// a connection open past ShutdownTimeout, ServeHTTP surfaces the timeout as
 // an error instead of silently reporting a clean shutdown.
 func TestServeHTTP_ShutdownTimeoutReturnsError(t *testing.T) {
-	orig := shutdownTimeout
-	shutdownTimeout = 100 * time.Millisecond
-	t.Cleanup(func() { shutdownTimeout = orig })
+	orig := ShutdownTimeout
+	ShutdownTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { ShutdownTimeout = orig })
 
 	srv := mcp.NewServer(&mcp.Implementation{Name: "test", Version: "v1"},
 		&mcp.ServerOptions{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
@@ -73,9 +73,9 @@ func TestServeHTTP_ShutdownTimeoutReturnsError(t *testing.T) {
 }
 
 // TestProgressRegistry_RelayTimeoutIsShrinkable checks that
-// progressRelayTimeout (progress.go) is a package-level var a test can
+// ProgressRelayTimeout (progress.go) is a package-level var a test can
 // shrink, following the exact same pattern
-// TestServeHTTP_ShutdownTimeoutReturnsError above uses for shutdownTimeout.
+// TestServeHTTP_ShutdownTimeoutReturnsError above uses for ShutdownTimeout.
 // A real downstream-hang test would need a *mcp.ServerSession backed by a
 // Transport whose Write blocks forever; the go-sdk offers no clean way to
 // construct one outside a live connection under genuine TCP backpressure,
@@ -85,12 +85,12 @@ func TestServeHTTP_ShutdownTimeoutReturnsError(t *testing.T) {
 // TestProgressRegistry_RegisterRelaySummary and
 // TestProgressRegistry_RelayDropsBackendMismatch.
 func TestProgressRegistry_RelayTimeoutIsShrinkable(t *testing.T) {
-	orig := progressRelayTimeout
-	progressRelayTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { progressRelayTimeout = orig })
+	orig := ProgressRelayTimeout
+	ProgressRelayTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { ProgressRelayTimeout = orig })
 
-	if progressRelayTimeout != 50*time.Millisecond {
-		t.Fatalf("progressRelayTimeout = %v after shrinking, want 50ms", progressRelayTimeout)
+	if ProgressRelayTimeout != 50*time.Millisecond {
+		t.Fatalf("ProgressRelayTimeout = %v after shrinking, want 50ms", ProgressRelayTimeout)
 	}
 
 	// Relay's ordinary successful-write path must still work unaffected by
@@ -110,7 +110,7 @@ func TestProgressRegistry_RelayTimeoutIsShrinkable(t *testing.T) {
 			t.Fatalf("relayed notification = %+v, want Message=ok", p)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for relay under shrunk progressRelayTimeout")
+		t.Fatal("timed out waiting for relay under shrunk ProgressRelayTimeout")
 	}
 }
 

@@ -149,6 +149,15 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
+	// Applied once here, at the very first config load, before any
+	// goroutine that reads one of these vars exists yet -- see
+	// applyTimeouts' doc comment on why watchSIGHUP's own config.Load
+	// (below) deliberately does not call it again.
+	// Applied once here, at the very first config load, before any
+	// goroutine that reads one of these vars exists yet -- see
+	// applyTimeouts' doc comment on why watchSIGHUP's own config.Load
+	// (below) deliberately does not call it again.
+	applyTimeouts(cfg.Timeouts)
 
 	// A child context we can cancel ourselves: if one listener fails while
 	// another is still healthy, cancelling here tells the healthy one to
@@ -932,6 +941,9 @@ func watchSIGHUP(ctx context.Context, logger *slog.Logger, configPath string, st
 				logger.Error("config reload failed, keeping current config", "error", err)
 				continue
 			}
+			// Deliberately not calling applyTimeouts(cfg.Timeouts) here: see
+			// its doc comment. timeouts.* is a startup-only setting --
+			// changing it requires a process restart.
 			// buildGateway itself validates that SOME listener is
 			// configured; this check is specifically about whether
 			// hot-reload can do anything USEFUL with the new config, which

@@ -50,6 +50,7 @@ func runPing(ctx context.Context, cmd *cobra.Command, configPath, backendName st
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
+	applyTimeouts(cfg.Timeouts)
 
 	if backendName == "" {
 		return runPingAll(ctx, cmd, cfg.Backends, jsonOutput)

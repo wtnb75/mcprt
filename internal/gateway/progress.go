@@ -10,14 +10,14 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// progressRelayTimeout bounds how long Relay waits for a downstream
+// ProgressRelayTimeout bounds how long Relay waits for a downstream
 // NotifyProgress write to complete, so a downstream client that stopped
 // reading its SSE stream can't stall this backend's entire notification
 // pipeline (go-sdk dispatches one backend's notifications sequentially) --
 // only this one progress relay is affected, not the tools/call itself
 // (Relay's caller never returns an error to it). A var so tests can shrink
 // it.
-var progressRelayTimeout = 5 * time.Second
+var ProgressRelayTimeout = 5 * time.Second
 
 // ProgressRegistry correlates a backend-facing progress token (which mcprt
 // generates fresh for every forwarded tools/call that carries one, to
@@ -118,7 +118,7 @@ func normalizeProgressToken(t any) (token uint64, ok bool) {
 // as the ordinary "expected race" drop below: no error propagated to the
 // caller.
 //
-// The downstream NotifyProgress write is bounded by progressRelayTimeout
+// The downstream NotifyProgress write is bounded by ProgressRelayTimeout
 // so a stalled downstream client can't block this backend's whole
 // notification-dispatch pipeline.
 func (r *ProgressRegistry) Relay(ctx context.Context, logger *slog.Logger, backendName string, params *mcp.ProgressNotificationParams) {
@@ -146,7 +146,7 @@ func (r *ProgressRegistry) Relay(ctx context.Context, logger *slog.Logger, backe
 	}
 	entry.mu.Unlock()
 
-	rctx, cancel := context.WithTimeout(ctx, progressRelayTimeout)
+	rctx, cancel := context.WithTimeout(ctx, ProgressRelayTimeout)
 	defer cancel()
 	err := entry.session.NotifyProgress(rctx, &mcp.ProgressNotificationParams{
 		ProgressToken: entry.originalToken,

@@ -470,10 +470,10 @@ func ServeStdio(ctx context.Context, srv *mcp.Server) error {
 	return srv.Run(ctx, &mcp.StdioTransport{})
 }
 
-// shutdownTimeout bounds ServeHTTP's graceful shutdown: MCP Streamable HTTP
+// ShutdownTimeout bounds ServeHTTP's graceful shutdown: MCP Streamable HTTP
 // clients hold a long-lived SSE stream open, so Shutdown would otherwise
 // wait forever for the connection to go idle. A var so tests can shrink it.
-var shutdownTimeout = 5 * time.Second
+var ShutdownTimeout = 5 * time.Second
 
 // ServeHTTP runs a Streamable HTTP server listening on addr, until ctx is
 // cancelled. getServer is called once per brand-new session (the
@@ -492,7 +492,7 @@ func ServeHTTP(ctx context.Context, getServer func() *mcp.Server, addr string) e
 
 	select {
 	case <-ctx.Done():
-		sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		sctx, cancel := context.WithTimeout(context.Background(), ShutdownTimeout)
 		defer cancel()
 		if err := httpServer.Shutdown(sctx); err != nil {
 			_ = httpServer.Close() // force-close whatever Shutdown couldn't drain in time

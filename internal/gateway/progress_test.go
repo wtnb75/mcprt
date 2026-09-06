@@ -170,11 +170,11 @@ func TestProgressRegistry_RelayDropsBackendMismatch(t *testing.T) {
 	}
 }
 
-// Coverage for progressRelayTimeout being a shrinkable, test-usable knob
+// Coverage for ProgressRelayTimeout being a shrinkable, test-usable knob
 // lives in gateway_internal_test.go (package gateway, where the unexported
 // var is reachable) -- see TestProgressRegistry_RelayTimeoutIsShrinkable
 // there, which follows the same pattern as
-// TestServeHTTP_ShutdownTimeoutReturnsError for shutdownTimeout.
+// TestServeHTTP_ShutdownTimeoutReturnsError for ShutdownTimeout.
 
 // TestProgressRegistry_ConcurrentRegisterRelayCleanup exercises Register,
 // Relay, and cleanup from many goroutines at once against one shared
