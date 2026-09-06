@@ -10,12 +10,31 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.opentelemetry.io/otel/propagation"
 
 	"github.com/wtnb75/mcprt/internal/config"
 )
+
+// KeepAlive, if non-zero, makes every Connect'ed client send a periodic MCP
+// "ping" to its backend at this interval, closing the session after
+// KeepAliveFailureThreshold consecutive failures -- which
+// superviseBackend's existing Session.Wait()-based disconnect handling then
+// reconnects, exactly like any other disconnect, with no changes needed
+// there. Zero (the default) disables this entirely, matching mcp.Client's
+// own zero-value behavior. A var, not a Connect parameter, so
+// internal/cli's applyTimeouts can set it from config without a signature
+// change to Connect -- which has ~40 call sites across this codebase (see
+// gateway.ShutdownTimeout for the same pattern).
+var KeepAlive time.Duration
+
+// KeepAliveFailureThreshold is the number of consecutive keepalive ping
+// failures Connect'ed clients tolerate before closing their session. Has no
+// effect unless KeepAlive is non-zero. Zero defers to go-sdk's own default
+// of 1.
+var KeepAliveFailureThreshold int
 
 // Backend is a live connection to one backend MCP server.
 type Backend struct {
@@ -54,7 +73,10 @@ type ChangeCallbacks struct {
 // wired as the corresponding notification handlers on the client, so the
 // caller finds out when the backend's tool/prompt/resource list changes.
 func Connect(ctx context.Context, cfg config.BackendConfig, cb ChangeCallbacks) (*Backend, error) {
-	clientOpts := &mcp.ClientOptions{}
+	clientOpts := &mcp.ClientOptions{
+		KeepAlive:                 KeepAlive,
+		KeepAliveFailureThreshold: KeepAliveFailureThreshold,
+	}
 	if cb.OnToolsChanged != nil {
 		clientOpts.ToolListChangedHandler = func(context.Context, *mcp.ToolListChangedRequest) { cb.OnToolsChanged() }
 	}

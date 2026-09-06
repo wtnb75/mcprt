@@ -57,6 +57,18 @@ type TimeoutsConfig struct {
 	// reconnect backoff. Defaults 1s/60s.
 	BackendBackoffMin Duration `yaml:"backend_backoff_min,omitempty"`
 	BackendBackoffMax Duration `yaml:"backend_backoff_max,omitempty"`
+	// BackendKeepAlive, if non-zero, makes every backend connection send a
+	// periodic MCP "ping" at this interval, closing the connection after
+	// BackendKeepAliveFailureThreshold consecutive failures -- which
+	// superviseBackend's existing disconnect handling then reconnects, the
+	// same as any other disconnect. Zero (the default) disables this
+	// entirely, matching mcprt's behavior before this field existed.
+	BackendKeepAlive Duration `yaml:"backend_keepalive,omitempty"`
+	// BackendKeepAliveFailureThreshold is the number of consecutive
+	// keepalive ping failures tolerated before closing the connection. Has
+	// no effect unless BackendKeepAlive is non-zero. Zero defers to
+	// go-sdk's own default of 1.
+	BackendKeepAliveFailureThreshold int `yaml:"backend_keepalive_failure_threshold,omitempty"`
 }
 
 // ListenConfig controls which client-facing transports the gateway serves.
@@ -305,6 +317,7 @@ func validateTimeouts(t TimeoutsConfig) error {
 		"progress_relay":      t.ProgressRelay,
 		"backend_backoff_min": t.BackendBackoffMin,
 		"backend_backoff_max": t.BackendBackoffMax,
+		"backend_keepalive":   t.BackendKeepAlive,
 	}
 	for name, d := range fields {
 		if d < 0 {
@@ -314,6 +327,9 @@ func validateTimeouts(t TimeoutsConfig) error {
 	if t.BackendBackoffMin > 0 && t.BackendBackoffMax > 0 && t.BackendBackoffMin > t.BackendBackoffMax {
 		return fmt.Errorf("timeouts.backend_backoff_min (%s) must not exceed timeouts.backend_backoff_max (%s)",
 			time.Duration(t.BackendBackoffMin), time.Duration(t.BackendBackoffMax))
+	}
+	if t.BackendKeepAliveFailureThreshold < 0 {
+		return fmt.Errorf("timeouts.backend_keepalive_failure_threshold: must not be negative, got %d", t.BackendKeepAliveFailureThreshold)
 	}
 	return nil
 }
