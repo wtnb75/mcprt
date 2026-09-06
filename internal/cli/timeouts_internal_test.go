@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wtnb75/mcprt/internal/backend"
 	"github.com/wtnb75/mcprt/internal/config"
 	"github.com/wtnb75/mcprt/internal/gateway"
 )
@@ -21,6 +22,8 @@ func saveTimeoutVars(t *testing.T) {
 	origTelemetryShutdown := telemetryShutdownTimeout
 	origBackoffMin := backendBackoffMin
 	origBackoffMax := backendBackoffMax
+	origBackendKeepAlive := backend.KeepAlive
+	origBackendKeepAliveFailureThreshold := backend.KeepAliveFailureThreshold
 	t.Cleanup(func() {
 		gateway.ShutdownTimeout = origShutdown
 		gateway.ProgressRelayTimeout = origProgressRelay
@@ -30,6 +33,8 @@ func saveTimeoutVars(t *testing.T) {
 		telemetryShutdownTimeout = origTelemetryShutdown
 		backendBackoffMin = origBackoffMin
 		backendBackoffMax = origBackoffMax
+		backend.KeepAlive = origBackendKeepAlive
+		backend.KeepAliveFailureThreshold = origBackendKeepAliveFailureThreshold
 	})
 }
 
@@ -37,14 +42,16 @@ func TestApplyTimeouts_OverridesWhenSet(t *testing.T) {
 	saveTimeoutVars(t)
 
 	applyTimeouts(config.TimeoutsConfig{
-		Shutdown:          config.Duration(11 * time.Second),
-		TelemetryShutdown: config.Duration(12 * time.Second),
-		BackendConnect:    config.Duration(13 * time.Second),
-		ReloadDrain:       config.Duration(14 * time.Minute),
-		Elicit:            config.Duration(15 * time.Minute),
-		ProgressRelay:     config.Duration(16 * time.Second),
-		BackendBackoffMin: config.Duration(17 * time.Second),
-		BackendBackoffMax: config.Duration(18 * time.Second),
+		Shutdown:                         config.Duration(11 * time.Second),
+		TelemetryShutdown:                config.Duration(12 * time.Second),
+		BackendConnect:                   config.Duration(13 * time.Second),
+		ReloadDrain:                      config.Duration(14 * time.Minute),
+		Elicit:                           config.Duration(15 * time.Minute),
+		ProgressRelay:                    config.Duration(16 * time.Second),
+		BackendBackoffMin:                config.Duration(17 * time.Second),
+		BackendBackoffMax:                config.Duration(18 * time.Second),
+		BackendKeepAlive:                 config.Duration(19 * time.Second),
+		BackendKeepAliveFailureThreshold: 3,
 	})
 
 	if gateway.ShutdownTimeout != 11*time.Second {
@@ -71,6 +78,12 @@ func TestApplyTimeouts_OverridesWhenSet(t *testing.T) {
 	if backendBackoffMax != 18*time.Second {
 		t.Errorf("backendBackoffMax = %v, want 18s", backendBackoffMax)
 	}
+	if backend.KeepAlive != 19*time.Second {
+		t.Errorf("backend.KeepAlive = %v, want 19s", backend.KeepAlive)
+	}
+	if backend.KeepAliveFailureThreshold != 3 {
+		t.Errorf("backend.KeepAliveFailureThreshold = %d, want 3", backend.KeepAliveFailureThreshold)
+	}
 }
 
 func TestApplyTimeouts_KeepsDefaultsWhenUnset(t *testing.T) {
@@ -83,6 +96,8 @@ func TestApplyTimeouts_KeepsDefaultsWhenUnset(t *testing.T) {
 	origTelemetryShutdown := telemetryShutdownTimeout
 	origBackoffMin := backendBackoffMin
 	origBackoffMax := backendBackoffMax
+	origBackendKeepAlive := backend.KeepAlive
+	origBackendKeepAliveFailureThreshold := backend.KeepAliveFailureThreshold
 
 	applyTimeouts(config.TimeoutsConfig{})
 
@@ -109,5 +124,12 @@ func TestApplyTimeouts_KeepsDefaultsWhenUnset(t *testing.T) {
 	}
 	if backendBackoffMax != origBackoffMax {
 		t.Errorf("backendBackoffMax changed to %v, want unchanged %v", backendBackoffMax, origBackoffMax)
+	}
+	if backend.KeepAlive != origBackendKeepAlive {
+		t.Errorf("backend.KeepAlive changed to %v, want unchanged %v", backend.KeepAlive, origBackendKeepAlive)
+	}
+	if backend.KeepAliveFailureThreshold != origBackendKeepAliveFailureThreshold {
+		t.Errorf("backend.KeepAliveFailureThreshold changed to %d, want unchanged %d",
+			backend.KeepAliveFailureThreshold, origBackendKeepAliveFailureThreshold)
 	}
 }

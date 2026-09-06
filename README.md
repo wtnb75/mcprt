@@ -85,6 +85,8 @@ Minimal example:
       progress_relay: 5s        # default 5s; relaying one progress notification to its requesting client
       backend_backoff_min: 1s   # default 1s; reconnect backoff floor
       backend_backoff_max: 60s  # default 60s; reconnect backoff ceiling
+      backend_keepalive: 30s              # default 0 (disabled); interval for a periodic MCP ping to every backend
+      backend_keepalive_failure_threshold: 3  # default 0 (defers to 1); consecutive ping failures tolerated before closing the connection
 
 `overrides` resolves conflicting **tool** names (after each backend's
 `prefix` is applied). `resource_overrides` and `resource_template_overrides`
@@ -114,6 +116,17 @@ Go duration strings (`"5s"`, `"1m30s"`, ...). `timeouts` is read once at
 process startup, including on `mcprt ping`/`call`/`list` one-shot commands —
 a config reload via SIGHUP does not pick up changes to it, so changing a
 timeout requires restarting `mcprt server`.
+
+`backend_keepalive` is the one field in `timeouts` that's opt-in rather than
+a tunable default: it's 0 (disabled) unless set. When enabled, every backend
+connection sends an MCP `ping` on that interval and closes itself after
+`backend_keepalive_failure_threshold` consecutive failures — which mcprt's
+existing reconnect logic then picks up exactly like any other disconnect.
+This detects a backend that's gone silent (hung, or vanished without
+closing the connection) without waiting for an actual `tools/call` to time
+out against it. Enabling it means a ping request per backend per interval,
+so leave it disabled (the default) if you have many backends or an
+unreliable network to them.
 
 mcprt also participates in distributed tracing via OpenTelemetry: a call
 served over the HTTP transport gets wrapped in a span (continuing an

@@ -3,6 +3,7 @@ package cli
 import (
 	"time"
 
+	"github.com/wtnb75/mcprt/internal/backend"
 	"github.com/wtnb75/mcprt/internal/config"
 	"github.com/wtnb75/mcprt/internal/gateway"
 )
@@ -40,5 +41,11 @@ func applyTimeouts(t config.TimeoutsConfig) {
 	}
 	if t.BackendBackoffMax > 0 {
 		backendBackoffMax = time.Duration(t.BackendBackoffMax)
+	}
+	if t.BackendKeepAlive > 0 {
+		backend.KeepAlive = time.Duration(t.BackendKeepAlive)
+	}
+	if t.BackendKeepAliveFailureThreshold > 0 {
+		backend.KeepAliveFailureThreshold = t.BackendKeepAliveFailureThreshold
 	}
 }

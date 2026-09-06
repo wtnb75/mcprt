@@ -814,3 +814,43 @@ func TestConnect_HTTP_NoTraceparentWithoutActiveSpan(t *testing.T) {
 		t.Fatalf("traceparent = %q, want none for a ctx with no active span", gotHeader)
 	}
 }
+
+// TestConnect_KeepAliveClosesSessionAfterPingFailures checks that setting
+// the package-level KeepAlive/KeepAliveFailureThreshold vars actually
+// reaches the underlying mcp.Client -- i.e. that Connect wires them into
+// its ClientOptions, not that go-sdk's own keepalive ping mechanism works
+// (that's go-sdk's own tested responsibility). The backend disappearing
+// out from under an already-open session (srv.Close(), no explicit
+// b.Session.Close()) is what a real hung/dead backend looks like; without
+// KeepAlive wired through, nothing would notice this until the next actual
+// tools/call.
+func TestConnect_KeepAliveClosesSessionAfterPingFailures(t *testing.T) {
+	origKeepAlive, origThreshold := backend.KeepAlive, backend.KeepAliveFailureThreshold
+	backend.KeepAlive = 20 * time.Millisecond
+	backend.KeepAliveFailureThreshold = 1
+	t.Cleanup(func() {
+		backend.KeepAlive = origKeepAlive
+		backend.KeepAliveFailureThreshold = origThreshold
+	})
+
+	mcpHandler := newFakeMCPHandler()
+	srv := httptest.NewServer(mcpHandler)
+
+	ctx := context.Background()
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL}, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- b.Session.Wait() }()
+
+	srv.Close()
+
+	select {
+	case <-waitErr:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Session.Wait() did not return within 2s of the backend disappearing; want KeepAlive to detect it and close the session")
+	}
+}

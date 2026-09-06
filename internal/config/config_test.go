@@ -738,3 +738,73 @@ timeouts:
 		t.Fatal("Parse: expected error for backend_backoff_min > backend_backoff_max, got nil")
 	}
 }
+
+func TestParse_TimeoutsBackendKeepAlive(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+timeouts:
+  backend_keepalive: 30s
+  backend_keepalive_failure_threshold: 3
+`)
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Timeouts.BackendKeepAlive != config.Duration(30*time.Second) {
+		t.Fatalf("Timeouts.BackendKeepAlive = %v, want 30s", cfg.Timeouts.BackendKeepAlive)
+	}
+	if cfg.Timeouts.BackendKeepAliveFailureThreshold != 3 {
+		t.Fatalf("Timeouts.BackendKeepAliveFailureThreshold = %d, want 3", cfg.Timeouts.BackendKeepAliveFailureThreshold)
+	}
+}
+
+func TestParse_TimeoutsBackendKeepAliveDefaultsToZeroWhenUnset(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+`)
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Timeouts.BackendKeepAlive != 0 || cfg.Timeouts.BackendKeepAliveFailureThreshold != 0 {
+		t.Fatalf("Timeouts.BackendKeepAlive* = %v/%d, want 0/0 (disabled)",
+			cfg.Timeouts.BackendKeepAlive, cfg.Timeouts.BackendKeepAliveFailureThreshold)
+	}
+}
+
+func TestParse_TimeoutsBackendKeepAliveNegativeRejected(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+timeouts:
+  backend_keepalive: -5s
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for negative backend_keepalive, got nil")
+	}
+}
+
+func TestParse_TimeoutsBackendKeepAliveFailureThresholdNegativeRejected(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+timeouts:
+  backend_keepalive_failure_threshold: -1
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for negative backend_keepalive_failure_threshold, got nil")
+	}
+}
