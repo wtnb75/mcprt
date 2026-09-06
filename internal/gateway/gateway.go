@@ -72,6 +72,25 @@ type NewConfig struct {
 	Overrides Overrides
 	MaskKeys  []string
 	Relays    Relays
+	// KeepAlive, if non-zero, makes the built *mcp.Server send a periodic
+	// MCP "ping" to every downstream client at this interval, closing that
+	// client's session after KeepAliveFailureThreshold consecutive
+	// failures -- unlike ShutdownTimeout (which only bounds process
+	// shutdown), this detects a downstream client that's gone silent
+	// (crashed, network drop) during ordinary operation, freeing its
+	// session's resources without waiting for that client's next request.
+	// Zero (the default) disables this, matching mcp.ServerOptions' own
+	// zero-value behavior. Unlike backend.KeepAlive, this is a plain
+	// NewConfig field, not a package var: New already takes one config
+	// struct per call, rebuilt fresh for every generation (see
+	// internal/cli/server.go's buildGateway), so there's no ~40-call-site
+	// signature-change cost and no shared-mutable-state race to avoid.
+	KeepAlive time.Duration
+	// KeepAliveFailureThreshold is the number of consecutive keepalive
+	// ping failures tolerated before closing a downstream client's
+	// session. Has no effect unless KeepAlive is non-zero. Zero defers to
+	// go-sdk's own default of 1.
+	KeepAliveFailureThreshold int
 }
 
 // Server wraps an *mcp.Server with the reconcile state needed to react to a
@@ -162,7 +181,11 @@ func emptyTable[T any](t *router.Table[T]) *router.Table[T] {
 // BackendName referenced in cfg.Tables (the caller builds both from the
 // same set of connected backends).
 func New(cfg NewConfig) *Server {
-	mcpSrv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{Logger: cfg.Logger})
+	mcpSrv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{
+		Logger:                    cfg.Logger,
+		KeepAlive:                 cfg.KeepAlive,
+		KeepAliveFailureThreshold: cfg.KeepAliveFailureThreshold,
+	})
 
 	s := &Server{
 		mcp:      mcpSrv,

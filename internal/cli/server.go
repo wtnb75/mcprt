@@ -333,8 +333,10 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 			ResourceTemplates: cfg.ResourceTemplateOverrides,
 			Prompts:           cfg.PromptOverrides,
 		},
-		MaskKeys: cfg.Logging.MaskKeys,
-		Relays:   gwH.relays,
+		MaskKeys:                  cfg.Logging.MaskKeys,
+		Relays:                    gwH.relays,
+		KeepAlive:                 time.Duration(cfg.Timeouts.DownstreamKeepAlive),
+		KeepAliveFailureThreshold: cfg.Timeouts.DownstreamKeepAliveFailureThreshold,
 	})
 	gwH.ptr.Store(srv)
 
