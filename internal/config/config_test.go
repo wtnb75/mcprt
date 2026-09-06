@@ -808,3 +808,73 @@ timeouts:
 		t.Fatal("Parse: expected error for negative backend_keepalive_failure_threshold, got nil")
 	}
 }
+
+func TestParse_TimeoutsDownstreamKeepAlive(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+timeouts:
+  downstream_keepalive: 30s
+  downstream_keepalive_failure_threshold: 3
+`)
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Timeouts.DownstreamKeepAlive != config.Duration(30*time.Second) {
+		t.Fatalf("Timeouts.DownstreamKeepAlive = %v, want 30s", cfg.Timeouts.DownstreamKeepAlive)
+	}
+	if cfg.Timeouts.DownstreamKeepAliveFailureThreshold != 3 {
+		t.Fatalf("Timeouts.DownstreamKeepAliveFailureThreshold = %d, want 3", cfg.Timeouts.DownstreamKeepAliveFailureThreshold)
+	}
+}
+
+func TestParse_TimeoutsDownstreamKeepAliveDefaultsToZeroWhenUnset(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+`)
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Timeouts.DownstreamKeepAlive != 0 || cfg.Timeouts.DownstreamKeepAliveFailureThreshold != 0 {
+		t.Fatalf("Timeouts.DownstreamKeepAlive* = %v/%d, want 0/0 (disabled)",
+			cfg.Timeouts.DownstreamKeepAlive, cfg.Timeouts.DownstreamKeepAliveFailureThreshold)
+	}
+}
+
+func TestParse_TimeoutsDownstreamKeepAliveNegativeRejected(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+timeouts:
+  downstream_keepalive: -5s
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for negative downstream_keepalive, got nil")
+	}
+}
+
+func TestParse_TimeoutsDownstreamKeepAliveFailureThresholdNegativeRejected(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+timeouts:
+  downstream_keepalive_failure_threshold: -1
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for negative downstream_keepalive_failure_threshold, got nil")
+	}
+}

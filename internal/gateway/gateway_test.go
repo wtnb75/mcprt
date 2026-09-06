@@ -1156,6 +1156,96 @@ func TestGateway_ServeHTTP_LogsRemoteAddr(t *testing.T) {
 	}
 }
 
+// TestServeHTTP_KeepAliveClosesSessionAfterDownstreamClientDisappears checks
+// that gateway.NewConfig's KeepAlive/KeepAliveFailureThreshold fields
+// actually reach the underlying *mcp.Server's ServerOptions -- the
+// downstream-facing counterpart to
+// backend.TestConnect_KeepAliveClosesSessionAfterPingFailures. The client's
+// raw TCP connection is killed directly (bypassing the client's own
+// session/HTTP machinery entirely, via a custom DialContext that captures
+// it), rather than calling session.Close(), since a clean client-side close
+// is exactly the ordinary disconnect mcprt already notices without any
+// keepalive -- this simulates the client vanishing instead (crash, network
+// drop), the scenario KeepAlive exists to detect on the server side.
+func TestServeHTTP_KeepAliveClosesSessionAfterDownstreamClientDisappears(t *testing.T) {
+	srv := gateway.New(gateway.NewConfig{
+		Logger:                    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		KeepAlive:                 20 * time.Millisecond,
+		KeepAliveFailureThreshold: 1,
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("closing probe listener: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- gateway.ServeHTTP(ctx, func() *mcp.Server { return srv.MCP() }, addr) }()
+
+	var mu sync.Mutex
+	var conns []net.Conn
+	dialer := &net.Dialer{}
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+				c, err := dialer.DialContext(ctx, network, address)
+				if err != nil {
+					return nil, err
+				}
+				mu.Lock()
+				conns = append(conns, c)
+				mu.Unlock()
+				return c, nil
+			},
+		},
+	}
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	var connectErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_, connectErr = client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: "http://" + addr, HTTPClient: httpClient}, nil)
+		if connectErr == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if connectErr != nil {
+		t.Fatalf("connecting to gateway: %v", connectErr)
+	}
+
+	var serverSession *mcp.ServerSession
+	for s := range srv.MCP().Sessions() {
+		serverSession = s
+	}
+	if serverSession == nil {
+		t.Fatal("srv.MCP().Sessions() is empty, want the just-connected downstream session")
+	}
+
+	mu.Lock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+	mu.Unlock()
+
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- serverSession.Wait() }()
+
+	select {
+	case <-waitErr:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ServerSession.Wait() did not return within 2s of the client disappearing; want KeepAlive to detect it and close the session")
+	}
+
+	cancel()
+	<-serveErr
+}
+
 // TestGateway_CallCreatesSpanWithParentFromTraceparent checks the core
 // behavior change: a tool call arriving over HTTP with a traceparent
 // header now produces one span, continuing that trace, with the expected

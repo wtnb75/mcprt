@@ -87,6 +87,8 @@ Minimal example:
       backend_backoff_max: 60s  # default 60s; reconnect backoff ceiling
       backend_keepalive: 30s              # default 0 (disabled); interval for a periodic MCP ping to every backend
       backend_keepalive_failure_threshold: 3  # default 0 (defers to 1); consecutive ping failures tolerated before closing the connection
+      downstream_keepalive: 30s              # default 0 (disabled); interval for a periodic MCP ping to every downstream client
+      downstream_keepalive_failure_threshold: 3  # default 0 (defers to 1); consecutive ping failures tolerated before closing that client's session
 
 `overrides` resolves conflicting **tool** names (after each backend's
 `prefix` is applied). `resource_overrides` and `resource_template_overrides`
@@ -127,6 +129,18 @@ closing the connection) without waiting for an actual `tools/call` to time
 out against it. Enabling it means a ping request per backend per interval,
 so leave it disabled (the default) if you have many backends or an
 unreliable network to them.
+
+`downstream_keepalive`/`downstream_keepalive_failure_threshold` are
+`backend_keepalive`'s counterpart for the other direction: mcprt pings each
+*downstream* client instead, closing its session after that many
+consecutive failures once it's gone silent (crashed, network drop),
+freeing that session's resources without waiting for its next request.
+Also opt-in (disabled by default) for the same reason. Unlike every other
+`timeouts.*` field, this one IS re-read on every SIGHUP config reload: it's
+applied per hot-reload generation rather than once at process startup (see
+`gateway.NewConfig`), so a new value takes effect for new downstream
+connections without a restart -- sessions from before the reload keep
+whatever setting was in effect when they connected.
 
 mcprt also participates in distributed tracing via OpenTelemetry: a call
 served over the HTTP transport gets wrapped in a span (continuing an
