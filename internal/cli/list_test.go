@@ -54,8 +54,7 @@ backends:
 	// review, finding 1). cancel() runs (via defer, LIFO) before
 	// backendA.Close() above, so any straggling supervisor stops retrying
 	// before the backend it would retry against goes away.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
 	}
@@ -84,8 +83,7 @@ backends:
 
 	// See TestListCommand_Text's matching comment: a cancellable context so
 	// runList's backend supervisor goroutine doesn't outlive this test.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
 	}
@@ -142,8 +140,7 @@ backends:
 
 	// See TestListCommand_Text's matching comment: a cancellable context so
 	// runList's backend supervisor goroutines don't outlive this test.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
 	}

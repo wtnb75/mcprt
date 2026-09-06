@@ -187,13 +187,13 @@ func TestProgressRegistry_ConcurrentRegisterRelayCleanup(t *testing.T) {
 	reg := gateway.NewProgressRegistry()
 
 	var wg sync.WaitGroup
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			internalToken, _, cleanup := reg.Register(session, i, "backend-a")
 			defer cleanup()
-			for j := 0; j < 3; j++ {
+			for j := range 3 {
 				reg.Relay(context.Background(), logger, "backend-a", &mcp.ProgressNotificationParams{ProgressToken: internalToken, Progress: float64(j)})
 			}
 		}(i)

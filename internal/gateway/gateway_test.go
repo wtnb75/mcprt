@@ -1067,7 +1067,7 @@ func TestGateway_CallLogsFailure(t *testing.T) {
 // wantMsg, failing the test if none matches.
 func findLogLine(t *testing.T, out, wantMsg string) map[string]any {
 	t.Helper()
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
 		if line == "" {
 			continue
 		}
@@ -1646,7 +1646,7 @@ func TestGateway_CallHandlerRefusesAmbiguousElicitation(t *testing.T) {
 
 	var wg sync.WaitGroup
 	results := make([]error, 2)
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
