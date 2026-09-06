@@ -413,6 +413,34 @@ backends:
 	}
 }
 
+func TestParse_StdioEmptyCommandRequiresDocker(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: bad
+    transport: stdio
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for stdio with no command and no docker, got nil")
+	}
+}
+
+func TestParse_DockerAllowsEmptyCommand(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: containerized
+    transport: stdio
+    docker:
+      image: your/mcp-image
+`)
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.Backends[0].Command) != 0 {
+		t.Fatalf("Backends[0].Command = %v, want empty", cfg.Backends[0].Command)
+	}
+}
+
 func TestParse_DockerEnvInvalidKey(t *testing.T) {
 	data := []byte(`
 backends:

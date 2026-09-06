@@ -199,7 +199,11 @@ func validate(cfg *Config) error {
 
 		switch b.Transport {
 		case "stdio":
-			if len(b.Command) == 0 {
+			// command may be omitted when docker is set: the container image's
+			// own ENTRYPOINT/CMD can supply it. ssh has no such fallback (it
+			// execs cfg.Command directly on the remote shell), so it still
+			// requires a non-empty command.
+			if len(b.Command) == 0 && b.Docker == nil {
 				return fmt.Errorf("backend %q: stdio transport requires command", b.Name)
 			}
 			if b.URL != "" {
