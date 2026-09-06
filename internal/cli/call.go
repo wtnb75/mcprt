@@ -50,6 +50,7 @@ func runCall(ctx context.Context, cmd *cobra.Command, configPath, toolName, args
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
+	applyTimeouts(cfg.Timeouts)
 
 	var arguments any
 	if argsJSON != "" {

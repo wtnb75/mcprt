@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"time"
 
 	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v3"
@@ -27,6 +28,35 @@ type Config struct {
 	ResourceTemplateOverrides map[string]string `yaml:"resource_template_overrides,omitempty"`
 	PromptOverrides           map[string]string `yaml:"prompt_overrides,omitempty"`
 	Logging                   LoggingConfig     `yaml:"logging,omitempty"`
+	Timeouts                  TimeoutsConfig    `yaml:"timeouts,omitempty"`
+}
+
+// TimeoutsConfig overrides mcprt's built-in timeout and backoff defaults.
+// Every field is optional; the zero value (unset in YAML) means "keep the
+// built-in default" -- see internal/cli's applyTimeouts, the only reader of
+// this struct.
+type TimeoutsConfig struct {
+	// Shutdown bounds gateway.ServeHTTP's graceful HTTP shutdown. Default 5s.
+	Shutdown Duration `yaml:"shutdown,omitempty"`
+	// TelemetryShutdown bounds flushing OpenTelemetry on process shutdown. Default 5s.
+	TelemetryShutdown Duration `yaml:"telemetry_shutdown,omitempty"`
+	// BackendConnect bounds a single backend connect attempt, and the
+	// startup window connectBackends waits for all backends to report in.
+	// Default 30s.
+	BackendConnect Duration `yaml:"backend_connect,omitempty"`
+	// ReloadDrain bounds how long a superseded hot-reload generation's
+	// backend connections are kept alive before being force-closed. Default 5m.
+	ReloadDrain Duration `yaml:"reload_drain,omitempty"`
+	// Elicit bounds how long the server waits for a human to answer an
+	// elicitation request relayed from a backend. Default 5m.
+	Elicit Duration `yaml:"elicit,omitempty"`
+	// ProgressRelay bounds relaying one progress notification from a
+	// backend to the downstream client that requested it. Default 5s.
+	ProgressRelay Duration `yaml:"progress_relay,omitempty"`
+	// BackendBackoffMin/Max bound a disconnected backend's exponential
+	// reconnect backoff. Defaults 1s/60s.
+	BackendBackoffMin Duration `yaml:"backend_backoff_min,omitempty"`
+	BackendBackoffMax Duration `yaml:"backend_backoff_max,omitempty"`
 }
 
 // ListenConfig controls which client-facing transports the gateway serves.
@@ -254,5 +284,36 @@ func validate(cfg *Config) error {
 		}
 	}
 
+	if err := validateTimeouts(cfg.Timeouts); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validateTimeouts rejects negative durations (time.ParseDuration itself
+// accepts "-5s") and a backoff range with min above max -- both would
+// otherwise silently misbehave wherever they're used (see
+// internal/cli's applyTimeouts).
+func validateTimeouts(t TimeoutsConfig) error {
+	fields := map[string]Duration{
+		"shutdown":            t.Shutdown,
+		"telemetry_shutdown":  t.TelemetryShutdown,
+		"backend_connect":     t.BackendConnect,
+		"reload_drain":        t.ReloadDrain,
+		"elicit":              t.Elicit,
+		"progress_relay":      t.ProgressRelay,
+		"backend_backoff_min": t.BackendBackoffMin,
+		"backend_backoff_max": t.BackendBackoffMax,
+	}
+	for name, d := range fields {
+		if d < 0 {
+			return fmt.Errorf("timeouts.%s: must not be negative, got %s", name, time.Duration(d))
+		}
+	}
+	if t.BackendBackoffMin > 0 && t.BackendBackoffMax > 0 && t.BackendBackoffMin > t.BackendBackoffMax {
+		return fmt.Errorf("timeouts.backend_backoff_min (%s) must not exceed timeouts.backend_backoff_max (%s)",
+			time.Duration(t.BackendBackoffMin), time.Duration(t.BackendBackoffMax))
+	}
 	return nil
 }

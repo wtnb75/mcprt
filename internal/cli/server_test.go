@@ -896,7 +896,7 @@ backends:
 	// below, rather than via defer: like httpA.Close()/httpB.Close() above,
 	// a deferred Close() would only run once this function returns, which
 	// is after the explicit cancel()/<-execErr statements at the end of
-	// this function. gateway.ServeHTTP's graceful shutdown (shutdownTimeout,
+	// this function. gateway.ServeHTTP's graceful shutdown (ShutdownTimeout,
 	// 5s) waits for every open MCP Streamable HTTP session's long-lived SSE
 	// stream to go idle; a still-open client session at the moment ctx is
 	// cancelled makes that shutdown time out and Execute return a non-nil
@@ -1496,5 +1496,74 @@ backends:
 	cancel()
 	if err := <-execErr; err != nil {
 		t.Fatalf("server exited with error: %v", err)
+	}
+}
+
+// TestServerCommand_ConfiguredShutdownTimeoutTakesEffect checks that
+// timeouts.shutdown in config.yaml actually reaches gateway.ServeHTTP
+// through the real "server" command's startup path (runServer's
+// applyTimeouts call), not just gateway.ShutdownTimeout in isolation (see
+// gateway_internal_test.go's TestServeHTTP_ShutdownTimeoutReturnsError,
+// which can only cover that in-package). A held-open session and an
+// unshrunk default of 5s would make this test slow without proving
+// anything; shrinking it to 100ms via config and bounding the wait for
+// execErr well under the 5s default is what turns "config value ignored"
+// into a prompt, deterministic failure instead of just a slow pass.
+func TestServerCommand_ConfiguredShutdownTimeoutTakesEffect(t *testing.T) {
+	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
+	mcp.AddTool(backendSrv, &mcp.Tool{Name: "ping", Description: "ping"},
+		func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
+			return nil, struct{}{}, nil
+		})
+	backendHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil))
+	defer backendHTTP.Close()
+
+	gatewayAddr := freePort(t)
+	configPath := writeConfig(t, fmt.Sprintf(`
+listen:
+  http: %q
+
+backends:
+  - name: fake
+    transport: http
+    url: %q
+
+timeouts:
+  shutdown: 100ms
+`, gatewayAddr, backendHTTP.URL))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	execErr := make(chan error, 1)
+	go func() {
+		execErr <- cli.Execute(ctx, []string{"server", "--config", configPath})
+	}()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	var session *mcp.ClientSession
+	var connectErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		session, connectErr = client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: "http://" + gatewayAddr}, nil)
+		if connectErr == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if connectErr != nil {
+		t.Fatalf("connecting to gateway: %v", connectErr)
+	}
+	// Deliberately never closed: the held-open standalone SSE stream is what
+	// makes Shutdown wait, exactly as in
+	// TestServeHTTP_ShutdownTimeoutReturnsError.
+	defer func() { _ = session.Close() }()
+
+	cancel()
+	select {
+	case err := <-execErr:
+		if err == nil {
+			t.Fatal("server exited with nil error; want a graceful-shutdown-timed-out error from the configured 100ms timeouts.shutdown")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not exit within 2s; timeouts.shutdown: 100ms in config was not applied (still waiting out the 5s default?)")
 	}
 }

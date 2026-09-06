@@ -76,6 +76,16 @@ Minimal example:
     logging:
       mask_keys: ["internal_id"] # extra key-name substrings to mask in the audit log, in addition to the built-in key/auth/pass/cred/token patterns
 
+    timeouts:
+      shutdown: 5s              # default 5s; graceful HTTP shutdown's upper bound
+      telemetry_shutdown: 5s    # default 5s
+      backend_connect: 30s      # default 30s; per-backend connect attempt, and connectBackends' startup collection window
+      reload_drain: 5m          # default 5m; how long a SIGHUP-superseded generation's backends stay open
+      elicit: 5m                # default 5m; how long a relayed elicitation request waits for a client answer
+      progress_relay: 5s        # default 5s; relaying one progress notification to its requesting client
+      backend_backoff_min: 1s   # default 1s; reconnect backoff floor
+      backend_backoff_max: 60s  # default 60s; reconnect backoff ceiling
+
 `overrides` resolves conflicting **tool** names (after each backend's
 `prefix` is applied). `resource_overrides` and `resource_template_overrides`
 resolve conflicting resource URIs and URI templates the same way, but
@@ -97,6 +107,13 @@ with the calling MCP client's name/version, session ID, HTTP remote address
 object key matching (case-insensitively, by substring) `key`, `auth`,
 `pass`, `cred`, `token`, or an entry in `logging.mask_keys` has its value
 replaced with `***` before logging.
+
+`timeouts` overrides mcprt's built-in timeout/backoff defaults; every field
+is optional and falls back to the default noted above when unset. Values are
+Go duration strings (`"5s"`, `"1m30s"`, ...). `timeouts` is read once at
+process startup, including on `mcprt ping`/`call`/`list` one-shot commands —
+a config reload via SIGHUP does not pick up changes to it, so changing a
+timeout requires restarting `mcprt server`.
 
 mcprt also participates in distributed tracing via OpenTelemetry: a call
 served over the HTTP transport gets wrapped in a span (continuing an
