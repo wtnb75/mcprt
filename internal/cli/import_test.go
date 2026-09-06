@@ -262,7 +262,7 @@ func TestImportCommand_RefusesToOverwrite(t *testing.T) {
 	}
 }
 
-func TestImportCommand_DefaultOutputPath(t *testing.T) {
+func TestImportCommand_NoOutputPathWritesToStdout(t *testing.T) {
 	inPath := writeJSON(t, `{"mcpServers": {"a": {"command": "true"}}}`)
 	dir := t.TempDir()
 	cwd, err := os.Getwd()
@@ -274,10 +274,26 @@ func TestImportCommand_DefaultOutputPath(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chdir(cwd) })
 
-	if err := cli.Execute(context.Background(), []string{"import", inPath}); err != nil {
+	var out, errOut bytes.Buffer
+	root := cli.NewRootCmd()
+	root.SetOut(&out)
+	root.SetErr(&errOut)
+	root.SetArgs([]string{"import", inPath})
+	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "config.yaml")); err != nil {
-		t.Fatalf("expected config.yaml to be created: %v", err)
+
+	cfg, err := config.Parse(out.Bytes())
+	if err != nil {
+		t.Fatalf("stdout did not parse as a config: %v\nstdout:\n%s", err, out.String())
+	}
+	if len(cfg.Backends) != 1 || cfg.Backends[0].Name != "a" {
+		t.Fatalf("stdout Backends = %+v, want a single backend named \"a\"", cfg.Backends)
+	}
+	if !strings.Contains(errOut.String(), "imported") {
+		t.Fatalf("stderr = %q, want the imported-count status message", errOut.String())
+	}
+	if _, err := os.Stat("config.yaml"); err == nil {
+		t.Fatal("Execute: config.yaml should not be written to the working directory when no output path is given")
 	}
 }

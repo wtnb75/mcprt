@@ -134,29 +134,26 @@ backends:
 	}
 }
 
-func TestExportCommand_SSHBackendWarnedAndSkipped(t *testing.T) {
+func TestExportCommand_SSHBackendConvertedToWorkingCommand(t *testing.T) {
+	t.Setenv("MY_TOKEN", "super-secret-value")
 	configPath := writeExportConfig(t, `
 backends:
   - name: remote-ssh
     transport: stdio
-    command: ["mcp-server"]
+    command: ["mcp-server", "--flag"]
+    dir: /work
+    env:
+      TOKEN: "${MY_TOKEN}"
     ssh:
       host: example.com
-  - name: local
-    transport: stdio
-    command: ["mcp-server"]
+      port: 2222
+      identity_file: /home/user/.ssh/id_rsa
+      args: ["-J", "jump"]
 `)
 	outPath := filepath.Join(t.TempDir(), "mcp.json")
 
-	var errOut bytes.Buffer
-	root := cli.NewRootCmd()
-	root.SetErr(&errOut)
-	root.SetArgs([]string{"export", "--config", configPath, outPath})
-	if err := root.ExecuteContext(context.Background()); err != nil {
+	if err := cli.Execute(context.Background(), []string{"export", "--config", configPath, outPath}); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
-	}
-	if !strings.Contains(errOut.String(), "remote-ssh") || !strings.Contains(errOut.String(), "ssh") {
-		t.Fatalf("stderr = %q, want a warning naming the skipped ssh backend", errOut.String())
 	}
 
 	data, err := os.ReadFile(outPath)
@@ -165,13 +162,93 @@ backends:
 	}
 	var got exportedFile
 	if err := json.Unmarshal(data, &got); err != nil {
-		t.Fatalf("generated mcp.json did not parse: %v", err)
+		t.Fatalf("generated mcp.json did not parse: %v\ncontent:\n%s", err, data)
 	}
-	if len(got.MCPServers) != 1 {
-		t.Fatalf("MCPServers = %+v, want exactly 1 (ssh backend must be skipped)", got.MCPServers)
+
+	srv, ok := got.MCPServers["remote-ssh"]
+	if !ok {
+		t.Fatalf("MCPServers = %+v, want a \"remote-ssh\" entry", got.MCPServers)
 	}
-	if _, ok := got.MCPServers["remote-ssh"]; ok {
-		t.Fatalf("MCPServers = %+v, remote-ssh must not be present", got.MCPServers)
+	if srv.Command != "ssh" {
+		t.Fatalf("remote-ssh.Command = %q, want ssh", srv.Command)
+	}
+	wantArgs := []string{"-p", "2222", "-i", "/home/user/.ssh/id_rsa", "-J", "jump", "example.com"}
+	if len(srv.Args) != len(wantArgs)+1 {
+		t.Fatalf("remote-ssh.Args = %v, want %v plus a trailing remote script", srv.Args, wantArgs)
+	}
+	for i, a := range wantArgs {
+		if srv.Args[i] != a {
+			t.Fatalf("remote-ssh.Args = %v, want prefix %v", srv.Args, wantArgs)
+		}
+	}
+	script := srv.Args[len(srv.Args)-1]
+	if !strings.Contains(script, "cd '/work'") {
+		t.Fatalf("remote script = %q, want it to cd into /work", script)
+	}
+	if !strings.Contains(script, "exec 'mcp-server' '--flag'") {
+		t.Fatalf("remote script = %q, want it to exec mcp-server --flag", script)
+	}
+	if !strings.Contains(script, "${env:MY_TOKEN}") {
+		t.Fatalf("remote script = %q, want the translated ${env:MY_TOKEN} placeholder", script)
+	}
+	if strings.Contains(string(data), "super-secret-value") {
+		t.Fatalf("generated mcp.json leaked the expanded secret value: %s", data)
+	}
+}
+
+func TestExportCommand_DockerBackendConvertedToWorkingCommand(t *testing.T) {
+	t.Setenv("MY_TOKEN", "super-secret-value")
+	configPath := writeExportConfig(t, `
+backends:
+  - name: containerized
+    transport: stdio
+    command: ["mcp-server", "--flag"]
+    dir: /work
+    env:
+      TOKEN: "${MY_TOKEN}"
+    docker:
+      bin: podman
+      image: my/image:latest
+      args: ["-v", "/data:/data"]
+      env:
+        DOCKER_HOST: unix:///var/run/podman.sock
+`)
+	outPath := filepath.Join(t.TempDir(), "mcp.json")
+
+	if err := cli.Execute(context.Background(), []string{"export", "--config", configPath, outPath}); err != nil {
+		t.Fatalf("Execute: unexpected error: %v", err)
+	}
+
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("reading generated mcp.json: %v", err)
+	}
+	var got exportedFile
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("generated mcp.json did not parse: %v\ncontent:\n%s", err, data)
+	}
+
+	srv, ok := got.MCPServers["containerized"]
+	if !ok {
+		t.Fatalf("MCPServers = %+v, want a \"containerized\" entry", got.MCPServers)
+	}
+	if srv.Command != "podman" {
+		t.Fatalf("containerized.Command = %q, want podman", srv.Command)
+	}
+	wantArgs := []string{"run", "-i", "--rm", "-e", "TOKEN=${env:MY_TOKEN}", "-w", "/work", "-v", "/data:/data", "my/image:latest", "mcp-server", "--flag"}
+	if len(srv.Args) != len(wantArgs) {
+		t.Fatalf("containerized.Args = %v, want %v", srv.Args, wantArgs)
+	}
+	for i, a := range wantArgs {
+		if srv.Args[i] != a {
+			t.Fatalf("containerized.Args = %v, want %v", srv.Args, wantArgs)
+		}
+	}
+	if srv.Env["DOCKER_HOST"] != "unix:///var/run/podman.sock" {
+		t.Fatalf("containerized.Env = %v, want DOCKER_HOST=unix:///var/run/podman.sock", srv.Env)
+	}
+	if strings.Contains(string(data), "super-secret-value") {
+		t.Fatalf("generated mcp.json leaked the expanded secret value: %s", data)
 	}
 }
 
@@ -320,11 +397,8 @@ prompt_overrides:
 func TestExportCommand_NoBackendsExported(t *testing.T) {
 	configPath := writeExportConfig(t, `
 backends:
-  - name: remote-ssh
-    transport: stdio
-    command: ["mcp-server"]
-    ssh:
-      host: example.com
+  - name: weird
+    transport: carrier-pigeon
 `)
 	outPath := filepath.Join(t.TempDir(), "mcp.json")
 
@@ -359,7 +433,7 @@ backends:
 	}
 }
 
-func TestExportCommand_DefaultOutputPath(t *testing.T) {
+func TestExportCommand_NoOutputPathWritesToStdout(t *testing.T) {
 	configPath := writeExportConfig(t, `
 backends:
   - name: srv
@@ -376,10 +450,26 @@ backends:
 	}
 	t.Cleanup(func() { _ = os.Chdir(cwd) })
 
-	if err := cli.Execute(context.Background(), []string{"export", "--config", configPath}); err != nil {
+	var out, errOut bytes.Buffer
+	root := cli.NewRootCmd()
+	root.SetOut(&out)
+	root.SetErr(&errOut)
+	root.SetArgs([]string{"export", "--config", configPath})
+	if err := root.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "mcp.json")); err != nil {
-		t.Fatalf("expected mcp.json to be created: %v", err)
+
+	var got exportedFile
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("stdout did not parse as mcp.json: %v\nstdout:\n%s", err, out.String())
+	}
+	if _, ok := got.MCPServers["srv"]; !ok {
+		t.Fatalf("stdout MCPServers = %+v, want an \"srv\" entry", got.MCPServers)
+	}
+	if !strings.Contains(errOut.String(), "exported") {
+		t.Fatalf("stderr = %q, want the exported-count status message", errOut.String())
+	}
+	if _, err := os.Stat("mcp.json"); err == nil {
+		t.Fatal("Execute: mcp.json should not be written to the working directory when no output path is given")
 	}
 }
