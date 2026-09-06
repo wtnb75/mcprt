@@ -173,6 +173,57 @@ v1 has no built-in gateway authentication, so keep `listen.http` bound to
 localhost or a trusted network and put a reverse proxy (or equivalent) in
 front of it before exposing it any further.
 
+## Container health checks
+
+`mcprt server` with `listen.http` set answers `GET /healthz` with a bare
+`200 OK` — no MCP session, no backend I/O. It only proves the process is up
+and the HTTP listener is dispatching requests, so it's safe to wire to a
+**liveness** probe: a backend going down is normal, auto-recovering
+behavior for mcprt (see `superviseBackend`'s reconnect loop and
+`timeouts.backend_keepalive` above), and a liveness probe that depends on
+backend health would fight that design by restarting the whole process over
+a problem mcprt is already handling on its own.
+
+docker compose:
+
+    services:
+      mcprt:
+        # ...
+        healthcheck:
+          test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/healthz"]
+          interval: 10s
+          timeout: 3s
+          retries: 3
+
+Kubernetes:
+
+    livenessProbe:
+      httpGet:
+        path: /healthz
+        port: 8080
+      periodSeconds: 10
+
+If you also want a **readiness** check that reflects backend health (e.g.
+to stop routing traffic to a pod whose backends aren't up yet), use
+`mcprt ping --config config.yaml` as an exec probe instead — it exits 0 only
+if every configured backend connects and lists tools successfully, and
+non-zero otherwise:
+
+    readinessProbe:
+      exec:
+        command: ["mcprt", "ping", "--config", "/etc/mcprt/config.yaml"]
+      periodSeconds: 10
+
+Don't use `mcprt ping` for **liveness**: unlike `/healthz`, it depends on
+every backend being reachable, so a k8s liveness probe wired to it would
+restart the mcprt process itself over a transient backend outage instead of
+just marking the pod not-ready — the readiness/liveness split above is
+deliberate, not interchangeable.
+
+`listen.stdio`-only deployments (no `listen.http`) have no `/healthz` to
+probe, since there's no HTTP listener at all; use `mcprt ping` (exec) for
+health checks in that case.
+
 ## Development
 
     task build   # build ./bin/mcprt

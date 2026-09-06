@@ -470,6 +470,20 @@ func ServeStdio(ctx context.Context, srv *mcp.Server) error {
 	return srv.Run(ctx, &mcp.StdioTransport{})
 }
 
+// healthzHandler answers GET /healthz with a bare 200 OK, deliberately
+// checking nothing about backend connectivity: mcprt already treats a
+// disconnected backend as a normal, auto-recovering condition (see
+// superviseBackend's reconnect loop), so a liveness probe wired to this
+// endpoint restarting the whole process over one down backend would fight
+// that design instead of complementing it. It exists purely to prove the
+// HTTP listener itself is up and dispatching requests -- see the README's
+// container healthcheck section for how to pair this with `mcprt ping` for
+// backend-aware readiness instead.
+func healthzHandler(w http.ResponseWriter, _ *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok"))
+}
+
 // ShutdownTimeout bounds ServeHTTP's graceful shutdown: MCP Streamable HTTP
 // clients hold a long-lived SSE stream open, so Shutdown would otherwise
 // wait forever for the connection to go idle. A var so tests can shrink it.
@@ -484,8 +498,15 @@ var ShutdownTimeout = 5 * time.Second
 // new sessions without disturbing sessions already bound to the previous
 // one.
 func ServeHTTP(ctx context.Context, getServer func() *mcp.Server, addr string) error {
-	handler := remoteAddrMiddleware(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return getServer() }, nil))
-	httpServer := &http.Server{Addr: addr, Handler: handler}
+	mcpHandler := remoteAddrMiddleware(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return getServer() }, nil))
+
+	mux := http.NewServeMux()
+	// /healthz answers unconditionally, with no MCP session or backend
+	// involved -- see its own doc comment on why liveness must not depend on
+	// backend health.
+	mux.HandleFunc("/healthz", healthzHandler)
+	mux.Handle("/", mcpHandler)
+	httpServer := &http.Server{Addr: addr, Handler: mux}
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpServer.ListenAndServe() }()
