@@ -38,7 +38,7 @@ func newFakeCallBackend(name string) *httptest.Server {
 
 func TestCallCommand_Text(t *testing.T) {
 	backendA := newFakeCallBackend("backend-a")
-	defer backendA.Close()
+	t.Cleanup(func() { backendA.Close() })
 
 	configPath := writeConfig(t, fmt.Sprintf(`
 backends:
@@ -61,9 +61,13 @@ backends:
 	// test the process doesn't exit, so context.Background() would leak it
 	// into later tests, racing their writes to package-level vars like
 	// backendConnectTimeout under `go test -race` (see this plan's Task 2
-	// review, finding 1). cancel() runs (via defer, LIFO) before
-	// backendA.Close() above, so any straggling supervisor stops retrying
-	// before the backend it would retry against goes away.
+	// review, finding 1). t.Context()'s cancellation always fires before any
+	// t.Cleanup-registered function runs (see testing.(*common).runCleanup),
+	// regardless of registration order, so backendA.Close() must be a
+	// t.Cleanup (above) rather than a plain defer: a plain defer would run
+	// at this function's return, before t.Context() cancels anything, and
+	// the backend would close first, letting a straggling supervisor retry
+	// against a now-dead backend.
 	ctx := t.Context()
 	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
@@ -77,7 +81,7 @@ backends:
 
 func TestCallCommand_JSON(t *testing.T) {
 	backendA := newFakeCallBackend("backend-a")
-	defer backendA.Close()
+	t.Cleanup(func() { backendA.Close() })
 
 	configPath := writeConfig(t, fmt.Sprintf(`
 backends:
@@ -91,8 +95,10 @@ backends:
 	root.SetOut(&out)
 	root.SetArgs([]string{"call", "--config", configPath, "--args", `{"message":"hi"}`, "--json", "echo"})
 
-	// See TestCallCommand_Text's matching comment: a cancellable context so
-	// runCall's backend supervisor goroutine doesn't outlive this test.
+	// See TestCallCommand_Text's matching comment: runCall's backend
+	// supervisor goroutine doesn't outlive this test because backendA.Close()
+	// (above) is a t.Cleanup, not a plain defer -- t.Context()'s cancellation
+	// always fires before any t.Cleanup-registered function runs.
 	ctx := t.Context()
 	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
@@ -118,7 +124,7 @@ backends:
 
 func TestCallCommand_NoArgs(t *testing.T) {
 	backendA := newFakeCallBackend("backend-a")
-	defer backendA.Close()
+	t.Cleanup(func() { backendA.Close() })
 
 	configPath := writeConfig(t, fmt.Sprintf(`
 backends:
@@ -127,8 +133,10 @@ backends:
     url: %q
 `, backendA.URL))
 
-	// See TestCallCommand_Text's matching comment: a cancellable context so
-	// runCall's backend supervisor goroutine doesn't outlive this test.
+	// See TestCallCommand_Text's matching comment: runCall's backend
+	// supervisor goroutine doesn't outlive this test because backendA.Close()
+	// (above) is a t.Cleanup, not a plain defer -- t.Context()'s cancellation
+	// always fires before any t.Cleanup-registered function runs.
 	ctx := t.Context()
 	if err := cli.Execute(ctx, []string{"call", "--config", configPath, "echo"}); err != nil {
 		t.Fatalf("Execute: unexpected error calling with no --args: %v", err)
@@ -137,7 +145,7 @@ backends:
 
 func TestCallCommand_UnknownTool(t *testing.T) {
 	backendA := newFakeCallBackend("backend-a")
-	defer backendA.Close()
+	t.Cleanup(func() { backendA.Close() })
 
 	configPath := writeConfig(t, fmt.Sprintf(`
 backends:
@@ -146,8 +154,10 @@ backends:
     url: %q
 `, backendA.URL))
 
-	// See TestCallCommand_Text's matching comment: a cancellable context so
-	// runCall's backend supervisor goroutine doesn't outlive this test.
+	// See TestCallCommand_Text's matching comment: runCall's backend
+	// supervisor goroutine doesn't outlive this test because backendA.Close()
+	// (above) is a t.Cleanup, not a plain defer -- t.Context()'s cancellation
+	// always fires before any t.Cleanup-registered function runs.
 	ctx := t.Context()
 	if err := cli.Execute(ctx, []string{"call", "--config", configPath, "does-not-exist"}); err == nil {
 		t.Fatal("Execute: expected error for unknown tool name, got nil")
@@ -156,7 +166,7 @@ backends:
 
 func TestCallCommand_InvalidArgsJSON(t *testing.T) {
 	backendA := newFakeCallBackend("backend-a")
-	defer backendA.Close()
+	t.Cleanup(func() { backendA.Close() })
 
 	configPath := writeConfig(t, fmt.Sprintf(`
 backends:
@@ -165,8 +175,10 @@ backends:
     url: %q
 `, backendA.URL))
 
-	// See TestCallCommand_Text's matching comment: a cancellable context so
-	// runCall's backend supervisor goroutine doesn't outlive this test. (This
+	// See TestCallCommand_Text's matching comment: runCall's backend
+	// supervisor goroutine doesn't outlive this test because backendA.Close()
+	// (above) is a t.Cleanup, not a plain defer -- t.Context()'s cancellation
+	// always fires before any t.Cleanup-registered function runs. (This
 	// particular call fails before connectBackends even runs -- --args is
 	// validated first -- but the context is fixed uniformly across this file
 	// rather than special-cased per test, since it costs nothing here and
@@ -180,7 +192,7 @@ backends:
 
 func TestCallCommand_ToolReturnsError(t *testing.T) {
 	backendA := newFakeCallBackend("backend-a")
-	defer backendA.Close()
+	t.Cleanup(func() { backendA.Close() })
 
 	configPath := writeConfig(t, fmt.Sprintf(`
 backends:
@@ -189,8 +201,10 @@ backends:
     url: %q
 `, backendA.URL))
 
-	// See TestCallCommand_Text's matching comment: a cancellable context so
-	// runCall's backend supervisor goroutine doesn't outlive this test.
+	// See TestCallCommand_Text's matching comment: runCall's backend
+	// supervisor goroutine doesn't outlive this test because backendA.Close()
+	// (above) is a t.Cleanup, not a plain defer -- t.Context()'s cancellation
+	// always fires before any t.Cleanup-registered function runs.
 	ctx := t.Context()
 	if err := cli.Execute(ctx, []string{"call", "--config", configPath, "boom"}); err == nil {
 		t.Fatal("Execute: expected a non-nil error when the tool result has IsError=true, got nil")
@@ -230,7 +244,7 @@ func (b *syncCallLogBuffer) String() string {
 // for the standalone CLI path, which previously logged nothing at all.
 func TestCallCommand_LogsAuditLineWithMaskedArguments(t *testing.T) {
 	backendA := newFakeCallBackend("backend-a")
-	defer backendA.Close()
+	t.Cleanup(func() { backendA.Close() })
 
 	configPath := writeConfig(t, fmt.Sprintf(`
 backends:
@@ -246,6 +260,10 @@ backends:
 	root.SetErr(&errOut)
 	root.SetArgs([]string{"call", "--config", configPath, "--args", `{"message":"hi","api_key":"secret-value"}`, "echo"})
 
+	// See TestCallCommand_Text's matching comment: runCall's backend
+	// supervisor goroutine doesn't outlive this test because backendA.Close()
+	// (above) is a t.Cleanup, not a plain defer -- t.Context()'s cancellation
+	// always fires before any t.Cleanup-registered function runs.
 	ctx := t.Context()
 	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("call: %v", err)
@@ -323,7 +341,7 @@ func TestCallCommand_LogsAuditLineOnFailure(t *testing.T) {
 			return nil, fmt.Errorf("boom")
 		})
 	backendA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
-	defer backendA.Close()
+	t.Cleanup(func() { backendA.Close() })
 
 	configPath := writeConfig(t, fmt.Sprintf(`
 backends:
@@ -339,6 +357,10 @@ backends:
 	root.SetErr(&errOut)
 	root.SetArgs([]string{"call", "--config", configPath, "explode"})
 
+	// See TestCallCommand_Text's matching comment: runCall's backend
+	// supervisor goroutine doesn't outlive this test because backendA.Close()
+	// (above) is a t.Cleanup, not a plain defer -- t.Context()'s cancellation
+	// always fires before any t.Cleanup-registered function runs.
 	ctx := t.Context()
 	if err := root.ExecuteContext(ctx); err == nil {
 		t.Fatal("call explode: got no error, want one (the tool handler always returns an error)")

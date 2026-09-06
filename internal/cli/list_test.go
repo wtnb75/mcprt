@@ -28,7 +28,7 @@ func newFakeToolBackend(name string, toolNames ...string) *httptest.Server {
 
 func TestListCommand_Text(t *testing.T) {
 	backendA := newFakeToolBackend("backend-a", "search")
-	defer backendA.Close()
+	t.Cleanup(func() { backendA.Close() })
 
 	configPath := writeConfig(t, fmt.Sprintf(`
 backends:
@@ -51,9 +51,13 @@ backends:
 	// test the process doesn't exit, so context.Background() would leak it
 	// into later tests, racing their writes to package-level vars like
 	// backendConnectTimeout under `go test -race` (see this plan's Task 2
-	// review, finding 1). cancel() runs (via defer, LIFO) before
-	// backendA.Close() above, so any straggling supervisor stops retrying
-	// before the backend it would retry against goes away.
+	// review, finding 1). t.Context()'s cancellation always fires before any
+	// t.Cleanup-registered function runs (see testing.(*common).runCleanup),
+	// regardless of registration order, so backendA.Close() must be a
+	// t.Cleanup (above) rather than a plain defer: a plain defer would run
+	// at this function's return, before t.Context() cancels anything, and
+	// the backend would close first, letting a straggling supervisor retry
+	// against a now-dead backend.
 	ctx := t.Context()
 	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
@@ -67,7 +71,7 @@ backends:
 
 func TestListCommand_JSON(t *testing.T) {
 	backendA := newFakeToolBackend("backend-a", "search")
-	defer backendA.Close()
+	t.Cleanup(func() { backendA.Close() })
 
 	configPath := writeConfig(t, fmt.Sprintf(`
 backends:
@@ -81,8 +85,10 @@ backends:
 	root.SetOut(&out)
 	root.SetArgs([]string{"list", "--config", configPath, "--json"})
 
-	// See TestListCommand_Text's matching comment: a cancellable context so
-	// runList's backend supervisor goroutine doesn't outlive this test.
+	// See TestListCommand_Text's matching comment: runList's backend
+	// supervisor goroutine doesn't outlive this test because backendA.Close()
+	// (above) is a t.Cleanup, not a plain defer -- t.Context()'s cancellation
+	// always fires before any t.Cleanup-registered function runs.
 	ctx := t.Context()
 	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
@@ -119,9 +125,9 @@ backends:
 
 func TestListCommand_ReportsConflict(t *testing.T) {
 	backendA := newFakeToolBackend("backend-a", "search")
-	defer backendA.Close()
+	t.Cleanup(func() { backendA.Close() })
 	backendB := newFakeToolBackend("backend-b", "search")
-	defer backendB.Close()
+	t.Cleanup(func() { backendB.Close() })
 
 	configPath := writeConfig(t, fmt.Sprintf(`
 backends:
@@ -138,8 +144,11 @@ backends:
 	root.SetOut(&out)
 	root.SetArgs([]string{"list", "--config", configPath, "--json"})
 
-	// See TestListCommand_Text's matching comment: a cancellable context so
-	// runList's backend supervisor goroutines don't outlive this test.
+	// See TestListCommand_Text's matching comment: runList's backend
+	// supervisor goroutines don't outlive this test because backendA.Close()
+	// and backendB.Close() (above) are t.Cleanup calls, not plain defers --
+	// t.Context()'s cancellation always fires before any t.Cleanup-registered
+	// function runs.
 	ctx := t.Context()
 	if err := root.ExecuteContext(ctx); err != nil {
 		t.Fatalf("Execute: unexpected error: %v", err)
