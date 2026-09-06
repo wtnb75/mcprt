@@ -1250,8 +1250,13 @@ func TestServerCommand_RelaysToolCallProgress(t *testing.T) {
 				// here gives the relay its ordinary run of the field before
 				// the response retires the call, so the assertions below
 				// exercise the intended path instead of that documented
-				// race.
-				time.Sleep(50 * time.Millisecond)
+				// race. 50ms was observed to flake under load (the drop is
+				// silent, so the symptom is the assertions below timing out
+				// waiting for a notification that was never sent, not a
+				// slow one arriving late) -- 200ms gives more margin for
+				// the relay to actually win the race before the response
+				// retires the call.
+				time.Sleep(200 * time.Millisecond)
 			}
 			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "ok"}}}, nil
 		})
