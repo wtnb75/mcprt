@@ -1156,6 +1156,51 @@ func TestGateway_ServeHTTP_LogsRemoteAddr(t *testing.T) {
 	}
 }
 
+// TestServeHTTP_HealthzReturnsOK checks that GET /healthz answers 200
+// immediately, without an MCP session or any backend involved -- this is
+// what makes it safe as a container liveness probe: unlike mcprt ping (or
+// any real MCP call), it never fails just because a backend is down, which
+// mcprt's own reconnect logic already treats as a normal, recoverable
+// condition rather than something that should restart the process.
+func TestServeHTTP_HealthzReturnsOK(t *testing.T) {
+	srv := gateway.New(gateway.NewConfig{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatalf("closing probe listener: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- gateway.ServeHTTP(ctx, func() *mcp.Server { return srv.MCP() }, addr) }()
+
+	var resp *http.Response
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err = http.Get("http://" + addr + "/healthz")
+		if err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /healthz status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	cancel()
+	if err := <-serveErr; err != nil {
+		t.Fatalf("ServeHTTP exited with error: %v", err)
+	}
+}
+
 // TestServeHTTP_KeepAliveClosesSessionAfterDownstreamClientDisappears checks
 // that gateway.NewConfig's KeepAlive/KeepAliveFailureThreshold fields
 // actually reach the underlying *mcp.Server's ServerOptions -- the
