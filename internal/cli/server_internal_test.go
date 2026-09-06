@@ -439,9 +439,13 @@ func TestSuperviseBackend_ReconnectsAfterDisconnect(t *testing.T) {
 	// actually cleared the tools at some point within the deadline.
 	// 2s was observed to flake on loaded CI runners (the disconnect -> clear
 	// cycle above is normally sub-millisecond locally, but shares no such
-	// guarantee under contention) -- 5s matches the margin already used by
-	// this file's other polling loops (e.g. the reconnect wait right below).
-	deadline := time.Now().Add(5 * time.Second)
+	// guarantee under contention); 5s (the margin already used by this
+	// file's other polling loops, e.g. the reconnect wait right below) then
+	// ALSO flaked twice in a row on CI, finishing at ~5.0-5.03s -- right at
+	// the edge, not a fluke. 15s gives real headroom instead of nudging the
+	// number up by a few seconds and re-litigating this the next time CI is
+	// under load.
+	deadline := time.Now().Add(15 * time.Second)
 	var sawEmpty bool
 	for time.Now().Before(deadline) {
 		if len(toolNames()) == 0 {
@@ -451,13 +455,13 @@ func TestSuperviseBackend_ReconnectsAfterDisconnect(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if !sawEmpty {
-		t.Fatal("tools never went empty within 5s of disconnect (superviseBackend must clear them)")
+		t.Fatal("tools never went empty within 15s of disconnect (superviseBackend must clear them)")
 	}
 
 	// The fake backend server is still up -- superviseBackend's retry loop
-	// (backoff shrunk above) should reconnect automatically. Same 5s margin
-	// as the empty-tools wait above, for the same reason.
-	deadline = time.Now().Add(5 * time.Second)
+	// (backoff shrunk above) should reconnect automatically. Same 15s
+	// margin as the empty-tools wait above, for the same reason.
+	deadline = time.Now().Add(15 * time.Second)
 	var got []string
 	for time.Now().Before(deadline) {
 		got = toolNames()
