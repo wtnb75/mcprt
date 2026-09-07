@@ -40,8 +40,24 @@ import (
 // test output. Setting "none" makes autoexport.NewSpanExporter return a
 // genuine no-op exporter, keeping every test in this package fast,
 // deterministic, and independent of network access.
+//
+// It also widens gateway.ShutdownTimeout from its 5s production default:
+// every TestServerCommand_* e2e test in server_test.go ends the same way
+// (session.Close(); cancel(); check execErr is nil), which races the
+// client-side close being noticed against ServeHTTP's graceful Shutdown
+// deadline -- fine with room to spare locally, but
+// TestServerCommand_PropagatesToolsListChanged hit "graceful shutdown
+// timed out" on a loaded CI runner at the production default. Since every
+// test in this file shares the identical ending, and therefore the
+// identical exposure, this is set once here rather than patched into
+// whichever single test happens to be the one observed flaking next.
+// TestServerCommand_ConfiguredShutdownTimeoutTakesEffect still overrides
+// this to 100ms for its own run (via config, restored via its own
+// t.Cleanup) to test the opposite direction -- a real timeout -- without
+// this default getting in its way.
 func TestMain(m *testing.M) {
 	_ = os.Setenv("OTEL_TRACES_EXPORTER", "none")
+	gateway.ShutdownTimeout = 15 * time.Second
 	os.Exit(m.Run())
 }
 
