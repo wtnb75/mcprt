@@ -506,6 +506,35 @@ func newFakePromptBackendServer(name string, promptNames ...string) *mcp.Server 
 	return srv
 }
 
+// newFakeCompletionBackendServer returns a fake backend that serves one
+// prompt ("greet") and one resource template ("file:///dir/{f}"), and
+// answers completion/complete by echoing back what it was asked to
+// complete -- ref type, name/URI, and the argument's name/value -- as a
+// single completion value, so tests can assert the backend received the
+// *original* (un-prefixed) ref, not the gateway-exposed one.
+func newFakeCompletionBackendServer(name string) *mcp.Server {
+	srv := mcp.NewServer(&mcp.Implementation{Name: name, Version: "v1"}, &mcp.ServerOptions{
+		CompletionHandler: func(ctx context.Context, req *mcp.CompleteRequest) (*mcp.CompleteResult, error) {
+			ref := req.Params.Ref
+			target := ref.Name
+			if ref.Type == "ref/resource" {
+				target = ref.URI
+			}
+			value := name + ":" + ref.Type + ":" + target + ":" + req.Params.Argument.Name + "=" + req.Params.Argument.Value
+			return &mcp.CompleteResult{Completion: mcp.CompletionResultDetails{Values: []string{value}}}, nil
+		},
+	})
+	srv.AddPrompt(&mcp.Prompt{Name: "greet"},
+		func(ctx context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+			return &mcp.GetPromptResult{}, nil
+		})
+	srv.AddResourceTemplate(&mcp.ResourceTemplate{URITemplate: "file:///dir/{f}", Name: "dir"},
+		func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+			return &mcp.ReadResourceResult{}, nil
+		})
+	return srv
+}
+
 func promptNameOf(p *mcp.Prompt) string { return p.Name }
 
 func promptRename(p *mcp.Prompt, name string) *mcp.Prompt {
@@ -885,6 +914,229 @@ func TestGateway_PromptGetOnDeadBackendReturnsError(t *testing.T) {
 	_, err = session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "boom"})
 	if err == nil {
 		t.Fatal("GetPrompt(boom) on dead backend: got no error, want one")
+	}
+}
+
+// TestGateway_CompletionRefPromptForwardsToBackend checks that
+// completion/complete with a ref/prompt is forwarded to the backend that
+// owns the prompt, with the backend's completion result returned unchanged.
+func TestGateway_CompletionRefPromptForwardsToBackend(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendServer := newFakeCompletionBackendServer("backend-a")
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpA.Close()
+
+	ctx := context.Background()
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = connA.Close() }()
+
+	prompts, err := connA.ListPrompts(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a prompts: %v", err)
+	}
+	table := router.Resolve([]router.Entry[*mcp.Prompt]{{BackendName: "backend-a", Items: prompts}}, promptNameOf, promptRename, nil)
+
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"backend-a": connA},
+		Tables:   gateway.Tables{Prompts: table},
+	})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.Complete(ctx, &mcp.CompleteParams{
+		Ref:      &mcp.CompleteReference{Type: "ref/prompt", Name: "greet"},
+		Argument: mcp.CompleteParamsArgument{Name: "lang", Value: "en"},
+	})
+	if err != nil {
+		t.Fatalf("Complete(ref/prompt greet): %v", err)
+	}
+	want := []string{"backend-a:ref/prompt:greet:lang=en"}
+	if !slices.Equal(res.Completion.Values, want) {
+		t.Fatalf("Complete(ref/prompt greet) values = %v, want %v", res.Completion.Values, want)
+	}
+}
+
+// TestGateway_CompletionRefPromptTranslatesPrefixedName checks that when a
+// prompt is exposed under a backend prefix, the gateway forwards the
+// backend's *original* (un-prefixed) name in the ref it sends upstream --
+// the same prefix-stripping registerPrompt already does for prompts/get.
+func TestGateway_CompletionRefPromptTranslatesPrefixedName(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendServer := newFakeCompletionBackendServer("backend-a")
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpA.Close()
+
+	ctx := context.Background()
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = connA.Close() }()
+
+	prompts, err := connA.ListPrompts(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a prompts: %v", err)
+	}
+	table := router.Resolve([]router.Entry[*mcp.Prompt]{
+		{BackendName: "backend-a", Prefix: "a__", Items: prompts},
+	}, promptNameOf, promptRename, nil)
+
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"backend-a": connA},
+		Tables:   gateway.Tables{Prompts: table},
+	})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.Complete(ctx, &mcp.CompleteParams{
+		Ref:      &mcp.CompleteReference{Type: "ref/prompt", Name: "a__greet"},
+		Argument: mcp.CompleteParamsArgument{Name: "lang", Value: "en"},
+	})
+	if err != nil {
+		t.Fatalf("Complete(ref/prompt a__greet): %v", err)
+	}
+	// The backend only ever saw "greet" (its own, un-prefixed name), not the
+	// gateway-exposed "a__greet".
+	want := []string{"backend-a:ref/prompt:greet:lang=en"}
+	if !slices.Equal(res.Completion.Values, want) {
+		t.Fatalf("Complete(ref/prompt a__greet) values = %v, want %v (original name forwarded)", res.Completion.Values, want)
+	}
+}
+
+// TestGateway_CompletionRefResourceTemplateForwardsToBackend checks that
+// completion/complete with a ref/resource matching a registered resource
+// template's URI-template string is forwarded to the owning backend.
+func TestGateway_CompletionRefResourceTemplateForwardsToBackend(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendServer := newFakeCompletionBackendServer("backend-a")
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpA.Close()
+
+	ctx := context.Background()
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = connA.Close() }()
+
+	templates, err := connA.ListResourceTemplates(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a resource templates: %v", err)
+	}
+	templateNameOf := func(rt *mcp.ResourceTemplate) string { return rt.URITemplate }
+	templateRename := func(rt *mcp.ResourceTemplate, name string) *mcp.ResourceTemplate {
+		c := *rt
+		c.URITemplate = name
+		return &c
+	}
+	table := router.Resolve([]router.Entry[*mcp.ResourceTemplate]{
+		{BackendName: "backend-a", Items: templates},
+	}, templateNameOf, templateRename, nil)
+
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"backend-a": connA},
+		Tables:   gateway.Tables{ResourceTemplates: table},
+	})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.Complete(ctx, &mcp.CompleteParams{
+		Ref:      &mcp.CompleteReference{Type: "ref/resource", URI: "file:///dir/{f}"},
+		Argument: mcp.CompleteParamsArgument{Name: "f", Value: "re"},
+	})
+	if err != nil {
+		t.Fatalf("Complete(ref/resource file:///dir/{f}): %v", err)
+	}
+	want := []string{"backend-a:ref/resource:file:///dir/{f}:f=re"}
+	if !slices.Equal(res.Completion.Values, want) {
+		t.Fatalf("Complete(ref/resource file:///dir/{f}) values = %v, want %v", res.Completion.Values, want)
+	}
+}
+
+// TestGateway_CompletionUnknownRefPromptReturnsError checks that
+// completion/complete for a ref/prompt naming an unregistered prompt
+// returns an error instead of an empty completion list.
+func TestGateway_CompletionUnknownRefPromptReturnsError(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := gateway.New(gateway.NewConfig{Logger: logger, Backends: map[string]*backend.Backend{}})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+
+	ctx := context.Background()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	_, err = session.Complete(ctx, &mcp.CompleteParams{
+		Ref:      &mcp.CompleteReference{Type: "ref/prompt", Name: "no-such-prompt"},
+		Argument: mcp.CompleteParamsArgument{Name: "lang", Value: "en"},
+	})
+	if err == nil {
+		t.Fatalf("Complete(ref/prompt no-such-prompt): got no error, want an error")
+	}
+}
+
+// TestGateway_CompletionUnknownRefResourceReturnsError checks that
+// completion/complete for a ref/resource URI matching neither a registered
+// resource nor a resource template returns an error.
+func TestGateway_CompletionUnknownRefResourceReturnsError(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := gateway.New(gateway.NewConfig{Logger: logger, Backends: map[string]*backend.Backend{}})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+
+	ctx := context.Background()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	_, err = session.Complete(ctx, &mcp.CompleteParams{
+		Ref:      &mcp.CompleteReference{Type: "ref/resource", URI: "file:///no-such"},
+		Argument: mcp.CompleteParamsArgument{Name: "f", Value: ""},
+	})
+	if err == nil {
+		t.Fatalf("Complete(ref/resource file:///no-such): got no error, want an error")
 	}
 }
 

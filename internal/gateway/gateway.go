@@ -181,14 +181,7 @@ func emptyTable[T any](t *router.Table[T]) *router.Table[T] {
 // BackendName referenced in cfg.Tables (the caller builds both from the
 // same set of connected backends).
 func New(cfg NewConfig) *Server {
-	mcpSrv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{
-		Logger:                    cfg.Logger,
-		KeepAlive:                 cfg.KeepAlive,
-		KeepAliveFailureThreshold: cfg.KeepAliveFailureThreshold,
-	})
-
 	s := &Server{
-		mcp:      mcpSrv,
 		logger:   cfg.Logger,
 		backends: cfg.Backends,
 		maskKeys: cfg.MaskKeys,
@@ -209,6 +202,14 @@ func New(cfg NewConfig) *Server {
 		promptTable:     emptyTable(cfg.Tables.Prompts),
 		promptOverrides: cfg.Overrides.Prompts,
 	}
+
+	mcpSrv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{
+		Logger:                    cfg.Logger,
+		KeepAlive:                 cfg.KeepAlive,
+		KeepAliveFailureThreshold: cfg.KeepAliveFailureThreshold,
+		CompletionHandler:         s.completionHandler,
+	})
+	s.mcp = mcpSrv
 
 	if cfg.Tables.Tools != nil {
 		for _, resolved := range cfg.Tables.Tools.Items {
@@ -232,6 +233,82 @@ func New(cfg NewConfig) *Server {
 	}
 
 	return s
+}
+
+// completionHandler forwards completion/complete to the backend that owns
+// req.Params.Ref (a prompt name or a resource/resource-template URI),
+// resolved through the same promptTable/resourceTable/resourceTemplateTable
+// registerPrompt/registerResource/registerResourceTemplate already populate
+// at registration time -- no new state is needed. Locked only for the table
+// lookup: s.mu guards promptTable/resourceTable/resourceTemplateTable
+// against a concurrent UpdatePrompts/UpdateResources (see reconcile.go), but
+// the actual backend I/O (b.Session.Complete) happens after Unlock, matching
+// every other handler in this file.
+func (s *Server) completionHandler(ctx context.Context, req *mcp.CompleteRequest) (*mcp.CompleteResult, error) {
+	ref := req.Params.Ref
+	if ref == nil {
+		// Defensive: the SDK validates this today, but a documented debug
+		// escape hatch can disable that validation, so guard against a nil
+		// ref rather than panicking on ref.Type below.
+		s.logger.Warn("completion: nil ref")
+		return nil, fmt.Errorf("completion: nil ref")
+	}
+	s.mu.Lock()
+	var b *backend.Backend
+	var backendName string
+	var originalRef *mcp.CompleteReference
+	found := false
+	switch ref.Type {
+	case "ref/prompt":
+		if resolved, ok := s.promptTable.Items[ref.Name]; ok {
+			found = true
+			backendName = resolved.BackendName
+			b = s.backends[resolved.BackendName]
+			originalRef = &mcp.CompleteReference{Type: "ref/prompt", Name: resolved.OriginalName}
+		}
+	case "ref/resource":
+		if resolved, ok := s.resourceTable.Items[ref.URI]; ok {
+			found = true
+			backendName = resolved.BackendName
+			b = s.backends[resolved.BackendName]
+			originalRef = &mcp.CompleteReference{Type: "ref/resource", URI: resolved.OriginalName}
+		} else if resolved, ok := s.resourceTemplateTable.Items[ref.URI]; ok {
+			// completion targets a resource template's URI-template string
+			// itself (e.g. "file:///dir/{f}"), matched exactly against
+			// registered template strings -- not the same "does a concrete
+			// URI match this template" resolution resourceTemplateReadHandler
+			// does at read time.
+			found = true
+			backendName = resolved.BackendName
+			b = s.backends[resolved.BackendName]
+			originalRef = &mcp.CompleteReference{Type: "ref/resource", URI: resolved.OriginalName}
+		}
+	}
+	s.mu.Unlock()
+
+	if !found {
+		s.logger.Warn("completion: unknown ref", "type", ref.Type, "name", ref.Name, "uri", ref.URI)
+		return nil, fmt.Errorf("completion: unknown %s (name=%q uri=%q)", ref.Type, ref.Name, ref.URI)
+	}
+	if b == nil {
+		// New's contract requires every referenced BackendName to have an
+		// entry in backends; a nil b here means that contract broke (e.g. a
+		// stale table racing a backend disconnect) -- the same case
+		// registerPrompt already handles explicitly. The ref itself was
+		// known; its backend just isn't there.
+		s.logger.Warn("completion: backend not found", "backend", backendName, "type", ref.Type, "name", ref.Name, "uri", ref.URI)
+		return nil, fmt.Errorf("completion: backend %q not found for %s (name=%q uri=%q)", backendName, ref.Type, ref.Name, ref.URI)
+	}
+
+	result, err := b.Session.Complete(ctx, &mcp.CompleteParams{
+		Ref:      originalRef,
+		Argument: req.Params.Argument,
+		Context:  req.Params.Context,
+	})
+	if err != nil {
+		s.logger.Warn("completion: backend call failed", "backend", b.Name, "type", ref.Type, "name", ref.Name, "uri", ref.URI, "error", err)
+	}
+	return result, err
 }
 
 // registerTool registers resolved.Item, falling back to the next

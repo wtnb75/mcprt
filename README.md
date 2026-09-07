@@ -101,8 +101,10 @@ a prefix onto one would produce an invalid URI. `resources/subscribe` and
 `overrides` resolves tool names — including `prefix` being applied to
 prompt names before conflict resolution, exactly like tool names (unlike
 resource/resource-template URIs, which never get a prefix).
-`notifications/prompts/list_changed` and `completion/complete` are not
-relayed.
+`notifications/prompts/list_changed` is not relayed. `completion/complete`
+(both `ref/prompt` and `ref/resource`, including resource templates) is
+forwarded to the backend that owns the referenced prompt/resource, the same
+way `tools/call`/`resources/read`/`prompts/get` are.
 
 Some backends advertise MCP's newer stateless protocol (SEP-2575) well
 enough to pass its `server/discover` handshake, but don't correctly
@@ -122,7 +124,9 @@ with the calling MCP client's name/version, session ID, HTTP remote address
 (HTTP sessions only), call duration, and the call's arguments. Any argument
 object key matching (case-insensitively, by substring) `key`, `auth`,
 `pass`, `cred`, `token`, or an entry in `logging.mask_keys` has its value
-replaced with `***` before logging.
+replaced with `***` before logging. `completion/complete` is deliberately
+not audit-logged this way (it's high-frequency and side-effect-free); only
+a failed `completion/complete` call gets a `Warn`-level log line.
 
 `timeouts` overrides mcprt's built-in timeout/backoff defaults; every field
 is optional and falls back to the default noted above when unset. Values are
