@@ -497,6 +497,10 @@ func connectAndList(ctx context.Context, logger *slog.Logger, bc config.BackendC
 		return nil, fmt.Errorf("connect: %w", err)
 	}
 	logger.Info("backend connected", "backend", bc.Name, "transport", bc.Transport)
+	if b.ListChangedUnsupported {
+		logger.Warn("backend does not support list-changed subscriptions, connected without live updates",
+			"backend", bc.Name)
+	}
 	tools, err := b.ListTools(ctx)
 	if err != nil {
 		_ = b.Close()
