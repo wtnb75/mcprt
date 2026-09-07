@@ -520,7 +520,7 @@ func newFakeCompletionBackendServer(name string) *mcp.Server {
 			if ref.Type == "ref/resource" {
 				target = ref.URI
 			}
-			value := ref.Type + ":" + target + ":" + req.Params.Argument.Name + "=" + req.Params.Argument.Value
+			value := name + ":" + ref.Type + ":" + target + ":" + req.Params.Argument.Name + "=" + req.Params.Argument.Value
 			return &mcp.CompleteResult{Completion: mcp.CompletionResultDetails{Values: []string{value}}}, nil
 		},
 	})
@@ -963,7 +963,7 @@ func TestGateway_CompletionRefPromptForwardsToBackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Complete(ref/prompt greet): %v", err)
 	}
-	want := []string{"ref/prompt:greet:lang=en"}
+	want := []string{"backend-a:ref/prompt:greet:lang=en"}
 	if !slices.Equal(res.Completion.Values, want) {
 		t.Fatalf("Complete(ref/prompt greet) values = %v, want %v", res.Completion.Values, want)
 	}
@@ -1020,7 +1020,7 @@ func TestGateway_CompletionRefPromptTranslatesPrefixedName(t *testing.T) {
 	}
 	// The backend only ever saw "greet" (its own, un-prefixed name), not the
 	// gateway-exposed "a__greet".
-	want := []string{"ref/prompt:greet:lang=en"}
+	want := []string{"backend-a:ref/prompt:greet:lang=en"}
 	if !slices.Equal(res.Completion.Values, want) {
 		t.Fatalf("Complete(ref/prompt a__greet) values = %v, want %v (original name forwarded)", res.Completion.Values, want)
 	}
@@ -1080,7 +1080,7 @@ func TestGateway_CompletionRefResourceTemplateForwardsToBackend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Complete(ref/resource file:///dir/{f}): %v", err)
 	}
-	want := []string{"ref/resource:file:///dir/{f}:f=re"}
+	want := []string{"backend-a:ref/resource:file:///dir/{f}:f=re"}
 	if !slices.Equal(res.Completion.Values, want) {
 		t.Fatalf("Complete(ref/resource file:///dir/{f}) values = %v, want %v", res.Completion.Values, want)
 	}

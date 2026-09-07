@@ -246,17 +246,30 @@ func New(cfg NewConfig) *Server {
 // every other handler in this file.
 func (s *Server) completionHandler(ctx context.Context, req *mcp.CompleteRequest) (*mcp.CompleteResult, error) {
 	ref := req.Params.Ref
+	if ref == nil {
+		// Defensive: the SDK validates this today, but a documented debug
+		// escape hatch can disable that validation, so guard against a nil
+		// ref rather than panicking on ref.Type below.
+		s.logger.Warn("completion: nil ref")
+		return nil, fmt.Errorf("completion: nil ref")
+	}
 	s.mu.Lock()
 	var b *backend.Backend
+	var backendName string
 	var originalRef *mcp.CompleteReference
+	found := false
 	switch ref.Type {
 	case "ref/prompt":
 		if resolved, ok := s.promptTable.Items[ref.Name]; ok {
+			found = true
+			backendName = resolved.BackendName
 			b = s.backends[resolved.BackendName]
 			originalRef = &mcp.CompleteReference{Type: "ref/prompt", Name: resolved.OriginalName}
 		}
 	case "ref/resource":
 		if resolved, ok := s.resourceTable.Items[ref.URI]; ok {
+			found = true
+			backendName = resolved.BackendName
 			b = s.backends[resolved.BackendName]
 			originalRef = &mcp.CompleteReference{Type: "ref/resource", URI: resolved.OriginalName}
 		} else if resolved, ok := s.resourceTemplateTable.Items[ref.URI]; ok {
@@ -265,15 +278,26 @@ func (s *Server) completionHandler(ctx context.Context, req *mcp.CompleteRequest
 			// registered template strings -- not the same "does a concrete
 			// URI match this template" resolution resourceTemplateReadHandler
 			// does at read time.
+			found = true
+			backendName = resolved.BackendName
 			b = s.backends[resolved.BackendName]
 			originalRef = &mcp.CompleteReference{Type: "ref/resource", URI: resolved.OriginalName}
 		}
 	}
 	s.mu.Unlock()
 
-	if b == nil {
+	if !found {
 		s.logger.Warn("completion: unknown ref", "type", ref.Type, "name", ref.Name, "uri", ref.URI)
 		return nil, fmt.Errorf("completion: unknown %s (name=%q uri=%q)", ref.Type, ref.Name, ref.URI)
+	}
+	if b == nil {
+		// New's contract requires every referenced BackendName to have an
+		// entry in backends; a nil b here means that contract broke (e.g. a
+		// stale table racing a backend disconnect) -- the same case
+		// registerPrompt already handles explicitly. The ref itself was
+		// known; its backend just isn't there.
+		s.logger.Warn("completion: backend not found", "backend", backendName, "type", ref.Type, "name", ref.Name, "uri", ref.URI)
+		return nil, fmt.Errorf("completion: backend %q not found for %s (name=%q uri=%q)", backendName, ref.Type, ref.Name, ref.URI)
 	}
 
 	result, err := b.Session.Complete(ctx, &mcp.CompleteParams{

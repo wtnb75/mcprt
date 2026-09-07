@@ -124,7 +124,9 @@ with the calling MCP client's name/version, session ID, HTTP remote address
 (HTTP sessions only), call duration, and the call's arguments. Any argument
 object key matching (case-insensitively, by substring) `key`, `auth`,
 `pass`, `cred`, `token`, or an entry in `logging.mask_keys` has its value
-replaced with `***` before logging.
+replaced with `***` before logging. `completion/complete` is deliberately
+not audit-logged this way (it's high-frequency and side-effect-free); only
+a failed `completion/complete` call gets a `Warn`-level log line.
 
 `timeouts` overrides mcprt's built-in timeout/backoff defaults; every field
 is optional and falls back to the default noted above when unset. Values are
