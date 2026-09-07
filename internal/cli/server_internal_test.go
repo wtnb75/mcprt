@@ -2089,13 +2089,13 @@ func TestCloseBackends_NoErrorLogsNothing(t *testing.T) {
 // test despite its doc comment claiming the same property.
 //
 // It wires the real production path (connectBackendsWaitable, i.e.
-// superviseBackends/superviseBackend, with a real *gateway.ElicitationRouter
-// in gwH.relays.Elicit) against a real backend whose "ask" tool calls
+// superviseBackends/superviseBackend, with a real *gateway.CallRouter
+// in gwH.relays.Calls) against a real backend whose "ask" tool calls
 // req.Session.Elicit. Rather than routing that elicitation through a full
 // gateway.Server and a downstream client connected to it (already covered
 // end-to-end by TestServerCommand_RoutesElicitationToDownstreamClient in
 // server_test.go), it Enters a stand-in downstream session directly into
-// gwH.relays.Elicit -- exactly what gateway.callHandler would do around a
+// gwH.relays.Calls -- exactly what gateway.callHandler would do around a
 // real tools/call, just done here by hand so the test can control precisely
 // how that session behaves. That stand-in session's ElicitationHandler
 // blocks on a channel the test only closes at cleanup, so it never itself
@@ -2114,7 +2114,7 @@ func TestSuperviseBackend_OnElicit_BoundedByElicitTimeout(t *testing.T) {
 	t.Cleanup(func() { close(blockElicit) })
 
 	// stubSrv/stubClient exist solely to hand this test a real
-	// *mcp.ServerSession to Enter into gwH.relays.Elicit -- ElicitationRouter's
+	// *mcp.ServerSession to Enter into gwH.relays.Calls -- CallRouter's
 	// live map is typed *mcp.ServerSession, which cannot be faked with an
 	// interface, so a genuine (if otherwise unused) MCP connection is the
 	// only way to get one. Capturing req.Session from a tool call is the
@@ -2188,7 +2188,7 @@ func TestSuperviseBackend_OnElicit_BoundedByElicitTimeout(t *testing.T) {
 	// just cancelling ctx and trusting it happens eventually.
 	defer func() { waitSupervisorsDone(t, supervisorsDone) }()
 
-	gwH := &gwHolder{relays: gateway.Relays{Elicit: gateway.NewElicitationRouter()}}
+	gwH := &gwHolder{relays: gateway.Relays{Calls: gateway.NewCallRouter()}}
 	conn, supervisorsDone := connectBackendsWaitable(ctx, logger,
 		[]config.BackendConfig{{Name: "fake", Transport: "http", URL: backendHTTP.URL}}, gwH)
 	b, ok := conn.backends["fake"]
@@ -2202,7 +2202,7 @@ func TestSuperviseBackend_OnElicit_BoundedByElicitTimeout(t *testing.T) {
 	// "fake", exactly as gateway.callHandler's Enter/leave pair would do
 	// around a real tools/call -- done directly here since this test only
 	// needs cb.OnElicit's timeout behavior, not the routing machinery.
-	leave := gwH.relays.Elicit.Enter("fake", capturedSession)
+	leave := gwH.relays.Calls.Enter("fake", capturedSession)
 	defer leave()
 
 	callCtx, callCancel := context.WithTimeout(context.Background(), 5*time.Second)
