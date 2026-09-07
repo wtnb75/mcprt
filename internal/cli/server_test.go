@@ -21,6 +21,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/wtnb75/mcprt/internal/cli"
+	"github.com/wtnb75/mcprt/internal/gateway"
 )
 
 func freePort(t *testing.T) string {
@@ -1510,6 +1511,13 @@ backends:
 // execErr well under the 5s default is what turns "config value ignored"
 // into a prompt, deterministic failure instead of just a slow pass.
 func TestServerCommand_ConfiguredShutdownTimeoutTakesEffect(t *testing.T) {
+	// runServer's applyTimeouts sets gateway.ShutdownTimeout unconditionally
+	// from config with no restoration of its own (see applyTimeouts) --
+	// without this, the 100ms this test configures below would leak into
+	// every test that runs after it in this package's test binary.
+	origShutdownTimeout := gateway.ShutdownTimeout
+	t.Cleanup(func() { gateway.ShutdownTimeout = origShutdownTimeout })
+
 	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
 	mcp.AddTool(backendSrv, &mcp.Tool{Name: "ping", Description: "ping"},
 		func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
