@@ -101,8 +101,10 @@ a prefix onto one would produce an invalid URI. `resources/subscribe` and
 `overrides` resolves tool names — including `prefix` being applied to
 prompt names before conflict resolution, exactly like tool names (unlike
 resource/resource-template URIs, which never get a prefix).
-`notifications/prompts/list_changed` and `completion/complete` are not
-relayed.
+`notifications/prompts/list_changed` is not relayed. `completion/complete`
+(both `ref/prompt` and `ref/resource`, including resource templates) is
+forwarded to the backend that owns the referenced prompt/resource, the same
+way `tools/call`/`resources/read`/`prompts/get` are.
 
 Some backends advertise MCP's newer stateless protocol (SEP-2575) well
 enough to pass its `server/discover` handshake, but don't correctly
