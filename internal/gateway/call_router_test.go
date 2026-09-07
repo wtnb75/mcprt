@@ -9,15 +9,15 @@ import (
 	"github.com/wtnb75/mcprt/internal/gateway"
 )
 
-func TestElicitationRouter_RouteWithZeroInFlightErrors(t *testing.T) {
-	r := gateway.NewElicitationRouter()
+func TestCallRouter_RouteWithZeroInFlightErrors(t *testing.T) {
+	r := gateway.NewCallRouter()
 	if _, err := r.Route("backend-a"); err == nil {
 		t.Fatal("Route with zero in-flight calls: got nil error, want an error")
 	}
 }
 
-func TestElicitationRouter_RouteWithOneInFlightReturnsSession(t *testing.T) {
-	r := gateway.NewElicitationRouter()
+func TestCallRouter_RouteWithOneInFlightReturnsSession(t *testing.T) {
+	r := gateway.NewCallRouter()
 	session := &mcp.ServerSession{}
 	leave := r.Enter("backend-a", session)
 	defer leave()
@@ -31,8 +31,8 @@ func TestElicitationRouter_RouteWithOneInFlightReturnsSession(t *testing.T) {
 	}
 }
 
-func TestElicitationRouter_RouteWithMultipleInFlightErrors(t *testing.T) {
-	r := gateway.NewElicitationRouter()
+func TestCallRouter_RouteWithMultipleInFlightErrors(t *testing.T) {
+	r := gateway.NewCallRouter()
 	leave1 := r.Enter("backend-a", &mcp.ServerSession{})
 	defer leave1()
 	leave2 := r.Enter("backend-a", &mcp.ServerSession{})
@@ -43,15 +43,15 @@ func TestElicitationRouter_RouteWithMultipleInFlightErrors(t *testing.T) {
 	}
 }
 
-// TestElicitationRouter_SameSessionTwiceIsStillAmbiguous checks that Route
+// TestCallRouter_SameSessionTwiceIsStillAmbiguous checks that Route
 // counts in-flight CALLS, not distinct sessions: two concurrent tools/call
 // from the very same downstream session against the same backend must
 // still refuse to route, since MCP's elicitation/create carries no
 // per-call correlation -- mcprt genuinely cannot tell which of the two
 // calls the elicitation belongs to, even though routing it to "the" session
 // would happen to reach the right client.
-func TestElicitationRouter_SameSessionTwiceIsStillAmbiguous(t *testing.T) {
-	r := gateway.NewElicitationRouter()
+func TestCallRouter_SameSessionTwiceIsStillAmbiguous(t *testing.T) {
+	r := gateway.NewCallRouter()
 	session := &mcp.ServerSession{}
 	leave1 := r.Enter("backend-a", session)
 	leave2 := r.Enter("backend-a", session)
@@ -75,8 +75,8 @@ func TestElicitationRouter_SameSessionTwiceIsStillAmbiguous(t *testing.T) {
 	}
 }
 
-func TestElicitationRouter_DifferentBackendsAreIndependent(t *testing.T) {
-	r := gateway.NewElicitationRouter()
+func TestCallRouter_DifferentBackendsAreIndependent(t *testing.T) {
+	r := gateway.NewCallRouter()
 	sessionA := &mcp.ServerSession{}
 	leaveA := r.Enter("backend-a", sessionA)
 	defer leaveA()
@@ -93,14 +93,14 @@ func TestElicitationRouter_DifferentBackendsAreIndependent(t *testing.T) {
 	}
 }
 
-// TestElicitationRouter_ConcurrentEnterRouteLeave exercises Enter, Route,
+// TestCallRouter_ConcurrentEnterRouteLeave exercises Enter, Route,
 // and leave from many goroutines at once -- go test -race must find
 // nothing. It does not assert on Route's outcome mid-stress (the in-flight
 // count is nondeterministic while goroutines are still entering/leaving),
 // only that the router is race-free and left in a correct empty state
 // afterward.
-func TestElicitationRouter_ConcurrentEnterRouteLeave(t *testing.T) {
-	r := gateway.NewElicitationRouter()
+func TestCallRouter_ConcurrentEnterRouteLeave(t *testing.T) {
+	r := gateway.NewCallRouter()
 	var wg sync.WaitGroup
 	for range 50 {
 		wg.Go(func() {
