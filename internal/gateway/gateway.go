@@ -53,17 +53,17 @@ type Overrides struct {
 // Relays bundles the optional cross-call correlation services a gateway
 // can wire in. A nil field means that feature is disabled, matching the
 // existing nil-means-disabled convention each of *ProgressRegistry and
-// *ElicitationRouter already had as standalone parameters.
+// *CallRouter already had as standalone parameters.
 type Relays struct {
 	Progress *ProgressRegistry
-	Elicit   *ElicitationRouter
+	Calls    *CallRouter
 }
 
 // NewConfig bundles New's construction parameters. Fields left at their
 // zero value behave exactly as an omitted/nil positional argument did
 // before this type existed: a nil Tables/Entries/Overrides sub-field means
 // that category has no items, a nil MaskKeys means no extra masking, and a
-// nil Relays.Progress/Relays.Elicit means that relay feature is disabled.
+// nil Relays.Progress/Relays.Calls means that relay feature is disabled.
 type NewConfig struct {
 	Logger    *slog.Logger
 	Backends  map[string]*backend.Backend
@@ -429,9 +429,9 @@ func promptGetHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend
 // correlation entry so a notifications/progress the backend sends mid-call
 // (relayed via relays.Progress.Relay, wired through backend.ChangeCallbacks.
 // OnProgress) reaches the downstream caller under its own token. When
-// relays.Elicit is non-nil, it records this call as in-flight against b for
+// relays.Calls is non-nil, it records this call as in-flight against b for
 // the whole duration of the backend call, so a backend's elicitation/create
-// (relayed via relays.Elicit.Route, wired through backend.ChangeCallbacks.
+// (relayed via relays.Calls.Route, wired through backend.ChangeCallbacks.
 // OnElicit) can be routed back to req.Session when -- and only when --
 // this is the sole tools/call in flight against b.
 func callHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, originalName string, relays Relays) mcp.ToolHandler {
@@ -442,8 +442,8 @@ func callHandler(logger *slog.Logger, maskKeys []string, b *backend.Backend, ori
 			attribute.String("mcp.tool.name", originalName))
 		defer span.End()
 
-		if relays.Elicit != nil {
-			leave := relays.Elicit.Enter(b.Name, req.Session)
+		if relays.Calls != nil {
+			leave := relays.Calls.Enter(b.Name, req.Session)
 			defer leave()
 		}
 

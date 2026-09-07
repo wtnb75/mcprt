@@ -1339,7 +1339,7 @@ backends:
 // backend's elicitation/create (sent mid-tools/call) reaches the
 // downstream client, and the client's response reaches the backend as the
 // elicitation result -- exercising the real production wiring
-// (superviseBackend's OnElicit, ElicitationRouter.Route, elicitTimeout).
+// (superviseBackend's OnElicit, CallRouter.Route, elicitTimeout).
 func TestServerCommand_RoutesElicitationToDownstreamClient(t *testing.T) {
 	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
 	backendSrv.AddTool(&mcp.Tool{Name: "ask", Description: "ask", InputSchema: map[string]any{"type": "object"}},

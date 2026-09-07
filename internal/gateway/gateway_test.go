@@ -1644,11 +1644,11 @@ func TestGateway_CallHandlerRoutesElicitationWhenExactlyOneCallInFlight(t *testi
 			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: res.Action}}}, nil
 		})
 
-	elicitRouter := gateway.NewElicitationRouter()
+	callRouter := gateway.NewCallRouter()
 	var gotMessage string
 	cb := backend.ChangeCallbacks{
 		OnElicit: func(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
-			session, err := elicitRouter.Route("backend-a")
+			session, err := callRouter.Route("backend-a")
 			if err != nil {
 				return nil, err
 			}
@@ -1677,7 +1677,7 @@ func TestGateway_CallHandlerRoutesElicitationWhenExactlyOneCallInFlight(t *testi
 		Logger:   logger,
 		Backends: map[string]*backend.Backend{"backend-a": connA},
 		Tables:   gateway.Tables{Tools: table},
-		Relays:   gateway.Relays{Elicit: elicitRouter},
+		Relays:   gateway.Relays{Calls: callRouter},
 	})
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
@@ -1728,10 +1728,10 @@ func TestGateway_CallHandlerRefusesAmbiguousElicitation(t *testing.T) {
 			return &mcp.CallToolResult{}, err
 		})
 
-	elicitRouter := gateway.NewElicitationRouter()
+	callRouter := gateway.NewCallRouter()
 	cb := backend.ChangeCallbacks{
 		OnElicit: func(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
-			session, err := elicitRouter.Route("backend-a")
+			session, err := callRouter.Route("backend-a")
 			if err != nil {
 				return nil, err
 			}
@@ -1759,7 +1759,7 @@ func TestGateway_CallHandlerRefusesAmbiguousElicitation(t *testing.T) {
 		Logger:   logger,
 		Backends: map[string]*backend.Backend{"backend-a": connA},
 		Tables:   gateway.Tables{Tools: table},
-		Relays:   gateway.Relays{Elicit: elicitRouter},
+		Relays:   gateway.Relays{Calls: callRouter},
 	})
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))

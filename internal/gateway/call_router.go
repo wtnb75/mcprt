@@ -7,13 +7,14 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// ElicitationRouter tracks, per backend, which downstream ServerSessions
-// currently have a tools/call in flight against that backend -- so that
-// when the backend sends an elicitation/create request (which carries no
-// correlation to any specific call), mcprt can route it to the right
-// downstream session when exactly one call is in flight, and refuse to
-// guess otherwise.
-type ElicitationRouter struct {
+// CallRouter tracks, per backend, which downstream ServerSessions
+// currently have a tools/call in flight against that backend -- so that a
+// backend-initiated request with no built-in call correlation (MCP defines
+// several: elicitation/create, sampling/createMessage, roots/list) can be
+// routed to the right downstream session when exactly one call is in
+// flight, and refused otherwise. Shared by every such feature rather than
+// each tracking its own copy of the same in-flight-call state.
+type CallRouter struct {
 	mu    sync.Mutex
 	calls map[string]*backendCalls // keyed by backend name, created lazily
 }
@@ -29,9 +30,9 @@ type backendCalls struct {
 	live map[uint64]*mcp.ServerSession
 }
 
-// NewElicitationRouter returns an empty router, ready to use.
-func NewElicitationRouter() *ElicitationRouter {
-	return &ElicitationRouter{calls: make(map[string]*backendCalls)}
+// NewCallRouter returns an empty router, ready to use.
+func NewCallRouter() *CallRouter {
+	return &CallRouter{calls: make(map[string]*backendCalls)}
 }
 
 // Enter records one in-flight tools/call for backendName, owned by
@@ -40,7 +41,7 @@ func NewElicitationRouter() *ElicitationRouter {
 // counts as a separate in-flight call for Route's purposes. The caller
 // must call the returned leave func exactly once (via defer) when the call
 // returns, success or failure.
-func (r *ElicitationRouter) Enter(backendName string, session *mcp.ServerSession) (leave func()) {
+func (r *CallRouter) Enter(backendName string, session *mcp.ServerSession) (leave func()) {
 	r.mu.Lock()
 	bc, ok := r.calls[backendName]
 	if !ok {
@@ -62,16 +63,17 @@ func (r *ElicitationRouter) Enter(backendName string, session *mcp.ServerSession
 	}
 }
 
-// Route reports the single downstream session to forward an elicitation
+// Route reports the single downstream session to forward a backend-initiated
 // request to, for the given backend. It returns an error -- and forwards
 // nothing -- unless exactly one tools/call is currently in flight for
 // backendName: zero in-flight calls means there's nothing to correlate to
-// (the elicitation arrived too late, or the backend is misbehaving); more
-// than one means mcprt cannot tell which call it belongs to (MCP's
-// elicitation/create carries no per-call correlation token), and guessing
-// wrong would route a backend's question to an unrelated client -- even
-// when every in-flight call happens to belong to the same session, the
-// count alone decides, never the sessions' identity.
+// (the request arrived too late, or the backend is misbehaving); more than
+// one means mcprt cannot tell which call it belongs to (MCP defines several
+// such requests -- elicitation/create, sampling/createMessage, roots/list --
+// that carry no per-call correlation token), and guessing wrong would route
+// a backend's question to an unrelated client -- even when every in-flight
+// call happens to belong to the same session, the count alone decides,
+// never the sessions' identity.
 //
 // This "exactly one" invariant is honest about in-flight calls Enter still
 // knows about, but call cancellation can make that count go stale faster
@@ -82,16 +84,16 @@ func (r *ElicitationRouter) Enter(backendName string, session *mcp.ServerSession
 // backend's eventual response). callHandler's `defer leave()` runs right
 // after CallTool returns, so a downstream client A that cancels or
 // disconnects mid-call frees A's slot at that instant even though backend B
-// may still be running A's call and can still emit elicitation/create for
-// it moments later. If, at that exact moment, some unrelated client C
-// happens to be the only other call in flight to B, Route will hand B's
-// question -- meant for A's now-abandoned call -- to C instead, because
-// Route has no way to tell "B is still working on a call whose slot was
-// freed early" from "B is idle." Closing this gap -- for example, by
-// keeping a cancelled call's slot counted toward ambiguity for a short
-// grace window after cancellation, instead of dropping it the instant
-// CallTool returns -- is a deliberate future decision, not attempted here.
-func (r *ElicitationRouter) Route(backendName string) (*mcp.ServerSession, error) {
+// may still be running A's call and can still emit such a request for it
+// moments later. If, at that exact moment, some unrelated client C happens
+// to be the only other call in flight to B, Route will hand B's question --
+// meant for A's now-abandoned call -- to C instead, because Route has no
+// way to tell "B is still working on a call whose slot was freed early"
+// from "B is idle." Closing this gap -- for example, by keeping a
+// cancelled call's slot counted toward ambiguity for a short grace window
+// after cancellation, instead of dropping it the instant CallTool returns
+// -- is a deliberate future decision, not attempted here.
+func (r *CallRouter) Route(backendName string) (*mcp.ServerSession, error) {
 	r.mu.Lock()
 	bc, ok := r.calls[backendName]
 	r.mu.Unlock()

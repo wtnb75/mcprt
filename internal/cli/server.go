@@ -288,7 +288,7 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 	var gwH gwHolder
 	gwH.relays = gateway.Relays{
 		Progress: gateway.NewProgressRegistry(),
-		Elicit:   gateway.NewElicitationRouter(),
+		Calls:    gateway.NewCallRouter(),
 	}
 	conn := connectBackends(ctx, logger, cfg.Backends, &gwH)
 
@@ -358,7 +358,7 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 // creation). A zero-value relays (buildGateway always sets both of its
 // fields; only some tests construct a bare gwHolder{} without them) means
 // "no progress relay/elicitation routing for this generation," matching a
-// nil *gateway.ProgressRegistry/*gateway.ElicitationRouter everywhere else.
+// nil *gateway.ProgressRegistry/*gateway.CallRouter everywhere else.
 type gwHolder struct {
 	ptr    atomic.Pointer[gateway.Server]
 	relays gateway.Relays
@@ -587,9 +587,9 @@ func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.Backen
 				gwH.relays.Progress.Relay(ctx, logger, bc.Name, req.Params)
 			}
 		}
-		if gwH.relays.Elicit != nil {
+		if gwH.relays.Calls != nil {
 			cb.OnElicit = func(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
-				session, err := gwH.relays.Elicit.Route(bc.Name)
+				session, err := gwH.relays.Calls.Route(bc.Name)
 				if err != nil {
 					gateway.LogEvent(ctx, logger, slog.LevelWarn, gateway.EventElicitationRoutingRefused, "backend", bc.Name, "error", err)
 					return nil, err
