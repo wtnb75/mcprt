@@ -104,6 +104,18 @@ resource/resource-template URIs, which never get a prefix).
 `notifications/prompts/list_changed` and `completion/complete` are not
 relayed.
 
+Some backends advertise MCP's newer stateless protocol (SEP-2575) well
+enough to pass its `server/discover` handshake, but don't correctly
+implement the `subscriptions/listen` session that same handshake commits
+them to for delivering list-changed notifications -- `mcprt server` needs
+that subscription (unlike `mcprt ping`/`list`/`call`, which never request
+it), and would otherwise fail to connect to such a backend at all, retrying
+forever. mcprt detects this and reconnects once without list-changed
+support instead, logging `backend does not support list-changed
+subscriptions, connected without live updates`; that backend's tool/
+resource/prompt list is then whatever it was at connect time until the next
+full reconnect.
+
 Every backend call (`tools/call`, `resources/read`, `prompts/get`) is logged
 one line per call, success or failure, at `info`/`error` level respectively,
 with the calling MCP client's name/version, session ID, HTTP remote address

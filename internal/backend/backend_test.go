@@ -3,6 +3,8 @@ package backend_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
@@ -307,6 +309,92 @@ func newFakeMCPHandler() http.Handler {
 	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return fakeServer }, nil)
 }
 
+// newFakeDiscoverableBrokenListenBackend hand-rolls a minimal JSON-RPC-over-
+// HTTP server (not go-sdk's own mcp.Server, which doesn't itself claim
+// SEP-2575 support on a plain mcp.NewServer()) that answers server/discover
+// by claiming support for MCP protocol 2026-07-28+ -- triggering
+// go-sdk's Client.Connect to skip straight to the stateless path and, if
+// the caller wants list-changed notifications, attempt subscriptions/listen
+// -- but always fails that one method with a JSON-RPC error, simulating a
+// real backend (the duckdb-mcp-server report this test models) that
+// advertises the new protocol without correctly implementing the
+// subscriptions/listen session it thereby claims to support. Every other
+// method (tools/list, notifications/initialized, ...) is answered just
+// well enough for a real *mcp.Client to consider itself connected and list
+// one tool -- this fake is deliberately not a general-purpose MCP server.
+func newFakeDiscoverableBrokenListenBackend(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if req.Method == "subscriptions/listen" {
+			// go-sdk's streamable client transport treats a plain HTTP 404
+			// on ANY request as ErrSessionMissing (checkResponse in
+			// streamable.go), regardless of JSON-RPC framing -- this is
+			// what the real duckdb-mcp-server report's "failed to connect
+			// (session ID: ): session not found" error comes from, not a
+			// 200 OK carrying a JSON-RPC-level error.
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch req.Method {
+		case "server/discover":
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"serverInfo":{"name":"fake-duckdb","version":"v1"}}}`, req.ID)
+		case "tools/list":
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ping","description":"ping","inputSchema":{"type":"object"}}]}}`, req.ID)
+		case "notifications/initialized", "notifications/cancelled":
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"method not found: %s"}}`, req.ID, req.Method)
+		}
+	}))
+}
+
+// TestConnect_DegradesWhenSubscriptionsListenUnsupported reproduces a
+// duckdb-mcp-server report: `mcprt ping`/`list` (which never request
+// list-changed notifications) connect fine, but `mcprt server` (which
+// does, to support live tool-list updates) fails outright with "backend
+// connect failed, retrying" forever, because go-sdk's Client.Connect
+// treats a failed subscriptions/listen as a fatal connect error. Connect
+// must instead retry once without list-changed handlers and succeed, with
+// ListChangedUnsupported set so the caller can log the degradation.
+func TestConnect_DegradesWhenSubscriptionsListenUnsupported(t *testing.T) {
+	srv := newFakeDiscoverableBrokenListenBackend(t)
+	defer srv.Close()
+
+	ctx := context.Background()
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL},
+		backend.ChangeCallbacks{OnToolsChanged: func() {}})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	if !b.ListChangedUnsupported {
+		t.Fatal("ListChangedUnsupported = false, want true (this backend's subscriptions/listen always fails)")
+	}
+
+	tools, err := b.ListTools(ctx)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	if len(tools) != 1 || tools[0].Name != "ping" {
+		t.Fatalf("ListTools = %v, want [ping]", tools)
+	}
+}
+
 // TestConnect_ToolListChangedCallback checks that ChangeCallbacks.OnToolsChanged
 // fires when the connected backend sends notifications/tools/list_changed
 // after the initial connection is established.
@@ -328,6 +416,9 @@ func TestConnect_ToolListChangedCallback(t *testing.T) {
 		t.Fatalf("Connect: %v", err)
 	}
 	defer func() { _ = b.Close() }()
+	if b.ListChangedUnsupported {
+		t.Fatal("ListChangedUnsupported = true, want false (this backend's subscriptions/listen -- if even attempted -- works fine)")
+	}
 
 	// Registering a second tool on the already-connected fake server makes
 	// the SDK emit notifications/tools/list_changed to b's session.
