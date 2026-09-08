@@ -163,7 +163,20 @@ for name, resolved := range newTable.Items {
 }
 ```
 
-除去ループ（`for name := range s.promptTable.Items { if _, ok := newTable.Items[name]; !ok { s.mcp.RemovePrompts(name) } }`）は変更不要 -- static prompt名は`promptEntries`/`promptTable`（backend由来のみを追跡する）に一度も入らないため、このループの対象になりようがない。つまりstatic promptは`New`で一度`AddPrompt`されたら、以後のreconcileで触られることも消されることもない。
+除去ループ（`for name := range s.promptTable.Items { if _, ok := newTable.Items[name]; !ok { s.mcp.RemovePrompts(name) } }`）にも同じ`staticPromptNames`ガードが要る。衝突が起きているケース（static promptとbackendが同名を出しているケース）では、backend側の`resolved`エントリは`registerPrompt`されないだけで`promptTable`自体には普通に入る（衝突解決は`router.Resolve`が担い、勝者を選ぶのは登録ループ側のガードであって`Resolve`ではないため）。したがってそのbackendが後で同名を出さなくなる（典型的には切断: `internal/cli/server.go`はbackend切断のたびに`gw.UpdatePrompts(backendName, nil)`を呼ぶ）と、除去ループは`newTable`からその名前が消えたと判断して`s.mcp.RemovePrompts(name)`を呼んでしまう -- しかしその名前で実際に登録されているハンドラは（登録ループでスキップされた結果）static prompt側のものなので、これは対応するbackend分の登録を消すのではなく、static promptを誤って消してしまう。そのため除去ループにも登録ループと同じ`staticPromptNames`スキップガードを入れ、static prompt名は除去ループの対象から外す:
+
+```go
+for name := range s.promptTable.Items {
+    if s.staticPromptNames[name] {
+        continue // 最初から登録されていない（登録ループでスキップされた）ので、RemovePromptsを呼ぶとstatic prompt自体を誤って消してしまう
+    }
+    if _, ok := newTable.Items[name]; !ok {
+        s.mcp.RemovePrompts(name)
+    }
+}
+```
+
+つまりstatic promptは`New`で一度`AddPrompt`されたら、以後のreconcileの両ループ（登録・除去）でガードされ、触られることも消されることもない。
 
 ハンドラ本体は既存の`promptGetHandler`と対称の構造にする（`startCallSpan`/`logCall`など監査・トレーシングの扱いを揃える。`mcp.backend`のような属性値・ログの`backend`欄には実backendがいないので`"(static)"`という固定文字列を使う）:
 

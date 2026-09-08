@@ -126,7 +126,10 @@ resource/resource-template URIs, which never get a prefix).
 `notifications/prompts/list_changed` is not relayed. `completion/complete`
 (both `ref/prompt` and `ref/resource`, including resource templates) is
 forwarded to the backend that owns the referenced prompt/resource, the same
-way `tools/call`/`resources/read`/`prompts/get` are.
+way `tools/call`/`resources/read`/`prompts/get` are. A `prompts`-defined
+static prompt has no backend and no completion source, so
+`completion/complete` for it always returns no suggestions rather than
+forwarding anywhere.
 
 `prompts` defines prompts mcprt serves itself, without forwarding
 `prompts/get` to any backend: each entry's `text` is a Go

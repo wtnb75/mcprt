@@ -268,7 +268,8 @@ func New(cfg NewConfig) *Server {
 	if cfg.Tables.Prompts != nil {
 		for _, resolved := range cfg.Tables.Prompts.Items {
 			if staticNames[resolved.Item.Name] {
-				cfg.Logger.Warn("prompt shadowed by static config prompt", "prompt", resolved.Item.Name, "backend", resolved.BackendName)
+				LogEvent(context.Background(), cfg.Logger, slog.LevelWarn, EventPromptShadowedByStatic,
+					"prompt", resolved.Item.Name, "backend", resolved.BackendName)
 				continue
 			}
 			registerPrompt(mcpSrv, cfg.Logger, cfg.Backends, resolved, cfg.MaskKeys)
@@ -306,6 +307,14 @@ func (s *Server) completionHandler(ctx context.Context, req *mcp.CompleteRequest
 	found := false
 	switch ref.Type {
 	case "ref/prompt":
+		if s.staticPromptNames[ref.Name] {
+			// Static prompts have no backend and no completion source
+			// (see the design spec's future-extensions list) -- answer
+			// with no suggestions rather than forwarding to a shadowed
+			// backend or erroring.
+			s.mu.Unlock()
+			return &mcp.CompleteResult{}, nil
+		}
 		if resolved, ok := s.promptTable.Items[ref.Name]; ok {
 			found = true
 			backendName = resolved.BackendName
