@@ -36,10 +36,11 @@ func LogEvent(ctx context.Context, logger *slog.Logger, level slog.Level, event 
 // typo in a call site becomes a compile error instead of a silently-dropped
 // (never grep-matchable) log line.
 const (
-	EventProgressBackendMismatch   = "progress_backend_mismatch"
-	EventNameConflict              = "name_conflict"
-	EventListChangedReconciled     = "list_changed_reconciled"
-	EventElicitationRoutingRefused = "elicitation_routing_refused"
-	EventElicitationTimeout        = "elicitation_timeout"
-	EventElicitationFailed         = "elicitation_failed"
+	EventProgressBackendMismatch       = "progress_backend_mismatch"
+	EventResourceUpdateBackendMismatch = "resource_update_backend_mismatch"
+	EventNameConflict                  = "name_conflict"
+	EventListChangedReconciled         = "list_changed_reconciled"
+	EventElicitationRoutingRefused     = "elicitation_routing_refused"
+	EventElicitationTimeout            = "elicitation_timeout"
+	EventElicitationFailed             = "elicitation_failed"
 )

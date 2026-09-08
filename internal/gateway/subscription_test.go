@@ -1,6 +1,7 @@
 package gateway_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -223,8 +224,9 @@ func TestSubscriptionRegistry_RelayIgnoresUnknownURI(t *testing.T) {
 
 // TestSubscriptionRegistry_RelayIgnoresBackendMismatch proves that a
 // notification claiming a URI the registry has on record as owned by a
-// DIFFERENT backend is silently dropped -- the counterpart of
-// TestProgressRegistry_RelayDropsBackendMismatch for this registry.
+// DIFFERENT backend is silently dropped from delivery -- the counterpart
+// of TestProgressRegistry_RelayDropsBackendMismatch for this registry --
+// and that the anomaly is logged via EventResourceUpdateBackendMismatch.
 func TestSubscriptionRegistry_RelayIgnoresBackendMismatch(t *testing.T) {
 	srv, clientSession, resourceUpdatedCh, cleanup := newSubscribableServer(t)
 	defer cleanup()
@@ -236,12 +238,17 @@ func TestSubscriptionRegistry_RelayIgnoresBackendMismatch(t *testing.T) {
 	r := gateway.NewSubscriptionRegistry()
 	r.Subscribe(&mcp.ServerSession{}, "file:///a", "backend-a", "file:///a")
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
 	r.Relay(ctx, srv, logger, "backend-b", "file:///a")
 
 	select {
 	case uri := <-resourceUpdatedCh:
 		t.Fatalf("received resource update for URI %q from mismatched backend, want none relayed", uri)
 	case <-time.After(200 * time.Millisecond):
+	}
+
+	if !bytes.Contains(logBuf.Bytes(), []byte(gateway.EventResourceUpdateBackendMismatch)) {
+		t.Fatalf("log output = %q, want it to contain event %q", logBuf.String(), gateway.EventResourceUpdateBackendMismatch)
 	}
 }

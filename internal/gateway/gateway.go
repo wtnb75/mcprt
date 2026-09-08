@@ -359,6 +359,7 @@ func (s *Server) subscribeHandler(ctx context.Context, req *mcp.SubscribeRequest
 	needUpstream := s.relays.Subscriptions.Subscribe(req.Session, req.Params.URI, resolved.BackendName, resolved.OriginalName)
 	if needUpstream {
 		if err := b.Session.Subscribe(ctx, &mcp.SubscribeParams{URI: resolved.OriginalName}); err != nil {
+			s.relays.Subscriptions.Unsubscribe(req.Session, req.Params.URI) // roll back: upstream Subscribe never actually succeeded
 			s.logger.Warn("subscribe: backend call failed", "backend", b.Name, "uri", req.Params.URI, "error", err)
 			return err
 		}
@@ -414,6 +415,15 @@ func (s *Server) unsubscribeHandler(ctx context.Context, req *mcp.UnsubscribeReq
 // on every subscribe, but only the first call for a given session actually
 // spawns the goroutine (guarded by s.watchedSessions) -- a session that
 // subscribes to several URIs must not get one watcher goroutine per URI.
+//
+// subscribeHandler starts this watcher BEFORE calling
+// relays.Subscriptions.Subscribe, a deliberate but imperfect ordering: a
+// session that disconnects in the narrow window between the watcher
+// starting and the registry recording the subscription makes SessionClosed
+// run against a registry that doesn't yet know about it, leaking that
+// just-created entry -- reversing the order would instead open a different,
+// roughly symmetric window (the registry recording a subscription no
+// watcher is yet armed to clean up), so neither order eliminates the race.
 func (s *Server) startSessionCloseWatcherOnce(session *mcp.ServerSession) {
 	s.mu.Lock()
 	if s.watchedSessions[session] {
@@ -428,7 +438,9 @@ func (s *Server) startSessionCloseWatcherOnce(session *mcp.ServerSession) {
 		toClose := s.relays.Subscriptions.SessionClosed(session)
 		for _, c := range toClose {
 			if b := s.Backend(c.BackendName); b != nil {
-				_ = b.Session.Unsubscribe(context.Background(), &mcp.UnsubscribeParams{URI: c.OriginalURI})
+				unsubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = b.Session.Unsubscribe(unsubCtx, &mcp.UnsubscribeParams{URI: c.OriginalURI})
+				cancel()
 			}
 		}
 		s.mu.Lock()

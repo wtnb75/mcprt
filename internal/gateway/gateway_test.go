@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -2087,6 +2088,33 @@ func newSubscribableFakeBackend(name string, uris ...string) *subscribableFakeBa
 	return f
 }
 
+// newFailingSubscribeFakeBackend is newSubscribableFakeBackend's opposite:
+// its SubscribeHandler always fails, simulating the common case (per
+// go-sdk, SubscribeHandler being set at all advertises the
+// resources.subscribe capability to every downstream client, regardless of
+// whether this particular backend actually implements resources/subscribe)
+// where a backend doesn't actually support subscriptions.
+func newFailingSubscribeFakeBackend(name string, uris ...string) *subscribableFakeBackend {
+	f := &subscribableFakeBackend{}
+	f.srv = mcp.NewServer(&mcp.Implementation{Name: name, Version: "v1"}, &mcp.ServerOptions{
+		SubscribeHandler: func(context.Context, *mcp.SubscribeRequest) error {
+			f.subscribeCount.Add(1)
+			return errors.New("subscriptions not supported")
+		},
+		UnsubscribeHandler: func(context.Context, *mcp.UnsubscribeRequest) error {
+			f.unsubscribeCount.Add(1)
+			return nil
+		},
+	})
+	for _, uri := range uris {
+		f.srv.AddResource(&mcp.Resource{URI: uri, Name: uri},
+			func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+				return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: req.Params.URI, Text: "content"}}}, nil
+			})
+	}
+	return f
+}
+
 // newSubscriptionTestGateway connects to fb over HTTP, builds a
 // *gateway.Server wired with a fresh SubscriptionRegistry and (if
 // wireResourceUpdated) an OnResourceUpdated callback that relays into it,
@@ -2332,5 +2360,33 @@ func TestGateway_DownstreamDisconnectUnsubscribesUpstreamWhenLastSubscriberLeave
 	}
 	if got := fb.unsubscribeCount.Load(); got != 1 {
 		t.Fatalf("backend unsubscribeCount after downstream disconnect = %d, want 1 (session close must trigger cleanup)", got)
+	}
+}
+
+// TestGateway_SubscribeUpstreamFailureRollsBackRegistryState checks that
+// when the upstream resources/subscribe call fails (e.g. the backend
+// doesn't actually support subscriptions, despite go-sdk having advertised
+// the capability to every downstream client), subscribeHandler rolls back
+// the SubscriptionRegistry entry it provisionally created. Without that
+// rollback, a second client's subscribe to the same URI would see
+// needUpstream=false (because the registry still thinks there's an active
+// subscriber) and incorrectly return success, leaving that client believing
+// it has a live subscription it will never receive updates for.
+func TestGateway_SubscribeUpstreamFailureRollsBackRegistryState(t *testing.T) {
+	fb := newFailingSubscribeFakeBackend("backend-a", "file:///a")
+	gwURL, _, cleanup := newSubscriptionTestGateway(t, fb, false)
+	defer cleanup()
+	ctx := context.Background()
+
+	session1, _ := newSubscribedGatewayClient(t, gwURL)
+	defer func() { _ = session1.Close() }()
+	if err := session1.Subscribe(ctx, &mcp.SubscribeParams{URI: "file:///a"}); err == nil {
+		t.Fatal("session1 Subscribe: got no error, want an error (backend does not support resources/subscribe)")
+	}
+
+	session2, _ := newSubscribedGatewayClient(t, gwURL)
+	defer func() { _ = session2.Close() }()
+	if err := session2.Subscribe(ctx, &mcp.SubscribeParams{URI: "file:///a"}); err == nil {
+		t.Fatal("session2 Subscribe: got no error, want an error too -- if this succeeds, the registry entry from session1's failed subscribe was not rolled back")
 	}
 }

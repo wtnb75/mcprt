@@ -147,10 +147,10 @@ func (r *SubscriptionRegistry) BackendReconnected(backendName string) []subscrip
 // Relay notifies mcpSrv's downstream subscribers that originalURI on
 // backendName changed, but only if originalURI is currently a tracked
 // upstream subscription owned by backendName -- guarding against a
-// notification for a URI mcprt never subscribed to, or (like
-// ProgressRegistry.Relay's backend-mismatch guard) one a DIFFERENT
-// backend is sending under a URI string that collides with another
-// backend's own subscription.
+// notification for a URI mcprt never subscribed to (silently ignored, see
+// below), or (like ProgressRegistry.Relay's backend-mismatch guard) one a
+// DIFFERENT backend is sending under a URI string that collides with
+// another backend's own subscription (logged, see below).
 //
 // Unlike ProgressRegistry.Relay (which owns a direct *mcp.ServerSession
 // per entry and calls NotifyProgress on it), Relay does not iterate this
@@ -165,11 +165,25 @@ func (r *SubscriptionRegistry) BackendReconnected(backendName string) []subscrip
 // already does this correctly; re-implementing it here would either
 // duplicate that internal bookkeeping or silently drop the
 // protocol-version handling go-sdk's own delivery path relies on.
+//
+// Two things about that delegation are not obvious from the call site: in
+// go-sdk v1.7.0, (*mcp.Server).ResourceUpdated discards ctx and builds its
+// own context.Background() internally, so cancelling or attaching a
+// deadline to the ctx passed here has no effect on the fan-out; and the
+// SDK's own fan-out to a URI's subscribed sessions is bounded by a
+// hardcoded ~10-second timeout applied serially, one subscriber at a time
+// -- not mcprt's own configurable timeout and not something mcprt
+// controls -- so a single stalled downstream subscriber can hold up
+// delivery to that same URI's other subscribers for up to that window.
 func (r *SubscriptionRegistry) Relay(ctx context.Context, mcpSrv *mcp.Server, logger *slog.Logger, backendName, originalURI string) {
 	r.mu.Lock()
 	sub, ok := r.subs[originalURI]
 	r.mu.Unlock()
-	if !ok || sub.backendName != backendName {
+	if !ok {
+		return
+	}
+	if sub.backendName != backendName {
+		LogEvent(ctx, logger, slog.LevelWarn, EventResourceUpdateBackendMismatch, "uri", originalURI, "claimed_backend", backendName, "actual_backend", sub.backendName)
 		return
 	}
 
