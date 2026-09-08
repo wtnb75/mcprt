@@ -606,6 +606,141 @@ prompt_overrides:
 	}
 }
 
+func TestParse_StaticPrompts(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - name: greet
+    description: "greets someone"
+    arguments:
+      - name: user
+        description: "who to greet"
+        required: true
+    text: "hello {{.user}}"
+`)
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.Prompts) != 1 {
+		t.Fatalf("len(cfg.Prompts) = %d, want 1", len(cfg.Prompts))
+	}
+	p := cfg.Prompts[0]
+	if p.Name != "greet" || p.Description != "greets someone" || p.Text != "hello {{.user}}" {
+		t.Fatalf("Prompts[0] = %+v, want name=greet description=%q text=%q", p, "greets someone", "hello {{.user}}")
+	}
+	if len(p.Arguments) != 1 || p.Arguments[0].Name != "user" || !p.Arguments[0].Required {
+		t.Fatalf("Prompts[0].Arguments = %+v, want one required argument named \"user\"", p.Arguments)
+	}
+}
+
+func TestParse_StaticPromptEmptyNameRejected(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - name: ""
+    text: "hi"
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for empty prompts[].name, got nil")
+	}
+}
+
+func TestParse_StaticPromptDuplicateNameRejected(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - name: greet
+    text: "hi"
+  - name: greet
+    text: "hello"
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for duplicate prompts[].name, got nil")
+	}
+}
+
+func TestParse_StaticPromptEmptyTextRejected(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - name: greet
+    text: ""
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for empty prompts[].text, got nil")
+	}
+}
+
+func TestParse_StaticPromptInvalidTemplateRejected(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - name: greet
+    text: "hello {{.unterminated"
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for unparseable prompts[].text template, got nil")
+	}
+}
+
+func TestParse_StaticPromptDuplicateArgumentNameRejected(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - name: greet
+    text: "hi"
+    arguments:
+      - name: user
+      - name: user
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for duplicate prompts[].arguments[].name, got nil")
+	}
+}
+
+func TestParse_StaticPromptEmptyArgumentNameRejected(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - name: greet
+    text: "hi"
+    arguments:
+      - name: ""
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for empty prompts[].arguments[].name, got nil")
+	}
+}
+
 func TestParse_LoggingMaskKeys(t *testing.T) {
 	data := []byte(`
 backends:
