@@ -594,6 +594,51 @@ func TestConnect_ElicitationCallback(t *testing.T) {
 	}
 }
 
+// TestConnect_ResourceUpdatedCallback checks that ChangeCallbacks.
+// OnResourceUpdated fires with the backend's notifications/resources/
+// updated payload when the backend sends one for a URI mcprt subscribed
+// to.
+func TestConnect_ResourceUpdatedCallback(t *testing.T) {
+	fakeServer := mcp.NewServer(&mcp.Implementation{Name: "fake", Version: "v1"}, &mcp.ServerOptions{
+		SubscribeHandler:   func(context.Context, *mcp.SubscribeRequest) error { return nil },
+		UnsubscribeHandler: func(context.Context, *mcp.UnsubscribeRequest) error { return nil },
+	})
+	fakeServer.AddResource(&mcp.Resource{URI: "file:///a", Name: "a"},
+		func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+			return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: req.Params.URI, Text: "content"}}}, nil
+		})
+
+	srv := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return fakeServer }, nil))
+	defer srv.Close()
+
+	ctx := context.Background()
+	received := make(chan *mcp.ResourceUpdatedNotificationParams, 1)
+	b, err := backend.Connect(ctx, config.BackendConfig{Name: "fake", Transport: "http", URL: srv.URL},
+		backend.ChangeCallbacks{OnResourceUpdated: func(_ context.Context, req *mcp.ResourceUpdatedNotificationRequest) {
+			received <- req.Params
+		}})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	if err := b.Session.Subscribe(ctx, &mcp.SubscribeParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if err := fakeServer.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("backend ResourceUpdated: %v", err)
+	}
+
+	select {
+	case p := <-received:
+		if p.URI != "file:///a" {
+			t.Fatalf("OnResourceUpdated params = %+v, want URI=file:///a", p)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnResourceUpdated did not fire within 5s of the backend sending an update")
+	}
+}
+
 // TestConnect_NilChangeCallbacks_NoHandlersRegistered checks that a nil
 // field on ChangeCallbacks leaves the corresponding SDK handler unset
 // (rather than, say, panicking or wiring a no-op that still advertises
