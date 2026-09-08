@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2051,5 +2052,285 @@ func TestGateway_CallHandlerRefusesAmbiguousElicitation(t *testing.T) {
 		if err == nil {
 			t.Fatalf("call %d: got no error, want elicitation to fail (ambiguous routing refuses it)", i)
 		}
+	}
+}
+
+// subscribableFakeBackend bundles a fake backend *mcp.Server that supports
+// resources/subscribe (always succeeding) with atomic counters for how
+// many times each of Subscribe/Unsubscribe was called, and exposes the
+// resources it was constructed with so a test can trigger
+// notifications/resources/updated on demand via srv.ResourceUpdated.
+type subscribableFakeBackend struct {
+	srv              *mcp.Server
+	subscribeCount   atomic.Int32
+	unsubscribeCount atomic.Int32
+}
+
+func newSubscribableFakeBackend(name string, uris ...string) *subscribableFakeBackend {
+	f := &subscribableFakeBackend{}
+	f.srv = mcp.NewServer(&mcp.Implementation{Name: name, Version: "v1"}, &mcp.ServerOptions{
+		SubscribeHandler: func(context.Context, *mcp.SubscribeRequest) error {
+			f.subscribeCount.Add(1)
+			return nil
+		},
+		UnsubscribeHandler: func(context.Context, *mcp.UnsubscribeRequest) error {
+			f.unsubscribeCount.Add(1)
+			return nil
+		},
+	})
+	for _, uri := range uris {
+		f.srv.AddResource(&mcp.Resource{URI: uri, Name: uri},
+			func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+				return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: req.Params.URI, Text: "content"}}}, nil
+			})
+	}
+	return f
+}
+
+// newSubscriptionTestGateway connects to fb over HTTP, builds a
+// *gateway.Server wired with a fresh SubscriptionRegistry and (if
+// wireResourceUpdated) an OnResourceUpdated callback that relays into it,
+// and returns the gateway's own HTTP endpoint plus a cleanup func. Shared
+// setup for every subscription integration test below.
+func newSubscriptionTestGateway(t *testing.T, fb *subscribableFakeBackend, wireResourceUpdated bool) (gwURL string, gw *gateway.Server, cleanup func()) {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	httpA := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return fb.srv }, nil))
+
+	subs := gateway.NewSubscriptionRegistry()
+	cb := backend.ChangeCallbacks{}
+	if wireResourceUpdated {
+		cb.OnResourceUpdated = func(ctx context.Context, req *mcp.ResourceUpdatedNotificationRequest) {
+			subs.Relay(ctx, gw.MCP(), logger, "backend-a", req.Params.URI)
+		}
+	}
+	ctx := context.Background()
+	connA, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpA.URL}, cb)
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+
+	resources, err := connA.ListResources(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a resources: %v", err)
+	}
+	resourceNameOf := func(r *mcp.Resource) string { return r.URI }
+	resourceRename := func(r *mcp.Resource, name string) *mcp.Resource { c := *r; c.URI = name; return &c }
+	table := router.Resolve([]router.Entry[*mcp.Resource]{{BackendName: "backend-a", Items: resources}}, resourceNameOf, resourceRename, nil)
+
+	gw = gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"backend-a": connA},
+		Tables:   gateway.Tables{Resources: table},
+		Relays:   gateway.Relays{Subscriptions: subs},
+	})
+
+	gwHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return gw.MCP() }, nil))
+
+	return gwHTTP.URL, gw, func() {
+		gwHTTP.Close()
+		_ = connA.Close()
+		httpA.Close()
+	}
+}
+
+// newSubscribedGatewayClient connects a client to gwURL and returns its
+// session plus a channel receiving every notifications/resources/updated
+// URI it sees.
+func newSubscribedGatewayClient(t *testing.T, gwURL string) (session *mcp.ClientSession, updatedCh <-chan string) {
+	t.Helper()
+	ch := make(chan string, 8)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, &mcp.ClientOptions{
+		ResourceUpdatedHandler: func(_ context.Context, req *mcp.ResourceUpdatedNotificationRequest) {
+			ch <- req.Params.URI
+		},
+	})
+	s, err := client.Connect(context.Background(), &mcp.StreamableClientTransport{Endpoint: gwURL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	return s, ch
+}
+
+// TestGateway_SubscribeRefCountsUpstreamSubscribeUnsubscribe checks that
+// mcprt issues exactly one upstream resources/subscribe on the first
+// downstream subscriber, none on a second subscriber to the same URI, and
+// exactly one upstream resources/unsubscribe only once the last downstream
+// subscriber leaves.
+func TestGateway_SubscribeRefCountsUpstreamSubscribeUnsubscribe(t *testing.T) {
+	fb := newSubscribableFakeBackend("backend-a", "file:///a")
+	gwURL, _, cleanup := newSubscriptionTestGateway(t, fb, false)
+	defer cleanup()
+	ctx := context.Background()
+
+	session1, _ := newSubscribedGatewayClient(t, gwURL)
+	defer func() { _ = session1.Close() }()
+	session2, _ := newSubscribedGatewayClient(t, gwURL)
+	defer func() { _ = session2.Close() }()
+
+	if err := session1.Subscribe(ctx, &mcp.SubscribeParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("session1 Subscribe: %v", err)
+	}
+	if got := fb.subscribeCount.Load(); got != 1 {
+		t.Fatalf("backend subscribeCount after first subscriber = %d, want 1", got)
+	}
+
+	if err := session2.Subscribe(ctx, &mcp.SubscribeParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("session2 Subscribe: %v", err)
+	}
+	if got := fb.subscribeCount.Load(); got != 1 {
+		t.Fatalf("backend subscribeCount after second subscriber = %d, want 1 (no re-subscribe)", got)
+	}
+
+	if err := session1.Unsubscribe(ctx, &mcp.UnsubscribeParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("session1 Unsubscribe: %v", err)
+	}
+	if got := fb.unsubscribeCount.Load(); got != 0 {
+		t.Fatalf("backend unsubscribeCount with one subscriber remaining = %d, want 0", got)
+	}
+
+	if err := session2.Unsubscribe(ctx, &mcp.UnsubscribeParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("session2 Unsubscribe: %v", err)
+	}
+	if got := fb.unsubscribeCount.Load(); got != 1 {
+		t.Fatalf("backend unsubscribeCount after last subscriber leaves = %d, want 1", got)
+	}
+}
+
+// TestGateway_ResourceUpdatedRelayedToSubscribedDownstream checks the
+// spec's core integration scenario: a fake backend's real resource update
+// reaches a subscribed downstream client via notifications/resources/
+// updated.
+func TestGateway_ResourceUpdatedRelayedToSubscribedDownstream(t *testing.T) {
+	fb := newSubscribableFakeBackend("backend-a", "file:///a")
+	gwURL, _, cleanup := newSubscriptionTestGateway(t, fb, true)
+	defer cleanup()
+	ctx := context.Background()
+
+	session, updatedCh := newSubscribedGatewayClient(t, gwURL)
+	defer func() { _ = session.Close() }()
+
+	if err := session.Subscribe(ctx, &mcp.SubscribeParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("Subscribe(file:///a): %v", err)
+	}
+
+	if err := fb.srv.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("backend ResourceUpdated: %v", err)
+	}
+
+	select {
+	case uri := <-updatedCh:
+		if uri != "file:///a" {
+			t.Fatalf("downstream received update for %q, want file:///a", uri)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("downstream did not receive notifications/resources/updated within 5s")
+	}
+}
+
+// TestGateway_UnsubscribedSessionStopsReceivingButOtherSessionStillDoes
+// checks the spec's second integration scenario: two downstream sessions
+// subscribed to the same URI, one unsubscribes, the other keeps receiving
+// updates.
+func TestGateway_UnsubscribedSessionStopsReceivingButOtherSessionStillDoes(t *testing.T) {
+	fb := newSubscribableFakeBackend("backend-a", "file:///a")
+	gwURL, _, cleanup := newSubscriptionTestGateway(t, fb, true)
+	defer cleanup()
+	ctx := context.Background()
+
+	session1, updatedCh1 := newSubscribedGatewayClient(t, gwURL)
+	defer func() { _ = session1.Close() }()
+	session2, updatedCh2 := newSubscribedGatewayClient(t, gwURL)
+	defer func() { _ = session2.Close() }()
+
+	if err := session1.Subscribe(ctx, &mcp.SubscribeParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("session1 Subscribe: %v", err)
+	}
+	if err := session2.Subscribe(ctx, &mcp.SubscribeParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("session2 Subscribe: %v", err)
+	}
+	if err := session1.Unsubscribe(ctx, &mcp.UnsubscribeParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("session1 Unsubscribe: %v", err)
+	}
+
+	if err := fb.srv.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("backend ResourceUpdated: %v", err)
+	}
+
+	select {
+	case uri := <-updatedCh2:
+		if uri != "file:///a" {
+			t.Fatalf("session2 received update for %q, want file:///a", uri)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("session2 (still subscribed) did not receive the update within 5s")
+	}
+
+	select {
+	case uri := <-updatedCh1:
+		t.Fatalf("session1 (unsubscribed) received update for %q, want none", uri)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestGateway_SubscribeUnknownURIReturnsError checks that
+// resources/subscribe for a URI not present in resourceTable returns an
+// error instead of silently succeeding.
+func TestGateway_SubscribeUnknownURIReturnsError(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{},
+		Relays:   gateway.Relays{Subscriptions: gateway.NewSubscriptionRegistry()},
+	})
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+
+	ctx := context.Background()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if err := session.Subscribe(ctx, &mcp.SubscribeParams{URI: "file:///no-such"}); err == nil {
+		t.Fatal("Subscribe(file:///no-such): got no error, want an error")
+	}
+}
+
+// TestGateway_DownstreamDisconnectUnsubscribesUpstreamWhenLastSubscriberLeaves
+// checks that a downstream client disconnecting without ever calling
+// resources/unsubscribe still triggers an upstream resources/unsubscribe
+// once it was the last subscriber -- exercising
+// startSessionCloseWatcherOnce's session.Wait()-based cleanup.
+func TestGateway_DownstreamDisconnectUnsubscribesUpstreamWhenLastSubscriberLeaves(t *testing.T) {
+	fb := newSubscribableFakeBackend("backend-a", "file:///a")
+	gwURL, _, cleanup := newSubscriptionTestGateway(t, fb, false)
+	defer cleanup()
+	ctx := context.Background()
+
+	session, _ := newSubscribedGatewayClient(t, gwURL)
+	if err := session.Subscribe(ctx, &mcp.SubscribeParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("Subscribe(file:///a): %v", err)
+	}
+	if got := fb.subscribeCount.Load(); got != 1 {
+		t.Fatalf("backend subscribeCount = %d, want 1", got)
+	}
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("closing downstream session: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if fb.unsubscribeCount.Load() == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := fb.unsubscribeCount.Load(); got != 1 {
+		t.Fatalf("backend unsubscribeCount after downstream disconnect = %d, want 1 (session close must trigger cleanup)", got)
 	}
 }
