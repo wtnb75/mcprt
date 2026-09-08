@@ -996,6 +996,91 @@ func TestBuildGateway_Success(t *testing.T) {
 	}
 }
 
+func TestBuildStaticPrompts_ConvertsConfig(t *testing.T) {
+	prompts := []config.StaticPromptConfig{
+		{
+			Name:        "greet",
+			Description: "greets someone",
+			Arguments:   []config.StaticPromptArgument{{Name: "name", Description: "who to greet", Required: true}},
+			Text:        "hello {{.name}}",
+		},
+	}
+	out, err := buildStaticPrompts(prompts)
+	if err != nil {
+		t.Fatalf("buildStaticPrompts: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("buildStaticPrompts returned %d entries, want 1", len(out))
+	}
+	sp := out[0]
+	if sp.Prompt.Name != "greet" || sp.Prompt.Description != "greets someone" {
+		t.Fatalf("Prompt = %+v, want name=greet description=%q", sp.Prompt, "greets someone")
+	}
+	if len(sp.Prompt.Arguments) != 1 || sp.Prompt.Arguments[0].Name != "name" || !sp.Prompt.Arguments[0].Required {
+		t.Fatalf("Prompt.Arguments = %+v, want one required argument named \"name\"", sp.Prompt.Arguments)
+	}
+}
+
+func TestBuildStaticPrompts_InvalidTemplatePropagatesError(t *testing.T) {
+	prompts := []config.StaticPromptConfig{{Name: "bad", Text: "{{.unterminated"}}
+	if _, err := buildStaticPrompts(prompts); err == nil {
+		t.Fatal("buildStaticPrompts: expected error for invalid template, got nil")
+	}
+}
+
+func TestBuildGateway_StaticPromptServesConfiguredText(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	cfg := &config.Config{
+		Listen: config.ListenConfig{HTTP: "127.0.0.1:0"},
+		Prompts: []config.StaticPromptConfig{
+			{
+				Name:      "greet",
+				Text:      "hello {{.name}}",
+				Arguments: []config.StaticPromptArgument{{Name: "name", Required: true}},
+			},
+		},
+	}
+
+	srv, err := buildGateway(context.Background(), logger, cfg)
+	if err != nil {
+		t.Fatalf("buildGateway: %v", err)
+	}
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+
+	ctx := context.Background()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "greet", Arguments: map[string]string{"name": "world"}})
+	if err != nil {
+		t.Fatalf("GetPrompt(greet): %v", err)
+	}
+	text, ok := res.Messages[0].Content.(*mcp.TextContent)
+	if !ok || text.Text != "hello world" {
+		t.Fatalf("GetPrompt(greet) content = %+v, want text \"hello world\"", res.Messages[0].Content)
+	}
+}
+
+func TestBuildGateway_StaticPromptTemplateErrorFailsBuild(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	cfg := &config.Config{
+		Listen:  config.ListenConfig{HTTP: "127.0.0.1:0"},
+		Prompts: []config.StaticPromptConfig{{Name: "bad", Text: "{{.unterminated"}},
+	}
+
+	if _, err := buildGateway(context.Background(), logger, cfg); err == nil {
+		t.Fatal("buildGateway: expected error for invalid static prompt template, got nil")
+	}
+}
+
 // TestBuildGateway_LogsNameConflictWithSingularKind checks that buildGateway's
 // own name_conflict logging (the four LogEvent calls right after each
 // router.Resolve call in buildGateway) reports kind="tool" -- the SAME
