@@ -105,7 +105,11 @@ type StaticPrompt struct {
 // buildGateway ever runs, so this Parse should not fail in practice; it is
 // not skipped, since NewStaticPrompt has no way to assume Validate ran.
 func NewStaticPrompt(name, description string, args []*mcp.PromptArgument, text string) (*StaticPrompt, error) {
-    tmpl, err := template.New(name).Parse(text)
+    // missingkey=zero: text/template's default behavior for a map key that
+    // isn't present is to print the literal string "<no value>", not "".
+    // An unset optional argument (or a name the template references but
+    // arguments: never declared) must render as an empty string instead.
+    tmpl, err := template.New(name).Option("missingkey=zero").Parse(text)
     if err != nil {
         return nil, fmt.Errorf("prompt %q: parse text template: %w", name, err)
     }
@@ -200,7 +204,7 @@ func renderStaticPrompt(sp *StaticPrompt, args map[string]string) (*mcp.GetPromp
 }
 ```
 
-`text/template`は`.`がmap[string]stringのとき`.field`をmapのキー参照として扱うので、`req.Params.Arguments`をそのまま`Execute`に渡せる。宣言されていない（`arguments:`に無い）キーをテンプレートが参照した場合や、非必須引数が渡されなかった場合は、Goの`text/template`のデフォルト挙動どおり空文字列として展開される（エラーにしない）。
+`text/template`は`.`がmap[string]stringのとき`.field`をmapのキー参照として扱うので、`req.Params.Arguments`をそのまま`Execute`に渡せる。ただしデフォルトでは、存在しないキーを参照すると空文字列ではなく文字列`"<no value>"`がそのまま埋め込まれてしまう（`text/template`のmissingkeyのデフォルト`"invalid"`の仕様）。`NewStaticPrompt`で`Option("missingkey=zero")`を設定することで、宣言されていない（`arguments:`に無い）キーをテンプレートが参照した場合や、非必須引数が渡されなかった場合に、空文字列として展開されるようにする（エラーにしない）。
 
 `internal/router`は変更しない。static promptはbackendを持たないため`router.Resolve`／`prompt_overrides`の対象にはならず、衝突解決は上記のstatic-name優先チェックだけで完結する。
 
