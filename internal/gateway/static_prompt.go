@@ -1,11 +1,15 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // StaticPrompt is a prompt mcprt serves directly from config, without
@@ -66,4 +70,24 @@ func renderStaticPrompt(sp *StaticPrompt, args map[string]string) (*mcp.GetPromp
 			{Role: "user", Content: &mcp.TextContent{Text: buf.String()}},
 		},
 	}, nil
+}
+
+// staticPromptHandler wraps renderStaticPrompt with the same
+// tracing/audit-logging treatment promptGetHandler (gateway.go) gives a
+// backend-forwarded prompts/get -- there is no backend to attribute the
+// call to, so both the span's "mcp.backend" attribute and the audit log's
+// backend field use the fixed sentinel "(static)".
+func staticPromptHandler(logger *slog.Logger, maskKeys []string, sp *StaticPrompt) mcp.PromptHandler {
+	return func(ctx context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+		start := time.Now()
+		ctx, span := startCallSpan(ctx, req.Extra, "prompts/get",
+			attribute.String("mcp.backend", "(static)"),
+			attribute.String("mcp.prompt.name", sp.Prompt.Name))
+		defer span.End()
+
+		result, err := renderStaticPrompt(sp, req.Params.Arguments)
+		recordOutcome(span, err)
+		logCall(ctx, logger, "prompt", "prompt", sp.Prompt.Name, "(static)", req.Session, req.Params.Arguments, maskKeys, start, err, nil)
+		return result, err
+	}
 }

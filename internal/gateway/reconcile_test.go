@@ -344,6 +344,47 @@ func TestUpdatePrompts_AddsRemovesAndChangesItems(t *testing.T) {
 	}
 }
 
+// TestUpdatePrompts_StaticPromptStillWinsAfterBackendReportsCollidingName
+// checks the reconcile path (a backend connecting/reconnecting after New,
+// reporting its prompt list via UpdatePrompts): a static prompt must keep
+// winning even when a backend's list_changed notification introduces a
+// same-named prompt after the gateway was already built.
+func TestUpdatePrompts_StaticPromptStillWinsAfterBackendReportsCollidingName(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx := context.Background()
+
+	sp, err := gateway.NewStaticPrompt("review", "", nil, "static review text")
+	if err != nil {
+		t.Fatalf("NewStaticPrompt: %v", err)
+	}
+
+	srv := gateway.New(gateway.NewConfig{
+		Logger:        logger,
+		Backends:      map[string]*backend.Backend{"a": {Name: "a"}},
+		StaticPrompts: []*gateway.StaticPrompt{sp},
+	})
+
+	srv.UpdatePrompts("a", []*mcp.Prompt{{Name: "review", Description: "backend's version"}})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "review"})
+	if err != nil {
+		t.Fatalf("GetPrompt(review): %v", err)
+	}
+	text, ok := res.Messages[0].Content.(*mcp.TextContent)
+	if !ok || text.Text != "static review text" {
+		t.Fatalf("GetPrompt(review) content = %+v, want the static prompt's text (still wins after UpdatePrompts)", res.Messages[0].Content)
+	}
+}
+
 func TestUpdateResourcesAndUpdatePrompts_ConcurrentCallsDoNotRace(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 

@@ -264,6 +264,9 @@ func (s *Server) updatePromptsLocked(backendName string, items []*mcp.Prompt, re
 		}
 	}
 	for name, resolved := range newTable.Items {
+		if s.staticPromptNames[name] {
+			continue // a static config prompt always wins; never register a backend's version under this name
+		}
 		old, ok := s.promptTable.Items[name]
 		if !touchedBy(resolved, old, ok, backendName) {
 			continue

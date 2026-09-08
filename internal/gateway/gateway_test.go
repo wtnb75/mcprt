@@ -919,6 +919,127 @@ func TestGateway_PromptGetOnDeadBackendReturnsError(t *testing.T) {
 	}
 }
 
+func TestGateway_StaticPromptServesConfiguredText(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	sp, err := gateway.NewStaticPrompt("greet", "greets someone", []*mcp.PromptArgument{{Name: "name", Required: true}}, "hello {{.name}}")
+	if err != nil {
+		t.Fatalf("NewStaticPrompt: %v", err)
+	}
+
+	srv := gateway.New(gateway.NewConfig{
+		Logger:        logger,
+		Backends:      map[string]*backend.Backend{},
+		StaticPrompts: []*gateway.StaticPrompt{sp},
+	})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+
+	ctx := context.Background()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "greet", Arguments: map[string]string{"name": "world"}})
+	if err != nil {
+		t.Fatalf("GetPrompt(greet): %v", err)
+	}
+	text, ok := res.Messages[0].Content.(*mcp.TextContent)
+	if !ok || text.Text != "hello world" {
+		t.Fatalf("GetPrompt(greet) content = %+v, want text \"hello world\"", res.Messages[0].Content)
+	}
+}
+
+func TestGateway_StaticPromptMissingRequiredArgumentReturnsError(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	sp, err := gateway.NewStaticPrompt("greet", "", []*mcp.PromptArgument{{Name: "name", Required: true}}, "hello {{.name}}")
+	if err != nil {
+		t.Fatalf("NewStaticPrompt: %v", err)
+	}
+
+	srv := gateway.New(gateway.NewConfig{
+		Logger:        logger,
+		Backends:      map[string]*backend.Backend{},
+		StaticPrompts: []*gateway.StaticPrompt{sp},
+	})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+
+	ctx := context.Background()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if _, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "greet"}); err == nil {
+		t.Fatal("GetPrompt(greet) succeeded, want an error: required argument \"name\" missing")
+	}
+}
+
+// TestGateway_StaticPromptAlwaysWinsOverBackendPrompt checks that when a
+// static config prompt and a backend prompt share a name, the static one is
+// the one actually served -- the backend's same-named prompt must not be
+// registered at all.
+func TestGateway_StaticPromptAlwaysWinsOverBackendPrompt(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendServer := newFakePromptBackendServer("backend-a", "review")
+	httpBackend := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpBackend.Close()
+
+	ctx := context.Background()
+	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpBackend.URL}, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	prompts, err := conn.ListPrompts(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a prompts: %v", err)
+	}
+	table := router.Resolve([]router.Entry[*mcp.Prompt]{{BackendName: "backend-a", Items: prompts}}, promptNameOf, promptRename, nil)
+
+	sp, err := gateway.NewStaticPrompt("review", "", nil, "static review text")
+	if err != nil {
+		t.Fatalf("NewStaticPrompt: %v", err)
+	}
+
+	srv := gateway.New(gateway.NewConfig{
+		Logger:        logger,
+		Backends:      map[string]*backend.Backend{"backend-a": conn},
+		Tables:        gateway.Tables{Prompts: table},
+		StaticPrompts: []*gateway.StaticPrompt{sp},
+	})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "review"})
+	if err != nil {
+		t.Fatalf("GetPrompt(review): %v", err)
+	}
+	text, ok := res.Messages[0].Content.(*mcp.TextContent)
+	if !ok || text.Text != "static review text" {
+		t.Fatalf("GetPrompt(review) content = %+v, want the static prompt's text (config always wins)", res.Messages[0].Content)
+	}
+}
+
 // TestGateway_CompletionRefPromptForwardsToBackend checks that
 // completion/complete with a ref/prompt is forwarded to the backend that
 // owns the prompt, with the backend's completion result returned unchanged.

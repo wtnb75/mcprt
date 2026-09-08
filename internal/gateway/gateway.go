@@ -75,6 +75,12 @@ type NewConfig struct {
 	Overrides Overrides
 	MaskKeys  []string
 	Relays    Relays
+	// StaticPrompts are prompts New registers directly (see the prompts
+	// registration loop below, and updatePromptsLocked in reconcile.go),
+	// without forwarding prompts/get to any backend. A static prompt's name
+	// always wins a collision with a backend-sourced prompt of the same
+	// name.
+	StaticPrompts []*StaticPrompt
 	// KeepAlive, if non-zero, makes the built *mcp.Server send a periodic
 	// MCP "ping" to every downstream client at this interval, closing that
 	// client's session after KeepAliveFailureThreshold consecutive
@@ -142,6 +148,13 @@ type Server struct {
 	promptEntries   []router.Entry[*mcp.Prompt]
 	promptTable     *router.Table[*mcp.Prompt]
 	promptOverrides map[string]string
+
+	// staticPromptNames is the set of prompt names New registered directly
+	// from NewConfig.StaticPrompts. Unlike the reconcile fields above, it is
+	// written once (in New) and never mutated afterward, but reading it
+	// happens under mu anyway since its only reader (updatePromptsLocked in
+	// reconcile.go) is already there for other reasons.
+	staticPromptNames map[string]bool
 }
 
 // MCP returns the underlying *mcp.Server, for ServeStdio/ServeHTTP.
@@ -193,6 +206,11 @@ func emptyTable[T any](t *router.Table[T]) *router.Table[T] {
 // BackendName referenced in cfg.Tables (the caller builds both from the
 // same set of connected backends).
 func New(cfg NewConfig) *Server {
+	staticNames := make(map[string]bool, len(cfg.StaticPrompts))
+	for _, sp := range cfg.StaticPrompts {
+		staticNames[sp.Prompt.Name] = true
+	}
+
 	s := &Server{
 		logger:   cfg.Logger,
 		backends: cfg.Backends,
@@ -215,6 +233,8 @@ func New(cfg NewConfig) *Server {
 		promptEntries:   cfg.Entries.Prompts,
 		promptTable:     emptyTable(cfg.Tables.Prompts),
 		promptOverrides: cfg.Overrides.Prompts,
+
+		staticPromptNames: staticNames,
 	}
 
 	opts := &mcp.ServerOptions{
@@ -247,8 +267,15 @@ func New(cfg NewConfig) *Server {
 	}
 	if cfg.Tables.Prompts != nil {
 		for _, resolved := range cfg.Tables.Prompts.Items {
+			if staticNames[resolved.Item.Name] {
+				cfg.Logger.Warn("prompt shadowed by static config prompt", "prompt", resolved.Item.Name, "backend", resolved.BackendName)
+				continue
+			}
 			registerPrompt(mcpSrv, cfg.Logger, cfg.Backends, resolved, cfg.MaskKeys)
 		}
+	}
+	for _, sp := range cfg.StaticPrompts {
+		mcpSrv.AddPrompt(sp.Prompt, staticPromptHandler(cfg.Logger, cfg.MaskKeys, sp))
 	}
 
 	return s
