@@ -116,6 +116,15 @@ resource/resource-template URIs, which never get a prefix).
 forwarded to the backend that owns the referenced prompt/resource, the same
 way `tools/call`/`resources/read`/`prompts/get` are.
 
+Client support for MCP's `prompts` feature (invoking `prompts/get`,
+typically surfaced as a slash command) varies widely between clients and
+changes quickly: some clients don't expose it at all yet, some only pass a
+single argument through, and slash-command naming isn't standardized across
+clients (e.g. `/mcp__server__prompt` vs `/mcp.server.prompt`). When naming a
+prompt (on a backend, or via `prompt_overrides`), keep the name to
+`[A-Za-z0-9_-]` and keep its argument count low, so it stays usable across
+whichever client ends up calling it.
+
 Some backends advertise MCP's newer stateless protocol (SEP-2575) well
 enough to pass its `server/discover` handshake, but don't correctly
 implement the `subscriptions/listen` session that same handshake commits

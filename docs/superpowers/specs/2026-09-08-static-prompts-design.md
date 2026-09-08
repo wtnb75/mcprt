@@ -271,9 +271,16 @@ func buildStaticPrompts(prompts []config.StaticPromptConfig) ([]*gateway.StaticP
 - `internal/cli`: `buildGateway`が`cfg.Prompts`のテンプレート構文エラーを伝播すること（`mcprt server`起動失敗）、`mcprt validate`が同じエラーを検出すること
 - `go test ./...`で完結、外部サービス依存なし
 
-## 運用上の注意（README追記）
+## 運用上の注意（README追記済み）
 
-Claude Codeは`prompts/list`のpromptを`/mcp__<server>__<prompt>`というスラッシュコマンドとして公開する。サーバー名（`claude mcp add`で付ける名前）は英数字・ハイフン・アンダースコアのみに制限されるが、prompt名側は許可文字以外が`_`に置換される（拒否ではない）。このためstatic promptの`name`に`.`やスペースなど`[A-Za-z0-9_-]`以外の文字を使うと、Claude Code側で他のprompt名と意図せず衝突しうる。README（config例の近く）に、`prompts:`の`name`は`[A-Za-z0-9_-]`に収めることを推奨する注記を足す。これはmcprt固有の制約ではなくClaude Code側の挙動なので、mcprt自体に文字種バリデーションは追加しない。
+MCPクライアントの`prompts`機能（`prompts/get`の呼び出しUI、多くはスラッシュコマンド）への対応状況はクライアントごとに大きく異なり、変化も速い。調査時点（2026-09-08）でわかったこと:
+
+- 呼び出し不可: Codex CLI（`prompts/get`を呼ぶ手段がドキュメント上見当たらない。[openai/codex#8342](https://github.com/openai/codex/issues/8342)が機能要望として開いている）
+- 区切り文字が不統一: Claude Codeは`/mcp__<server>__<prompt>`、GitHub Copilot Chatは`/mcp.<server>.<prompt>`、Gemini CLIはサーバー名プレフィックスなしの`/<prompt>`
+- 引数の扱いが不完全なクライアントがある: Continue.devは引数入力UI自体がない、Zed editorは2個目以降の引数を通知なく無視する
+- サーバー名の文字種はClaude Codeが`claude mcp add`で英数字・ハイフン・アンダースコアのみに制限（prompt名側は許可文字以外が拒否ではなく`_`に置換される）。他クライアントでの文字種制約は一次情報で確認できていない
+
+個別クライアントの呼び出し構文はクライアント側の実装変更ですぐ陳腐化するため、READMEには構文の詳細ではなく一般的な注意（prompt名は`[A-Za-z0-9_-]`に収める、引数は極力少なくする）として記載した（`prompt_overrides`の説明の直後、README.md）。static prompt（`prompts:`）もこの既存の注意書きの対象に含まれる（backend由来promptと同じ名前空間・同じ`prompts/get`経路でクライアントから見えるため、追加の注記は不要と判断）。mcprt自体には文字種バリデーションを追加しない（クライアント側の挙動でありmcprt固有の制約ではないため）。
 
 ## 将来拡張（本ドキュメントのスコープ外）
 
