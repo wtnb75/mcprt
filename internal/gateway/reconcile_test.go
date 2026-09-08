@@ -344,6 +344,75 @@ func TestUpdatePrompts_AddsRemovesAndChangesItems(t *testing.T) {
 	}
 }
 
+// TestUpdatePrompts_StaticPromptStillWinsAfterBackendReportsCollidingName
+// checks the reconcile path (a backend connecting/reconnecting after New,
+// reporting its prompt list via UpdatePrompts): a static prompt must keep
+// winning even when a backend's list_changed notification introduces a
+// same-named prompt after the gateway was already built, AND after that
+// backend later stops advertising the name (e.g. on disconnect --
+// internal/cli/server.go calls UpdatePrompts(backendName, nil) then). The
+// second UpdatePrompts call below is what actually exercises the removal
+// loop's staticPromptNames skip guard in updatePromptsLocked
+// (reconcile.go): a single UpdatePrompts call only ever adds "review" to
+// the table for the first time, so the removal loop (which only looks at
+// names that were already in the OLD table) never touches it -- only once
+// the name has been in the table and THEN disappears does the removal loop
+// consider deleting it, which is exactly the bug Finding 1 of the final
+// review fixed.
+func TestUpdatePrompts_StaticPromptStillWinsAfterBackendReportsCollidingName(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx := context.Background()
+
+	sp, err := gateway.NewStaticPrompt("review", "", nil, "static review text")
+	if err != nil {
+		t.Fatalf("NewStaticPrompt: %v", err)
+	}
+
+	// Seed a real prompt entry for backend "a" so UpdatePrompts below
+	// produces a non-trivial newTable: replaceEntry (see reconcile.go) only
+	// replaces an EXISTING entry for backendName, so without this seed
+	// s.promptEntries stays nil and UpdatePrompts would be a no-op,
+	// letting the test "pass" without ever touching the skip guard it's
+	// meant to regression-test (see Finding 3 of the final review).
+	entries := []router.Entry[*mcp.Prompt]{{BackendName: "a", Items: nil}}
+	table := router.Resolve(entries, promptNameOf, promptRename, nil)
+
+	srv := gateway.New(gateway.NewConfig{
+		Logger:        logger,
+		Backends:      map[string]*backend.Backend{"a": {Name: "a"}},
+		Tables:        gateway.Tables{Prompts: table},
+		Entries:       gateway.Entries{Prompts: entries},
+		StaticPrompts: []*gateway.StaticPrompt{sp},
+	})
+
+	srv.UpdatePrompts("a", []*mcp.Prompt{{Name: "review", Description: "backend's version"}})
+
+	// Simulate the backend disconnecting (internal/cli/server.go calls
+	// UpdatePrompts(backendName, nil) on every backend disconnect): "review"
+	// now vanishes from newTable, driving the removal loop to consider it --
+	// without the staticPromptNames skip guard, this incorrectly deletes the
+	// static prompt's own registration.
+	srv.UpdatePrompts("a", nil)
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect to gateway: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "review"})
+	if err != nil {
+		t.Fatalf("GetPrompt(review): %v", err)
+	}
+	text, ok := res.Messages[0].Content.(*mcp.TextContent)
+	if !ok || text.Text != "static review text" {
+		t.Fatalf("GetPrompt(review) content = %+v, want the static prompt's text (still wins after UpdatePrompts)", res.Messages[0].Content)
+	}
+}
+
 func TestUpdateResourcesAndUpdatePrompts_ConcurrentCallsDoNotRace(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 

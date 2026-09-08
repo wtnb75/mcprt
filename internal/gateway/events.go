@@ -43,4 +43,5 @@ const (
 	EventElicitationRoutingRefused     = "elicitation_routing_refused"
 	EventElicitationTimeout            = "elicitation_timeout"
 	EventElicitationFailed             = "elicitation_failed"
+	EventPromptShadowedByStatic        = "prompt_shadowed_by_static"
 )

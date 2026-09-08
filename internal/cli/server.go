@@ -273,6 +273,28 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	return firstErr
 }
 
+// buildStaticPrompts converts each config-level static prompt definition
+// into the *gateway.StaticPrompt New actually registers, parsing its text
+// template along the way. internal/config's validateStaticPrompts already
+// rejects an unparseable template at config-load time, so an error here
+// should only happen if that validation was skipped somehow -- still
+// handled, not assumed impossible.
+func buildStaticPrompts(prompts []config.StaticPromptConfig) ([]*gateway.StaticPrompt, error) {
+	out := make([]*gateway.StaticPrompt, 0, len(prompts))
+	for _, p := range prompts {
+		args := make([]*mcp.PromptArgument, 0, len(p.Arguments))
+		for _, a := range p.Arguments {
+			args = append(args, &mcp.PromptArgument{Name: a.Name, Description: a.Description, Required: a.Required})
+		}
+		sp, err := gateway.NewStaticPrompt(p.Name, p.Description, args, p.Text)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sp)
+	}
+	return out, nil
+}
+
 // buildGateway connects to every configured backend (see connectBackends)
 // and builds a fresh *gateway.Server from scratch. Called once at startup,
 // and (from Task 5's watchSIGHUP) once per SIGHUP-triggered reload with a
@@ -313,6 +335,11 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 		gateway.LogEvent(ctx, logger, slog.LevelWarn, gateway.EventNameConflict, "kind", "prompt", "name", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
 
+	staticPrompts, err := buildStaticPrompts(cfg.Prompts)
+	if err != nil {
+		return nil, err
+	}
+
 	srv := gateway.New(gateway.NewConfig{
 		Logger:   logger,
 		Backends: conn.backends,
@@ -334,6 +361,7 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 			ResourceTemplates: cfg.ResourceTemplateOverrides,
 			Prompts:           cfg.PromptOverrides,
 		},
+		StaticPrompts:             staticPrompts,
 		MaskKeys:                  cfg.Logging.MaskKeys,
 		Relays:                    gwH.relays,
 		KeepAlive:                 time.Duration(cfg.Timeouts.DownstreamKeepAlive),

@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"text/template"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -21,14 +22,38 @@ var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // Config is the top-level gateway configuration, loaded from a YAML file.
 type Config struct {
-	Listen                    ListenConfig      `yaml:"listen"`
-	Backends                  []BackendConfig   `yaml:"backends"`
-	Overrides                 map[string]string `yaml:"overrides,omitempty"`
-	ResourceOverrides         map[string]string `yaml:"resource_overrides,omitempty"`
-	ResourceTemplateOverrides map[string]string `yaml:"resource_template_overrides,omitempty"`
-	PromptOverrides           map[string]string `yaml:"prompt_overrides,omitempty"`
-	Logging                   LoggingConfig     `yaml:"logging,omitempty"`
-	Timeouts                  TimeoutsConfig    `yaml:"timeouts,omitempty"`
+	Listen                    ListenConfig         `yaml:"listen"`
+	Backends                  []BackendConfig      `yaml:"backends"`
+	Overrides                 map[string]string    `yaml:"overrides,omitempty"`
+	ResourceOverrides         map[string]string    `yaml:"resource_overrides,omitempty"`
+	ResourceTemplateOverrides map[string]string    `yaml:"resource_template_overrides,omitempty"`
+	PromptOverrides           map[string]string    `yaml:"prompt_overrides,omitempty"`
+	Prompts                   []StaticPromptConfig `yaml:"prompts,omitempty"`
+	Logging                   LoggingConfig        `yaml:"logging,omitempty"`
+	Timeouts                  TimeoutsConfig       `yaml:"timeouts,omitempty"`
+}
+
+// StaticPromptConfig defines a prompt mcprt serves directly from config,
+// without forwarding prompts/get to any backend. See
+// internal/gateway.StaticPrompt for the runtime representation built from
+// this at gateway-construction time (internal/cli's buildStaticPrompts
+// parses Text as a template there; validateStaticPrompts below only checks
+// it parses, it doesn't keep the *template.Template around).
+type StaticPromptConfig struct {
+	Name        string                 `yaml:"name"`
+	Description string                 `yaml:"description,omitempty"`
+	Arguments   []StaticPromptArgument `yaml:"arguments,omitempty"`
+	Text        string                 `yaml:"text"`
+}
+
+// StaticPromptArgument mirrors mcp.PromptArgument's fields (Name,
+// Description, Required) -- kept as a separate config-layer type rather
+// than importing the mcp package here, matching how BackendConfig etc.
+// don't import mcp either.
+type StaticPromptArgument struct {
+	Name        string `yaml:"name"`
+	Description string `yaml:"description,omitempty"`
+	Required    bool   `yaml:"required,omitempty"`
 }
 
 // TimeoutsConfig overrides mcprt's built-in timeout and backoff defaults.
@@ -311,10 +336,49 @@ func validate(cfg *Config) error {
 		}
 	}
 
+	if err := validateStaticPrompts(cfg.Prompts); err != nil {
+		return err
+	}
+
 	if err := validateTimeouts(cfg.Timeouts); err != nil {
 		return err
 	}
 
+	return nil
+}
+
+// validateStaticPrompts rejects an empty/duplicate prompt or argument name,
+// an empty text body, and a text body that doesn't parse as a Go
+// text/template -- so a broken prompts: entry fails fast at config-load
+// time (mcprt validate/server startup/SIGHUP reload), the same as every
+// other misconfiguration this file checks.
+func validateStaticPrompts(prompts []StaticPromptConfig) error {
+	seen := make(map[string]bool, len(prompts))
+	for _, p := range prompts {
+		if p.Name == "" {
+			return fmt.Errorf("prompts: name is required")
+		}
+		if seen[p.Name] {
+			return fmt.Errorf("prompts %q: duplicate name", p.Name)
+		}
+		seen[p.Name] = true
+		if p.Text == "" {
+			return fmt.Errorf("prompts %q: text is required", p.Name)
+		}
+		if _, err := template.New(p.Name).Parse(p.Text); err != nil {
+			return fmt.Errorf("prompts %q: parse text template: %w", p.Name, err)
+		}
+		argSeen := make(map[string]bool, len(p.Arguments))
+		for _, a := range p.Arguments {
+			if a.Name == "" {
+				return fmt.Errorf("prompts %q: argument name is required", p.Name)
+			}
+			if argSeen[a.Name] {
+				return fmt.Errorf("prompts %q: duplicate argument %q", p.Name, a.Name)
+			}
+			argSeen[a.Name] = true
+		}
+	}
 	return nil
 }
 

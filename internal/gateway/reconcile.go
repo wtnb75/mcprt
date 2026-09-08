@@ -259,11 +259,17 @@ func (s *Server) updatePromptsLocked(backendName string, items []*mcp.Prompt, re
 	newTable := router.Resolve(s.promptEntries, PromptNameOf, PromptRename, s.promptOverrides)
 
 	for name := range s.promptTable.Items {
+		if s.staticPromptNames[name] {
+			continue // never registered from the table in the first place; RemovePrompts would incorrectly drop the static prompt
+		}
 		if _, ok := newTable.Items[name]; !ok {
 			s.mcp.RemovePrompts(name)
 		}
 	}
 	for name, resolved := range newTable.Items {
+		if s.staticPromptNames[name] {
+			continue // a static config prompt always wins; never register a backend's version under this name
+		}
 		old, ok := s.promptTable.Items[name]
 		if !touchedBy(resolved, old, ok, backendName) {
 			continue
