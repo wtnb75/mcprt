@@ -287,8 +287,9 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 
 	var gwH gwHolder
 	gwH.relays = gateway.Relays{
-		Progress: gateway.NewProgressRegistry(),
-		Calls:    gateway.NewCallRouter(),
+		Progress:      gateway.NewProgressRegistry(),
+		Calls:         gateway.NewCallRouter(),
+		Subscriptions: gateway.NewSubscriptionRegistry(),
 	}
 	conn := connectBackends(ctx, logger, cfg.Backends, &gwH)
 
@@ -355,10 +356,11 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 // relays is set once, before connectBackends spawns any supervisor
 // goroutine, and never mutated afterward -- so reading it from those
 // goroutines needs no lock (the write happens-before every goroutine's
-// creation). A zero-value relays (buildGateway always sets both of its
+// creation). A zero-value relays (buildGateway always sets all three of its
 // fields; only some tests construct a bare gwHolder{} without them) means
-// "no progress relay/elicitation routing for this generation," matching a
-// nil *gateway.ProgressRegistry/*gateway.CallRouter everywhere else.
+// "no progress relay/elicitation routing/resource subscription for this
+// generation," matching a nil *gateway.ProgressRegistry/*gateway.
+// CallRouter/*gateway.SubscriptionRegistry everywhere else.
 type gwHolder struct {
 	ptr    atomic.Pointer[gateway.Server]
 	relays gateway.Relays
@@ -615,6 +617,15 @@ func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.Backen
 				return res, err
 			}
 		}
+		if gwH.relays.Subscriptions != nil {
+			cb.OnResourceUpdated = func(ctx context.Context, req *mcp.ResourceUpdatedNotificationRequest) {
+				gw := gwH.ptr.Load()
+				if gw == nil {
+					return
+				}
+				gwH.relays.Subscriptions.Relay(ctx, gw.MCP(), logger, bc.Name, req.Params.URI)
+			}
+		}
 	}
 
 	// firstAttemptPending guards onFirstAttempt so it fires exactly once, on
@@ -667,6 +678,13 @@ func superviseBackend(ctx context.Context, logger *slog.Logger, bc config.Backen
 		}
 		if gw != nil {
 			gw.ConnectBackend(bc.Name, c.backend, bc.Prefix, c.tools, c.resources, c.resourceTemplates, c.prompts)
+			if gwH.relays.Subscriptions != nil {
+				for _, sub := range gwH.relays.Subscriptions.BackendReconnected(bc.Name) {
+					if err := c.backend.Session.Subscribe(ctx, &mcp.SubscribeParams{URI: sub.OriginalURI}); err != nil {
+						logger.Warn("resubscribe after reconnect failed", "backend", bc.Name, "uri", sub.OriginalURI, "error", err)
+					}
+				}
+			}
 		} else if onFirstConnect != nil {
 			onFirstConnect(c)
 		}

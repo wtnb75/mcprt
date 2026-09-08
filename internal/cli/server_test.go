@@ -1575,3 +1575,206 @@ timeouts:
 		t.Fatal("server did not exit within 2s; timeouts.shutdown: 100ms in config was not applied (still waiting out the 5s default?)")
 	}
 }
+
+// TestServerCommand_RelaysResourceUpdatedToSubscribedDownstream checks the
+// resource-subscription-relay feature end-to-end through the real server
+// command: a downstream client's resources/subscribe reaches the backend,
+// and the backend's notifications/resources/updated reaches the
+// downstream client -- exercising the real production wiring
+// (superviseBackend's OnResourceUpdated, SubscriptionRegistry.Relay).
+func TestServerCommand_RelaysResourceUpdatedToSubscribedDownstream(t *testing.T) {
+	backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, &mcp.ServerOptions{
+		SubscribeHandler:   func(context.Context, *mcp.SubscribeRequest) error { return nil },
+		UnsubscribeHandler: func(context.Context, *mcp.UnsubscribeRequest) error { return nil },
+	})
+	backendSrv.AddResource(&mcp.Resource{URI: "file:///a", Name: "a"},
+		func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+			return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: req.Params.URI, Text: "content"}}}, nil
+		})
+	backendHTTP := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil))
+	defer backendHTTP.Close()
+
+	gatewayAddr := freePort(t)
+	configPath := writeConfig(t, fmt.Sprintf(`
+listen:
+  http: %q
+
+backends:
+  - name: fake
+    transport: http
+    url: %q
+`, gatewayAddr, backendHTTP.URL))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	execErr := make(chan error, 1)
+	go func() {
+		execErr <- cli.Execute(ctx, []string{"server", "--config", configPath})
+	}()
+
+	updatedCh := make(chan string, 4)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, &mcp.ClientOptions{
+		ResourceUpdatedHandler: func(_ context.Context, req *mcp.ResourceUpdatedNotificationRequest) {
+			updatedCh <- req.Params.URI
+		},
+	})
+	var session *mcp.ClientSession
+	var connectErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		session, connectErr = client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: "http://" + gatewayAddr}, nil)
+		if connectErr == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if connectErr != nil {
+		t.Fatalf("connecting to gateway: %v", connectErr)
+	}
+	waitForResourceURIs(t, ctx, session, []string{"file:///a"})
+
+	if err := session.Subscribe(ctx, &mcp.SubscribeParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("Subscribe(file:///a): %v", err)
+	}
+	if err := backendSrv.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("backend ResourceUpdated: %v", err)
+	}
+
+	select {
+	case uri := <-updatedCh:
+		if uri != "file:///a" {
+			t.Fatalf("downstream received update for %q, want file:///a", uri)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("downstream did not receive notifications/resources/updated within 5s")
+	}
+
+	_ = session.Close()
+	cancel()
+	if err := <-execErr; err != nil {
+		t.Fatalf("server exited with error: %v", err)
+	}
+}
+
+// TestServerCommand_SubscriptionSurvivesBackendReconnect checks that a
+// downstream subscription automatically resumes after the owning backend
+// disconnects and reconnects, following the same real-listener-restart
+// technique TestServerCommand_BackendReconnectsAfterDisconnect already
+// uses (see its comments for the SSE-retry-backoff timing rationale this
+// test's deadlines mirror).
+func TestServerCommand_SubscriptionSurvivesBackendReconnect(t *testing.T) {
+	var subscribeCount atomic.Int32
+	newBackendHandler := func() http.Handler {
+		backendSrv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, &mcp.ServerOptions{
+			SubscribeHandler: func(context.Context, *mcp.SubscribeRequest) error {
+				subscribeCount.Add(1)
+				return nil
+			},
+			UnsubscribeHandler: func(context.Context, *mcp.UnsubscribeRequest) error { return nil },
+		})
+		backendSrv.AddResource(&mcp.Resource{URI: "file:///a", Name: "a"},
+			func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+				return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{URI: req.Params.URI, Text: "content"}}}, nil
+			})
+		return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendSrv }, nil)
+	}
+
+	backendAddr := freePort(t)
+	backendListener, err := net.Listen("tcp", backendAddr)
+	if err != nil {
+		t.Fatalf("listening on %s: %v", backendAddr, err)
+	}
+	backendHTTP := &http.Server{Handler: newBackendHandler()}
+	go func() { _ = backendHTTP.Serve(backendListener) }()
+	defer func() { _ = backendHTTP.Close() }()
+
+	gatewayAddr := freePort(t)
+	configPath := writeConfig(t, fmt.Sprintf(`
+listen:
+  http: %q
+
+backends:
+  - name: fake
+    transport: http
+    url: %q
+`, gatewayAddr, "http://"+backendAddr))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	execErr := make(chan error, 1)
+	go func() {
+		execErr <- cli.Execute(ctx, []string{"server", "--config", configPath})
+	}()
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	var session *mcp.ClientSession
+	var connectErr error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		session, connectErr = client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: "http://" + gatewayAddr}, nil)
+		if connectErr == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if connectErr != nil {
+		t.Fatalf("connecting to gateway: %v", connectErr)
+	}
+	waitForResourceURIs(t, ctx, session, []string{"file:///a"})
+
+	if err := session.Subscribe(ctx, &mcp.SubscribeParams{URI: "file:///a"}); err != nil {
+		t.Fatalf("Subscribe(file:///a): %v", err)
+	}
+	if got := subscribeCount.Load(); got != 1 {
+		t.Fatalf("backend subscribeCount before disconnect = %d, want 1", got)
+	}
+
+	if err := backendHTTP.Close(); err != nil {
+		t.Fatalf("stopping backend: %v", err)
+	}
+
+	deadline = time.Now().Add(40 * time.Second)
+	for time.Now().Before(deadline) {
+		var got []string
+		for r, err := range session.Resources(ctx, nil) {
+			if err != nil {
+				t.Fatalf("listing resources: %v", err)
+			}
+			got = append(got, r.URI)
+		}
+		if len(got) == 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Restart a backend listening on the SAME address, with a fresh
+	// SubscribeHandler (subscribeCount is shared across restarts via the
+	// closure above): superviseBackend's unbounded retry loop reconnects
+	// automatically, and its post-ConnectBackend resubscribe logic must
+	// re-issue resources/subscribe for file:///a on the new connection.
+	backendListener2, err := net.Listen("tcp", backendAddr)
+	if err != nil {
+		t.Fatalf("re-listening on %s: %v", backendAddr, err)
+	}
+	backendHTTP2 := &http.Server{Handler: newBackendHandler()}
+	go func() { _ = backendHTTP2.Serve(backendListener2) }()
+	defer func() { _ = backendHTTP2.Close() }()
+
+	waitForResourceURIs(t, ctx, session, []string{"file:///a"})
+
+	deadline = time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if subscribeCount.Load() == 2 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := subscribeCount.Load(); got != 2 {
+		t.Fatalf("backend subscribeCount after reconnect = %d, want 2 (must auto-resubscribe file:///a)", got)
+	}
+
+	_ = session.Close()
+	cancel()
+	if err := <-execErr; err != nil {
+		t.Fatalf("server exited with error: %v", err)
+	}
+}

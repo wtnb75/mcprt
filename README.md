@@ -95,8 +95,18 @@ Minimal example:
 resolve conflicting resource URIs and URI templates the same way, but
 `prefix` is never applied to resources: a URI already carries a
 backend-specific namespace (`scheme://host/path`), and string-concatenating
-a prefix onto one would produce an invalid URI. `resources/subscribe` and
-`notifications/resources/updated` are not relayed.
+a prefix onto one would produce an invalid URI. `resources/subscribe`/
+`resources/unsubscribe` are forwarded to the backend that owns the resource
+(reference-counted: mcprt subscribes upstream once, on the first downstream
+subscriber, and unsubscribes once the last one leaves), and a backend's
+`notifications/resources/updated` is relayed to every downstream session
+currently subscribed to that URI. Subscribing to a resource *template*'s
+dynamically-generated URIs is not supported -- only URIs registered as
+exact resources can be subscribed to. A subscription does not survive
+`mcprt server` restarting or reloading via SIGHUP (matching every other
+in-memory state mcprt holds), but does survive the owning backend
+disconnecting and reconnecting: mcprt automatically re-subscribes every URI
+that was subscribed before the disconnect.
 `prompt_overrides` resolves conflicting **prompt** names, the same way
 `overrides` resolves tool names — including `prefix` being applied to
 prompt names before conflict resolution, exactly like tool names (unlike

@@ -72,6 +72,13 @@ type ChangeCallbacks struct {
 	// the elicitation capability to the backend (see go-sdk's
 	// ClientOptions.ElicitationHandler doc).
 	OnElicit func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error)
+	// OnResourceUpdated, if non-nil, is wired as the backend-facing
+	// mcp.Client's ResourceUpdatedHandler -- fires when the backend sends
+	// notifications/resources/updated for a URI mcprt has subscribed to on
+	// some downstream session's behalf (see gateway.SubscriptionRegistry).
+	// Like OnProgress, this is a plain notification callback (no result to
+	// return).
+	OnResourceUpdated func(context.Context, *mcp.ResourceUpdatedNotificationRequest)
 }
 
 // Connect starts (for stdio) or dials (for http) the backend described by
@@ -107,7 +114,7 @@ func Connect(ctx context.Context, cfg config.BackendConfig, cb ChangeCallbacks) 
 		if probeErr := probeListTools(ctx, session); probeErr != nil && isSubscriptionsListenFailure(probeErr) {
 			_ = session.Close()
 			degraded = true
-			degradedCB := ChangeCallbacks{OnProgress: cb.OnProgress, OnElicit: cb.OnElicit}
+			degradedCB := ChangeCallbacks{OnProgress: cb.OnProgress, OnElicit: cb.OnElicit, OnResourceUpdated: cb.OnResourceUpdated}
 			session, err = connectOnce(ctx, cfg, degradedCB)
 		}
 	}
@@ -174,6 +181,9 @@ func connectOnce(ctx context.Context, cfg config.BackendConfig, cb ChangeCallbac
 	}
 	if cb.OnElicit != nil {
 		clientOpts.ElicitationHandler = cb.OnElicit
+	}
+	if cb.OnResourceUpdated != nil {
+		clientOpts.ResourceUpdatedHandler = cb.OnResourceUpdated
 	}
 	client := mcp.NewClient(&mcp.Implementation{Name: "mcprt", Version: "v1"}, clientOpts)
 

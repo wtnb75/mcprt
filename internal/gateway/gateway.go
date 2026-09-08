@@ -52,18 +52,21 @@ type Overrides struct {
 
 // Relays bundles the optional cross-call correlation services a gateway
 // can wire in. A nil field means that feature is disabled, matching the
-// existing nil-means-disabled convention each of *ProgressRegistry and
-// *CallRouter already had as standalone parameters.
+// existing nil-means-disabled convention each of *ProgressRegistry,
+// *CallRouter, and *SubscriptionRegistry already had as standalone
+// parameters.
 type Relays struct {
-	Progress *ProgressRegistry
-	Calls    *CallRouter
+	Progress      *ProgressRegistry
+	Calls         *CallRouter
+	Subscriptions *SubscriptionRegistry
 }
 
 // NewConfig bundles New's construction parameters. Fields left at their
 // zero value behave exactly as an omitted/nil positional argument did
 // before this type existed: a nil Tables/Entries/Overrides sub-field means
 // that category has no items, a nil MaskKeys means no extra masking, and a
-// nil Relays.Progress/Relays.Calls means that relay feature is disabled.
+// nil Relays.Progress/Relays.Calls/Relays.Subscriptions means that relay
+// feature is disabled.
 type NewConfig struct {
 	Logger    *slog.Logger
 	Backends  map[string]*backend.Backend
@@ -113,6 +116,15 @@ type Server struct {
 	backends map[string]*backend.Backend
 	maskKeys []string
 	relays   Relays
+
+	// watchedSessions records which downstream *mcp.ServerSession already
+	// has a startSessionCloseWatcherOnce goroutine running for it, so a
+	// session that calls resources/subscribe more than once doesn't spawn
+	// a second, redundant Wait()-then-cleanup goroutine for the same
+	// session. Empty and unused whenever relays.Subscriptions is nil (the
+	// subscription feature is disabled). Guarded by mu, same as every
+	// other Server field below.
+	watchedSessions map[*mcp.ServerSession]bool
 
 	mu sync.Mutex
 
@@ -187,6 +199,8 @@ func New(cfg NewConfig) *Server {
 		maskKeys: cfg.MaskKeys,
 		relays:   cfg.Relays,
 
+		watchedSessions: make(map[*mcp.ServerSession]bool),
+
 		toolEntries:   cfg.Entries.Tools,
 		toolTable:     emptyTable(cfg.Tables.Tools),
 		toolOverrides: cfg.Overrides.Tools,
@@ -203,12 +217,17 @@ func New(cfg NewConfig) *Server {
 		promptOverrides: cfg.Overrides.Prompts,
 	}
 
-	mcpSrv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, &mcp.ServerOptions{
+	opts := &mcp.ServerOptions{
 		Logger:                    cfg.Logger,
 		KeepAlive:                 cfg.KeepAlive,
 		KeepAliveFailureThreshold: cfg.KeepAliveFailureThreshold,
 		CompletionHandler:         s.completionHandler,
-	})
+	}
+	if cfg.Relays.Subscriptions != nil {
+		opts.SubscribeHandler = s.subscribeHandler
+		opts.UnsubscribeHandler = s.unsubscribeHandler
+	}
+	mcpSrv := mcp.NewServer(&mcp.Implementation{Name: "mcprt", Version: "v1"}, opts)
 	s.mcp = mcpSrv
 
 	if cfg.Tables.Tools != nil {
@@ -309,6 +328,125 @@ func (s *Server) completionHandler(ctx context.Context, req *mcp.CompleteRequest
 		s.logger.Warn("completion: backend call failed", "backend", b.Name, "type", ref.Type, "name", ref.Name, "uri", ref.URI, "error", err)
 	}
 	return result, err
+}
+
+// subscribeHandler forwards resources/subscribe to the backend that owns
+// req.Params.URI, resolved through the same resourceTable registerResource
+// already populates at registration time (unlike completionHandler,
+// resourceTemplateTable is deliberately not consulted here -- subscribing
+// to a resource template's dynamically-generated URIs is out of scope, see
+// this plan's spec). It records the downstream session's interest in
+// relays.Subscriptions and issues the backend's actual resources/subscribe
+// only when this is the URI's first subscriber (reference-counted).
+func (s *Server) subscribeHandler(ctx context.Context, req *mcp.SubscribeRequest) error {
+	s.mu.Lock()
+	resolved, ok := s.resourceTable.Items[req.Params.URI]
+	if !ok {
+		s.mu.Unlock()
+		s.logger.Warn("subscribe: unknown resource", "uri", req.Params.URI)
+		return fmt.Errorf("subscribe: unknown resource %q", req.Params.URI)
+	}
+	b := s.backends[resolved.BackendName]
+	s.mu.Unlock()
+
+	if b == nil {
+		s.logger.Warn("subscribe: backend not found", "backend", resolved.BackendName, "uri", req.Params.URI)
+		return fmt.Errorf("subscribe: backend %q not found for resource %q", resolved.BackendName, req.Params.URI)
+	}
+
+	s.startSessionCloseWatcherOnce(req.Session)
+
+	needUpstream := s.relays.Subscriptions.Subscribe(req.Session, req.Params.URI, resolved.BackendName, resolved.OriginalName)
+	if needUpstream {
+		if err := b.Session.Subscribe(ctx, &mcp.SubscribeParams{URI: resolved.OriginalName}); err != nil {
+			s.relays.Subscriptions.Unsubscribe(req.Session, req.Params.URI) // roll back: upstream Subscribe never actually succeeded
+			s.logger.Warn("subscribe: backend call failed", "backend", b.Name, "uri", req.Params.URI, "error", err)
+			return err
+		}
+	}
+	return nil
+}
+
+// unsubscribeHandler forwards resources/unsubscribe symmetrically to
+// subscribeHandler: it resolves req.Params.URI through resourceTable the
+// same way, removes the downstream session's interest from
+// relays.Subscriptions, and issues the backend's actual
+// resources/unsubscribe only when this was the URI's last subscriber.
+//
+// Because it re-resolves resourceTable (rather than trusting whatever
+// backend/originalURI relays.Subscriptions itself recorded at Subscribe
+// time), a resource a backend has since removed via list_changed -- while
+// a downstream session is still subscribed to it -- makes
+// unsubscribeHandler fail with "unknown resource" even though
+// relays.Subscriptions still holds a live entry for it; that entry is
+// then only cleared later, by SessionClosed, when the session eventually
+// disconnects. Handling that gap (e.g. by having relays.Subscriptions
+// itself remember backendName/originalURI and having Unsubscribe return
+// them, so this lookup wouldn't depend on resourceTable staying accurate)
+// is a deliberate simplification matching the design spec's own scope,
+// not attempted here.
+func (s *Server) unsubscribeHandler(ctx context.Context, req *mcp.UnsubscribeRequest) error {
+	s.mu.Lock()
+	resolved, ok := s.resourceTable.Items[req.Params.URI]
+	if !ok {
+		s.mu.Unlock()
+		s.logger.Warn("unsubscribe: unknown resource", "uri", req.Params.URI)
+		return fmt.Errorf("unsubscribe: unknown resource %q", req.Params.URI)
+	}
+	b := s.backends[resolved.BackendName]
+	s.mu.Unlock()
+
+	needUpstreamUnsubscribe := s.relays.Subscriptions.Unsubscribe(req.Session, req.Params.URI)
+	if needUpstreamUnsubscribe && b != nil {
+		if err := b.Session.Unsubscribe(ctx, &mcp.UnsubscribeParams{URI: resolved.OriginalName}); err != nil {
+			s.logger.Warn("unsubscribe: backend call failed", "backend", b.Name, "uri", req.Params.URI, "error", err)
+			return err
+		}
+	}
+	return nil
+}
+
+// startSessionCloseWatcherOnce spawns, at most once per session, a
+// goroutine that waits for session to disconnect (session.Wait(), the same
+// technique superviseBackend already uses for backend-side disconnect
+// detection -- go-sdk has no public downstream-session-close hook) and then
+// cleans up every subscription that session held, unsubscribing upstream
+// for any URI it was the last subscriber of. Called from subscribeHandler
+// on every subscribe, but only the first call for a given session actually
+// spawns the goroutine (guarded by s.watchedSessions) -- a session that
+// subscribes to several URIs must not get one watcher goroutine per URI.
+//
+// subscribeHandler starts this watcher BEFORE calling
+// relays.Subscriptions.Subscribe, a deliberate but imperfect ordering: a
+// session that disconnects in the narrow window between the watcher
+// starting and the registry recording the subscription makes SessionClosed
+// run against a registry that doesn't yet know about it, leaking that
+// just-created entry -- reversing the order would instead open a different,
+// roughly symmetric window (the registry recording a subscription no
+// watcher is yet armed to clean up), so neither order eliminates the race.
+func (s *Server) startSessionCloseWatcherOnce(session *mcp.ServerSession) {
+	s.mu.Lock()
+	if s.watchedSessions[session] {
+		s.mu.Unlock()
+		return
+	}
+	s.watchedSessions[session] = true
+	s.mu.Unlock()
+
+	go func() {
+		_ = session.Wait()
+		toClose := s.relays.Subscriptions.SessionClosed(session)
+		for _, c := range toClose {
+			if b := s.Backend(c.BackendName); b != nil {
+				unsubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = b.Session.Unsubscribe(unsubCtx, &mcp.UnsubscribeParams{URI: c.OriginalURI})
+				cancel()
+			}
+		}
+		s.mu.Lock()
+		delete(s.watchedSessions, session)
+		s.mu.Unlock()
+	}()
 }
 
 // registerTool registers resolved.Item, falling back to the next
