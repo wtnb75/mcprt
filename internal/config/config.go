@@ -22,15 +22,15 @@ var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // Config is the top-level gateway configuration, loaded from a YAML file.
 type Config struct {
-	Listen                    ListenConfig         `yaml:"listen"`
-	Backends                  []BackendConfig      `yaml:"backends"`
-	Overrides                 map[string]string    `yaml:"overrides,omitempty"`
-	ResourceOverrides         map[string]string    `yaml:"resource_overrides,omitempty"`
-	ResourceTemplateOverrides map[string]string    `yaml:"resource_template_overrides,omitempty"`
-	PromptOverrides           map[string]string    `yaml:"prompt_overrides,omitempty"`
-	Prompts                   []StaticPromptConfig `yaml:"prompts,omitempty"`
-	Logging                   LoggingConfig        `yaml:"logging,omitempty"`
-	Timeouts                  TimeoutsConfig       `yaml:"timeouts,omitempty"`
+	Listen                    ListenConfig         `yaml:"listen" json:"listen"`
+	Backends                  []BackendConfig      `yaml:"backends" json:"backends"`
+	Overrides                 map[string]string    `yaml:"overrides,omitempty" json:"overrides,omitempty"`
+	ResourceOverrides         map[string]string    `yaml:"resource_overrides,omitempty" json:"resource_overrides,omitempty"`
+	ResourceTemplateOverrides map[string]string    `yaml:"resource_template_overrides,omitempty" json:"resource_template_overrides,omitempty"`
+	PromptOverrides           map[string]string    `yaml:"prompt_overrides,omitempty" json:"prompt_overrides,omitempty"`
+	Prompts                   []StaticPromptConfig `yaml:"prompts,omitempty" json:"prompts,omitempty"`
+	Logging                   LoggingConfig        `yaml:"logging,omitempty" json:"logging,omitempty"`
+	Timeouts                  TimeoutsConfig       `yaml:"timeouts,omitempty" json:"timeouts,omitempty"`
 }
 
 // StaticPromptConfig defines a prompt mcprt serves directly from config,
@@ -40,10 +40,10 @@ type Config struct {
 // parses Text as a template there; validateStaticPrompts below only checks
 // it parses, it doesn't keep the *template.Template around).
 type StaticPromptConfig struct {
-	Name        string                 `yaml:"name"`
-	Description string                 `yaml:"description,omitempty"`
-	Arguments   []StaticPromptArgument `yaml:"arguments,omitempty"`
-	Text        string                 `yaml:"text"`
+	Name        string                 `yaml:"name" json:"name"`
+	Description string                 `yaml:"description,omitempty" json:"description,omitempty"`
+	Arguments   []StaticPromptArgument `yaml:"arguments,omitempty" json:"arguments,omitempty"`
+	Text        string                 `yaml:"text" json:"text"`
 }
 
 // StaticPromptArgument mirrors mcp.PromptArgument's fields (Name,
@@ -51,9 +51,9 @@ type StaticPromptConfig struct {
 // than importing the mcp package here, matching how BackendConfig etc.
 // don't import mcp either.
 type StaticPromptArgument struct {
-	Name        string `yaml:"name"`
-	Description string `yaml:"description,omitempty"`
-	Required    bool   `yaml:"required,omitempty"`
+	Name        string `yaml:"name" json:"name"`
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
+	Required    bool   `yaml:"required,omitempty" json:"required,omitempty"`
 }
 
 // TimeoutsConfig overrides mcprt's built-in timeout and backoff defaults.
@@ -62,38 +62,38 @@ type StaticPromptArgument struct {
 // this struct.
 type TimeoutsConfig struct {
 	// Shutdown bounds gateway.ServeHTTP's graceful HTTP shutdown. Default 5s.
-	Shutdown Duration `yaml:"shutdown,omitempty"`
+	Shutdown Duration `yaml:"shutdown,omitempty" json:"shutdown,omitempty"`
 	// TelemetryShutdown bounds flushing OpenTelemetry on process shutdown. Default 5s.
-	TelemetryShutdown Duration `yaml:"telemetry_shutdown,omitempty"`
+	TelemetryShutdown Duration `yaml:"telemetry_shutdown,omitempty" json:"telemetry_shutdown,omitempty"`
 	// BackendConnect bounds a single backend connect attempt, and the
 	// startup window connectBackends waits for all backends to report in.
 	// Default 30s.
-	BackendConnect Duration `yaml:"backend_connect,omitempty"`
+	BackendConnect Duration `yaml:"backend_connect,omitempty" json:"backend_connect,omitempty"`
 	// ReloadDrain bounds how long a superseded hot-reload generation's
 	// backend connections are kept alive before being force-closed. Default 5m.
-	ReloadDrain Duration `yaml:"reload_drain,omitempty"`
+	ReloadDrain Duration `yaml:"reload_drain,omitempty" json:"reload_drain,omitempty"`
 	// Elicit bounds how long the server waits for a human to answer an
 	// elicitation request relayed from a backend. Default 5m.
-	Elicit Duration `yaml:"elicit,omitempty"`
+	Elicit Duration `yaml:"elicit,omitempty" json:"elicit,omitempty"`
 	// ProgressRelay bounds relaying one progress notification from a
 	// backend to the downstream client that requested it. Default 5s.
-	ProgressRelay Duration `yaml:"progress_relay,omitempty"`
+	ProgressRelay Duration `yaml:"progress_relay,omitempty" json:"progress_relay,omitempty"`
 	// BackendBackoffMin/Max bound a disconnected backend's exponential
 	// reconnect backoff. Defaults 1s/60s.
-	BackendBackoffMin Duration `yaml:"backend_backoff_min,omitempty"`
-	BackendBackoffMax Duration `yaml:"backend_backoff_max,omitempty"`
+	BackendBackoffMin Duration `yaml:"backend_backoff_min,omitempty" json:"backend_backoff_min,omitempty"`
+	BackendBackoffMax Duration `yaml:"backend_backoff_max,omitempty" json:"backend_backoff_max,omitempty"`
 	// BackendKeepAlive, if non-zero, makes every backend connection send a
 	// periodic MCP "ping" at this interval, closing the connection after
 	// BackendKeepAliveFailureThreshold consecutive failures -- which
 	// superviseBackend's existing disconnect handling then reconnects, the
 	// same as any other disconnect. Zero (the default) disables this
 	// entirely, matching mcprt's behavior before this field existed.
-	BackendKeepAlive Duration `yaml:"backend_keepalive,omitempty"`
+	BackendKeepAlive Duration `yaml:"backend_keepalive,omitempty" json:"backend_keepalive,omitempty"`
 	// BackendKeepAliveFailureThreshold is the number of consecutive
 	// keepalive ping failures tolerated before closing the connection. Has
 	// no effect unless BackendKeepAlive is non-zero. Zero defers to
 	// go-sdk's own default of 1.
-	BackendKeepAliveFailureThreshold int `yaml:"backend_keepalive_failure_threshold,omitempty"`
+	BackendKeepAliveFailureThreshold int `yaml:"backend_keepalive_failure_threshold,omitempty" json:"backend_keepalive_failure_threshold,omitempty"`
 	// DownstreamKeepAlive is BackendKeepAlive's counterpart for the other
 	// direction: if non-zero, mcprt sends a periodic MCP "ping" to every
 	// downstream client at this interval, closing that client's session
@@ -103,52 +103,52 @@ type TimeoutsConfig struct {
 	// disables this entirely. Unlike BackendKeepAlive, this is applied
 	// fresh on every SIGHUP-triggered reload too, not just at process
 	// startup -- see internal/cli's buildGateway.
-	DownstreamKeepAlive Duration `yaml:"downstream_keepalive,omitempty"`
+	DownstreamKeepAlive Duration `yaml:"downstream_keepalive,omitempty" json:"downstream_keepalive,omitempty"`
 	// DownstreamKeepAliveFailureThreshold is the number of consecutive
 	// keepalive ping failures tolerated before closing a downstream
 	// client's session. Has no effect unless DownstreamKeepAlive is
 	// non-zero. Zero defers to go-sdk's own default of 1.
-	DownstreamKeepAliveFailureThreshold int `yaml:"downstream_keepalive_failure_threshold,omitempty"`
+	DownstreamKeepAliveFailureThreshold int `yaml:"downstream_keepalive_failure_threshold,omitempty" json:"downstream_keepalive_failure_threshold,omitempty"`
 }
 
 // ListenConfig controls which client-facing transports the gateway serves.
 type ListenConfig struct {
-	Stdio bool   `yaml:"stdio,omitempty"`
-	HTTP  string `yaml:"http,omitempty"`
+	Stdio bool   `yaml:"stdio,omitempty" json:"stdio,omitempty"`
+	HTTP  string `yaml:"http,omitempty" json:"http,omitempty"`
 }
 
 // BackendConfig describes one backend MCP server to connect to.
 type BackendConfig struct {
-	Name      string            `yaml:"name"`
-	Transport string            `yaml:"transport"` // "stdio" or "http"
-	Command   []string          `yaml:"command,omitempty"`
-	Dir       string            `yaml:"dir,omitempty"`      // working directory for the stdio subprocess
-	EnvFile   string            `yaml:"env_file,omitempty"` // .env-format file merged under Env
-	Env       map[string]string `yaml:"env,omitempty"`
-	SSH       *SSHConfig        `yaml:"ssh,omitempty"`    // if set, run the stdio Command on a remote host via ssh
-	Docker    *DockerConfig     `yaml:"docker,omitempty"` // if set, run the stdio Command inside a container
-	URL       string            `yaml:"url,omitempty"`
-	Headers   map[string]string `yaml:"headers,omitempty"`
-	Proxy     string            `yaml:"proxy,omitempty"` // proxy URL for http transport; "none" disables proxying even if HTTP_PROXY etc. are set; unset follows HTTP_PROXY/HTTPS_PROXY/NO_PROXY
-	Prefix    string            `yaml:"prefix,omitempty"`
+	Name      string            `yaml:"name" json:"name"`
+	Transport string            `yaml:"transport" json:"transport"` // "stdio" or "http"
+	Command   []string          `yaml:"command,omitempty" json:"command,omitempty"`
+	Dir       string            `yaml:"dir,omitempty" json:"dir,omitempty"`           // working directory for the stdio subprocess
+	EnvFile   string            `yaml:"env_file,omitempty" json:"env_file,omitempty"` // .env-format file merged under Env
+	Env       map[string]string `yaml:"env,omitempty" json:"env,omitempty"`
+	SSH       *SSHConfig        `yaml:"ssh,omitempty" json:"ssh,omitempty"`       // if set, run the stdio Command on a remote host via ssh
+	Docker    *DockerConfig     `yaml:"docker,omitempty" json:"docker,omitempty"` // if set, run the stdio Command inside a container
+	URL       string            `yaml:"url,omitempty" json:"url,omitempty"`
+	Headers   map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+	Proxy     string            `yaml:"proxy,omitempty" json:"proxy,omitempty"` // proxy URL for http transport; "none" disables proxying even if HTTP_PROXY etc. are set; unset follows HTTP_PROXY/HTTPS_PROXY/NO_PROXY
+	Prefix    string            `yaml:"prefix,omitempty" json:"prefix,omitempty"`
 }
 
 // SSHConfig describes how to reach the remote host a stdio backend's
 // Command should be run on.
 type SSHConfig struct {
-	Host         string   `yaml:"host"` // required, e.g. "user@example.com"
-	Port         int      `yaml:"port,omitempty"`
-	IdentityFile string   `yaml:"identity_file,omitempty"` // passed as -i
-	Args         []string `yaml:"args,omitempty"`          // extra ssh arguments, e.g. ["-J", "jumphost"]
+	Host         string   `yaml:"host" json:"host"` // required, e.g. "user@example.com"
+	Port         int      `yaml:"port,omitempty" json:"port,omitempty"`
+	IdentityFile string   `yaml:"identity_file,omitempty" json:"identity_file,omitempty"` // passed as -i
+	Args         []string `yaml:"args,omitempty" json:"args,omitempty"`                   // extra ssh arguments, e.g. ["-J", "jumphost"]
 }
 
 // DockerConfig describes how to run a stdio backend's Command inside a
 // container via a docker-compatible CLI.
 type DockerConfig struct {
-	Bin   string            `yaml:"bin,omitempty"`  // docker-compatible CLI to invoke; defaults to "docker" (e.g. "podman", "nerdctl")
-	Image string            `yaml:"image"`          // required
-	Args  []string          `yaml:"args,omitempty"` // extra arguments appended to "run", e.g. ["-v", "/data:/data"]
-	Env   map[string]string `yaml:"env,omitempty"`  // env vars for the local CLI process itself (e.g. DOCKER_HOST), not the container; backends[].env is the container's env
+	Bin   string            `yaml:"bin,omitempty" json:"bin,omitempty"`   // docker-compatible CLI to invoke; defaults to "docker" (e.g. "podman", "nerdctl")
+	Image string            `yaml:"image" json:"image"`                   // required
+	Args  []string          `yaml:"args,omitempty" json:"args,omitempty"` // extra arguments appended to "run", e.g. ["-v", "/data:/data"]
+	Env   map[string]string `yaml:"env,omitempty" json:"env,omitempty"`   // env vars for the local CLI process itself (e.g. DOCKER_HOST), not the container; backends[].env is the container's env
 }
 
 // LoggingConfig controls audit-log behavior beyond what --log-level/--log-format
@@ -157,7 +157,7 @@ type LoggingConfig struct {
 	// MaskKeys are extra case-insensitive substrings matched against
 	// argument key names, in addition to the built-in defaultMaskKeyPatterns
 	// ("key", "auth", "pass", "cred", "token") gateway.maskArguments uses.
-	MaskKeys []string `yaml:"mask_keys,omitempty"`
+	MaskKeys []string `yaml:"mask_keys,omitempty" json:"mask_keys,omitempty"`
 }
 
 // Load reads and parses the config file at path.

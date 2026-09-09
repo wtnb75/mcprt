@@ -35,3 +35,8 @@ tasks:
     cmds:
       - gofmt -w .
       - go fix ./...
+
+  schema:
+    desc: regenerate config.schema.json from internal/config.Config
+    cmds:
+      - go run ./cmd/mcprt schema --force config.schema.json

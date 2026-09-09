@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/invopop/jsonschema"
 	"gopkg.in/yaml.v3"
 )
 
@@ -27,4 +28,17 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 
 func (d Duration) MarshalYAML() (any, error) {
 	return time.Duration(d).String(), nil
+}
+
+// JSONSchema overrides the schema github.com/invopop/jsonschema would
+// otherwise reflect for Duration's underlying int64 -- Duration is only
+// ever written/read as a Go duration string ("5s", "1m30s", ...), never as
+// a bare number (see UnmarshalYAML/MarshalYAML above), so its schema must
+// say "string", not "integer".
+func (d Duration) JSONSchema() *jsonschema.Schema {
+	return &jsonschema.Schema{
+		Type:        "string",
+		Pattern:     `^-?([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$`,
+		Description: `a Go time.ParseDuration string, e.g. "5s", "1m30s", "500ms"`,
+	}
 }

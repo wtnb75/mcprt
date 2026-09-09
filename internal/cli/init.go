@@ -95,6 +95,11 @@ func runInit(cmd *cobra.Command, path string, force bool) error {
 	if err != nil {
 		return fmt.Errorf("rendering config template: %w", err)
 	}
+	// Prepend the YAML Language Server modeline so the generated config
+	// gets editor validation/autocomplete (see README.md's "Editor support
+	// (JSON Schema)" section) with no extra setup -- configSchemaURL
+	// (schema.go) is the same URL config.schema.json's own $id uses.
+	data = append([]byte("# yaml-language-server: $schema="+configSchemaURL+"\n\n"), data...)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("writing %s: %w", path, err)
 	}

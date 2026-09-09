@@ -1,0 +1,279 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/wtnb75/mcprt/main/config.schema.json",
+  "$defs": {
+    "BackendConfig": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "transport": {
+          "type": "string"
+        },
+        "command": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "dir": {
+          "type": "string"
+        },
+        "env_file": {
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "ssh": {
+          "$ref": "#/$defs/SSHConfig"
+        },
+        "docker": {
+          "$ref": "#/$defs/DockerConfig"
+        },
+        "url": {
+          "type": "string"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "proxy": {
+          "type": "string"
+        },
+        "prefix": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "name",
+        "transport"
+      ]
+    },
+    "DockerConfig": {
+      "properties": {
+        "bin": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "args": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "image"
+      ]
+    },
+    "Duration": {
+      "type": "string",
+      "pattern": "^-?([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$",
+      "description": "a Go time.ParseDuration string, e.g. \"5s\", \"1m30s\", \"500ms\""
+    },
+    "ListenConfig": {
+      "properties": {
+        "stdio": {
+          "type": "boolean"
+        },
+        "http": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "LoggingConfig": {
+      "properties": {
+        "mask_keys": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "SSHConfig": {
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer"
+        },
+        "identity_file": {
+          "type": "string"
+        },
+        "args": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "host"
+      ]
+    },
+    "StaticPromptArgument": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "name"
+      ]
+    },
+    "StaticPromptConfig": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "arguments": {
+          "items": {
+            "$ref": "#/$defs/StaticPromptArgument"
+          },
+          "type": "array"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "name",
+        "text"
+      ]
+    },
+    "TimeoutsConfig": {
+      "properties": {
+        "shutdown": {
+          "$ref": "#/$defs/Duration"
+        },
+        "telemetry_shutdown": {
+          "$ref": "#/$defs/Duration"
+        },
+        "backend_connect": {
+          "$ref": "#/$defs/Duration"
+        },
+        "reload_drain": {
+          "$ref": "#/$defs/Duration"
+        },
+        "elicit": {
+          "$ref": "#/$defs/Duration"
+        },
+        "progress_relay": {
+          "$ref": "#/$defs/Duration"
+        },
+        "backend_backoff_min": {
+          "$ref": "#/$defs/Duration"
+        },
+        "backend_backoff_max": {
+          "$ref": "#/$defs/Duration"
+        },
+        "backend_keepalive": {
+          "$ref": "#/$defs/Duration"
+        },
+        "backend_keepalive_failure_threshold": {
+          "type": "integer"
+        },
+        "downstream_keepalive": {
+          "$ref": "#/$defs/Duration"
+        },
+        "downstream_keepalive_failure_threshold": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    }
+  },
+  "properties": {
+    "listen": {
+      "$ref": "#/$defs/ListenConfig"
+    },
+    "backends": {
+      "items": {
+        "$ref": "#/$defs/BackendConfig"
+      },
+      "type": "array"
+    },
+    "overrides": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "resource_overrides": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "resource_template_overrides": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "prompt_overrides": {
+      "additionalProperties": {
+        "type": "string"
+      },
+      "type": "object"
+    },
+    "prompts": {
+      "items": {
+        "$ref": "#/$defs/StaticPromptConfig"
+      },
+      "type": "array"
+    },
+    "logging": {
+      "$ref": "#/$defs/LoggingConfig"
+    },
+    "timeouts": {
+      "$ref": "#/$defs/TimeoutsConfig"
+    }
+  },
+  "additionalProperties": false,
+  "type": "object",
+  "required": [
+    "listen",
+    "backends"
+  ]
+}

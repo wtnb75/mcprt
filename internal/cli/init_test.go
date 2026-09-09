@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/wtnb75/mcprt/internal/config"
@@ -78,6 +79,31 @@ func TestInitCommand_WritesParsableConfig(t *testing.T) {
 	}
 	if len(cfg.PromptOverrides) == 0 {
 		t.Fatalf("generated config has no prompt_overrides example:\n%s", data)
+	}
+}
+
+// TestInitCommand_WritesYAMLLanguageServerModeline checks that the
+// generated config.yaml starts with a `# yaml-language-server: $schema=...`
+// comment, so opening it in an editor with YAML Language Server support
+// gets validation/autocomplete against config.schema.json with no extra
+// setup (see README.md's "Editor support (JSON Schema)" section).
+func TestInitCommand_WritesYAMLLanguageServerModeline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+
+	if err := cli.Execute(context.Background(), []string{"init", path}); err != nil {
+		t.Fatalf("Execute: unexpected error: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading generated config: %v", err)
+	}
+	firstLine, _, _ := strings.Cut(string(data), "\n")
+	if !strings.HasPrefix(firstLine, "# yaml-language-server: $schema=") {
+		t.Fatalf("first line = %q, want it to start with %q", firstLine, "# yaml-language-server: $schema=")
+	}
+	if _, err := config.Parse(data); err != nil {
+		t.Fatalf("generated config did not parse: %v\ncontent:\n%s", err, data)
 	}
 }
 
