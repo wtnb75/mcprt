@@ -2086,6 +2086,28 @@ func TestGateway_CallHandlerRoutesElicitationWhenExactlyOneCallInFlight(t *testi
 // tools/call are concurrently in flight against the same backend, that
 // backend's elicitation/create is refused (never reaches the downstream
 // client) -- mcprt cannot tell which of the two calls it belongs to.
+//
+// Both elicitation/create requests must still be in flight (Entered, not
+// yet left CallRouter) at the moment EITHER one calls Route -- otherwise
+// the race this test exists to catch disappears: if call A's entire round
+// trip (Route -> refused -> error propagated back through its tool handler
+// -> callHandler's deferred leave()) finishes before call B ever asks, only
+// B remains live when B asks, and Route correctly (per its documented
+// "exactly one in flight" contract, see call_router.go) routes B's request
+// instead of refusing it -- even though the two calls were concurrent from
+// this test's point of view. The elicitArrived/releaseElicit barrier below
+// makes that window airtight instead of relying on the two goroutines
+// happening to be scheduled closely enough together: both OnElicit
+// invocations (which the jsonrpc2 layer always dispatches onto separate
+// goroutines for calls -- ClientSession.handle calls jsonrpc2.Async for
+// every incoming call, not just notifications) must reach the barrier --
+// meaning neither has returned, so neither has left CallRouter yet --
+// before either is released to call Route. This originally flaked under CI
+// (but not in hundreds of local runs):
+// https://github.com/wtnb75/mcprt/actions/runs/34346599681 failed with
+// "call 0: got no error", i.e. exactly this race resolved the wrong way; a
+// CallRouter-level repro (Enter both, Route+leave one, then Route the
+// other) confirmed the mechanism directly during debugging.
 func TestGateway_CallHandlerRefusesAmbiguousElicitation(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -2104,8 +2126,12 @@ func TestGateway_CallHandlerRefusesAmbiguousElicitation(t *testing.T) {
 		})
 
 	callRouter := gateway.NewCallRouter()
+	elicitArrived := make(chan struct{}, 2)
+	releaseElicit := make(chan struct{})
 	cb := backend.ChangeCallbacks{
 		OnElicit: func(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			elicitArrived <- struct{}{}
+			<-releaseElicit // see the barrier comment above TestGateway_CallHandlerRefusesAmbiguousElicitation
 			session, err := callRouter.Route("backend-a")
 			if err != nil {
 				return nil, err
@@ -2168,6 +2194,11 @@ func TestGateway_CallHandlerRefusesAmbiguousElicitation(t *testing.T) {
 	<-started
 	<-started // both tool handlers are now past elicit.Enter and blocked before calling Elicit
 	close(proceed)
+
+	<-elicitArrived
+	<-elicitArrived // both elicitation/create requests have now arrived and are blocked before calling Route -- neither has left CallRouter yet
+	close(releaseElicit)
+
 	wg.Wait()
 
 	for i, err := range results {
