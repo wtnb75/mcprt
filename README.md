@@ -15,6 +15,8 @@ design, including the config file format and conflict-resolution rules.
 
 Minimal example:
 
+    # yaml-language-server: $schema=https://raw.githubusercontent.com/wtnb75/mcprt/main/config.schema.json
+
     listen:
       stdio: true
       http: "127.0.0.1:8080"
@@ -248,6 +250,37 @@ connection regardless of those environment variables.
 v1 has no built-in gateway authentication, so keep `listen.http` bound to
 localhost or a trusted network and put a reverse proxy (or equivalent) in
 front of it before exposing it any further.
+
+### Editor support (JSON Schema)
+
+`config.schema.json` (repo root) is a JSON Schema for the config file
+format, reflected directly from `internal/config.Config` (`mcprt schema`
+regenerates it; `task schema` writes it back to `config.schema.json`, and a
+test in `internal/cli` fails if the committed file drifts from the struct
+it's reflected from). Adding the modeline comment shown in the example
+above to a `config.yaml` gets live validation and autocomplete in any
+editor with YAML Language Server support (VS Code's `redhat.vscode-yaml`
+extension, several JetBrains IDEs, ...): missing required fields, typos in
+a key name (`additionalProperties: false` at every level), and a
+`timeouts.*` value that isn't a valid duration string all get flagged
+before you ever run `mcprt validate`. The schema does not (yet) express
+`transport`-conditional rules such as "`command` is required for `stdio`
+but invalid for `http`" -- those stay `mcprt validate`-only for now.
+
+The schema is necessarily a subset of what `mcprt validate`/`mcprt server`
+actually enforce: it has no way to express "an `overrides` value must name
+a backend that exists," "`prompts[].name` must be unique," or "`prompts[].
+text` must parse as a Go template" -- those stay Go-side, in
+`internal/config`'s `validate`.
+
+`mcprt init` writes the modeline comment into the config.yaml it
+generates, so a fresh config gets editor support without any extra setup.
+
+The modeline points at `config.schema.json` on the `main` branch (there
+are no tagged releases yet, so that's the only stable URL available today);
+once releases exist, an older `mcprt` binary's config format could drift
+from `main`'s schema, and pinning to a release tag (or serving a
+schema per version) would be worth revisiting then.
 
 ## Container health checks
 
