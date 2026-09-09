@@ -741,6 +741,154 @@ prompts:
 	}
 }
 
+func TestParse_StaticPromptSkillFile(t *testing.T) {
+	skillFile := filepath.Join(t.TempDir(), "SKILL.md")
+	writeFile(t, skillFile, "---\nname: greet\ndescription: greets someone\n---\nhello {{.user}}\n")
+
+	data := fmt.Appendf(nil, `
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - skill_file: %q
+    arguments:
+      - name: user
+        required: true
+`, skillFile)
+
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	p := cfg.Prompts[0]
+	if p.Name != "greet" {
+		t.Fatalf("Prompts[0].Name = %q, want %q (from skill_file front matter)", p.Name, "greet")
+	}
+	if p.Description != "greets someone" {
+		t.Fatalf("Prompts[0].Description = %q, want %q (from skill_file front matter)", p.Description, "greets someone")
+	}
+	if p.Text != "hello {{.user}}\n" {
+		t.Fatalf("Prompts[0].Text = %q, want %q (skill_file body after front matter)", p.Text, "hello {{.user}}\n")
+	}
+	if len(p.Arguments) != 1 || p.Arguments[0].Name != "user" || !p.Arguments[0].Required {
+		t.Fatalf("Prompts[0].Arguments = %+v, want one required argument named \"user\" (from config.yaml, not skill_file)", p.Arguments)
+	}
+}
+
+func TestParse_StaticPromptSkillFileConfigOverrides(t *testing.T) {
+	skillFile := filepath.Join(t.TempDir(), "SKILL.md")
+	writeFile(t, skillFile, "---\nname: greet\ndescription: greets someone\n---\nhello {{.user}}\n")
+
+	data := fmt.Appendf(nil, `
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - skill_file: %q
+    name: renamed
+    description: overridden description
+    text: "overridden text"
+`, skillFile)
+
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	p := cfg.Prompts[0]
+	if p.Name != "renamed" || p.Description != "overridden description" || p.Text != "overridden text" {
+		t.Fatalf("Prompts[0] = %+v, want config.yaml's explicit name/description/text to win over skill_file", p)
+	}
+}
+
+func TestParse_StaticPromptSkillFileNoFrontMatter(t *testing.T) {
+	skillFile := filepath.Join(t.TempDir(), "prompt.txt")
+	writeFile(t, skillFile, "just a plain prompt body, no front matter\n")
+
+	data := fmt.Appendf(nil, `
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - skill_file: %q
+    name: plain
+`, skillFile)
+
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got, want := cfg.Prompts[0].Text, "just a plain prompt body, no front matter\n"; got != want {
+		t.Fatalf("Prompts[0].Text = %q, want %q (whole file used as text when there's no front matter)", got, want)
+	}
+}
+
+func TestParse_StaticPromptSkillFileMissing(t *testing.T) {
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - skill_file: /nonexistent/does-not-exist/SKILL.md
+`)
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for missing skill_file, got nil")
+	}
+}
+
+func TestParse_StaticPromptSkillFileInvalidFrontMatter(t *testing.T) {
+	skillFile := filepath.Join(t.TempDir(), "SKILL.md")
+	writeFile(t, skillFile, "---\nname: [unterminated\n---\nbody\n")
+
+	data := fmt.Appendf(nil, `
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - skill_file: %q
+`, skillFile)
+
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for unparseable skill_file front matter, got nil")
+	}
+}
+
+func TestParse_StaticPromptSkillFileHomeExpansion(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, "skills"), 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	writeFile(t, filepath.Join(home, "skills", "SKILL.md"), "---\nname: fromhome\n---\nhi\n")
+
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - skill_file: "~/skills/SKILL.md"
+`)
+
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got, want := cfg.Prompts[0].Name, "fromhome"; got != want {
+		t.Fatalf("Prompts[0].Name = %q, want %q (skill_file: \"~/...\" should expand to $HOME)", got, want)
+	}
+}
+
 func TestParse_LoggingMaskKeys(t *testing.T) {
 	data := []byte(`
 backends:

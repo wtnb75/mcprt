@@ -86,6 +86,10 @@ Minimal example:
           Summarize the following diff as release notes:
 
           {{.diff}}
+      - skill_file: ~/.claude/skills/code-review/SKILL.md
+        arguments:
+          - name: diff
+            required: true
 
     logging:
       mask_keys: ["internal_id"] # extra key-name substrings to mask in the audit log, in addition to the built-in key/auth/pass/cred/token patterns
@@ -144,6 +148,22 @@ declared in `arguments`) renders as an empty string. A `prompts` entry's
 `name` always wins a collision with a same-named prompt from a backend --
 unlike `overrides`/`prompt_overrides`, this isn't configurable, and mcprt
 logs a warning at startup when it happens.
+
+Writing a long `text` inline in YAML gets unwieldy fast, so a `prompts` entry
+can instead point `skill_file` at a file, read once at config-load time (so
+`mcprt validate`/startup/SIGHUP reload all catch a missing file or bad
+front matter the same way they catch any other misconfiguration). A leading
+`~/` is expanded to the user's home directory; any other relative path
+resolves against mcprt's working directory. If the file starts with a
+`---`-delimited YAML front matter block -- the same convention
+[Claude Code skills](https://docs.claude.com/en/docs/agents-and-tools/agent-skills)'
+`SKILL.md` files use -- its `name`/`description` seed the prompt's
+`name`/`description` and the Markdown body after it becomes `text`; a file
+with no front matter is used as `text` in full. Fields set directly on the
+`prompts` entry (`name`, `description`, `text`, and always `arguments`,
+which no front matter carries) take priority over the file, so one entry
+can point at a shared `SKILL.md` while still adding `arguments` or
+overriding any of the other fields locally.
 
 Client support for MCP's `prompts` feature (invoking `prompts/get`,
 typically surfaced as a slash command) varies widely between clients and
