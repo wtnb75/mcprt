@@ -1,7 +1,9 @@
 package cli_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -84,9 +86,11 @@ func TestInitCommand_WritesParsableConfig(t *testing.T) {
 
 // TestInitCommand_WritesYAMLLanguageServerModeline checks that the
 // generated config.yaml starts with a `# yaml-language-server: $schema=...`
-// comment, so opening it in an editor with YAML Language Server support
-// gets validation/autocomplete against config.schema.json with no extra
-// setup (see README.md's "Editor support (JSON Schema)" section).
+// comment pointing at the exact URL config.schema.json's own $id uses --
+// not just any URL, so a future edit that moved the two out of sync (one
+// updated, one not) fails this test instead of silently shipping a
+// modeline that points at the wrong schema. See README.md's "Editor
+// support (JSON Schema)" section.
 func TestInitCommand_WritesYAMLLanguageServerModeline(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 
@@ -98,12 +102,31 @@ func TestInitCommand_WritesYAMLLanguageServerModeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading generated config: %v", err)
 	}
-	firstLine, _, _ := strings.Cut(string(data), "\n")
-	if !strings.HasPrefix(firstLine, "# yaml-language-server: $schema=") {
-		t.Fatalf("first line = %q, want it to start with %q", firstLine, "# yaml-language-server: $schema=")
-	}
 	if _, err := config.Parse(data); err != nil {
 		t.Fatalf("generated config did not parse: %v\ncontent:\n%s", err, data)
+	}
+
+	var schemaOut bytes.Buffer
+	root := cli.NewRootCmd()
+	root.SetOut(&schemaOut)
+	root.SetArgs([]string{"schema"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("Execute schema: unexpected error: %v", err)
+	}
+	var schema struct {
+		ID string `json:"$id"`
+	}
+	if err := json.Unmarshal(schemaOut.Bytes(), &schema); err != nil {
+		t.Fatalf("schema output is not valid JSON: %v", err)
+	}
+	if schema.ID == "" {
+		t.Fatal(`mcprt schema output has an empty "$id"`)
+	}
+
+	wantLine := "# yaml-language-server: $schema=" + schema.ID
+	firstLine, _, _ := strings.Cut(string(data), "\n")
+	if firstLine != wantLine {
+		t.Fatalf("first line = %q, want %q", firstLine, wantLine)
 	}
 }
 

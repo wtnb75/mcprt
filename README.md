@@ -276,6 +276,12 @@ text` must parse as a Go template" -- those stay Go-side, in
 `mcprt init` writes the modeline comment into the config.yaml it
 generates, so a fresh config gets editor support without any extra setup.
 
+The modeline points at `config.schema.json` on the `main` branch (there
+are no tagged releases yet, so that's the only stable URL available today);
+once releases exist, an older `mcprt` binary's config format could drift
+from `main`'s schema, and pinning to a release tag (or serving a
+schema per version) would be worth revisiting then.
+
 ## Container health checks
 
 `mcprt server` with `listen.http` set answers `GET /healthz` with a bare
