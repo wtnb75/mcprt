@@ -5,7 +5,9 @@ import (
 	"maps"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"text/template"
 	"time"
 
@@ -39,11 +41,19 @@ type Config struct {
 // this at gateway-construction time (internal/cli's buildStaticPrompts
 // parses Text as a template there; validateStaticPrompts below only checks
 // it parses, it doesn't keep the *template.Template around).
+//
+// SkillFile, when set, is resolved by expandSkillFiles (called from Parse,
+// before validation) into Name/Description/Text -- whichever of those three
+// fields is still empty after that. A field set here in config.yaml always
+// wins over the skill_file's front matter/body, so a single entry can
+// override any of them, or add Arguments (which a SKILL.md's front matter
+// doesn't carry), without touching the file.
 type StaticPromptConfig struct {
-	Name        string                 `yaml:"name" json:"name"`
+	Name        string                 `yaml:"name,omitempty" json:"name,omitempty"`
 	Description string                 `yaml:"description,omitempty" json:"description,omitempty"`
 	Arguments   []StaticPromptArgument `yaml:"arguments,omitempty" json:"arguments,omitempty"`
-	Text        string                 `yaml:"text" json:"text"`
+	Text        string                 `yaml:"text,omitempty" json:"text,omitempty"`
+	SkillFile   string                 `yaml:"skill_file,omitempty" json:"skill_file,omitempty"`
 }
 
 // StaticPromptArgument mirrors mcp.PromptArgument's fields (Name,
@@ -186,10 +196,101 @@ func Parse(data []byte) (*Config, error) {
 	if err := mergeEnvFiles(&cfg); err != nil {
 		return nil, err
 	}
+	if err := expandSkillFiles(cfg.Prompts); err != nil {
+		return nil, err
+	}
 	if err := validate(&cfg); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// skillFrontMatter is the subset of a SKILL.md's YAML front matter
+// expandSkillFiles understands -- the two fields Anthropic's SKILL.md format
+// defines (https://docs.claude.com/en/docs/agents-and-tools/agent-skills).
+type skillFrontMatter struct {
+	Name        string `yaml:"name"`
+	Description string `yaml:"description"`
+}
+
+// expandSkillFiles reads each prompt's SkillFile (if set) and fills in
+// Name/Description/Text from it, leaving any field the config.yaml entry
+// already set untouched -- config.yaml always wins over the file, per
+// StaticPromptConfig's doc comment. It runs from Parse before validate, so a
+// missing file, unreadable front matter, or (via validateStaticPrompts,
+// unchanged) a still-empty name/text after expansion all fail config
+// loading the same way every other misconfiguration here does.
+func expandSkillFiles(prompts []StaticPromptConfig) error {
+	for i := range prompts {
+		p := &prompts[i]
+		if p.SkillFile == "" {
+			continue
+		}
+		path, err := expandHome(p.SkillFile)
+		if err != nil {
+			return fmt.Errorf("prompts: skill_file %q: %w", p.SkillFile, err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("prompts: skill_file %q: %w", p.SkillFile, err)
+		}
+		name, description, body, err := parseSkillFile(data)
+		if err != nil {
+			return fmt.Errorf("prompts: skill_file %q: %w", p.SkillFile, err)
+		}
+		if p.Name == "" {
+			p.Name = name
+		}
+		if p.Description == "" {
+			p.Description = description
+		}
+		if p.Text == "" {
+			p.Text = body
+		}
+	}
+	return nil
+}
+
+// parseSkillFile splits SKILL.md-style content into its YAML front matter
+// (delimited by a leading and trailing "---" line) and Markdown body. A file
+// with no leading "---" line has no front matter -- its entire content
+// becomes the body, so a plain-text prompt file also works as a skill_file.
+func parseSkillFile(data []byte) (name, description, body string, err error) {
+	const delim = "---\n"
+	text := string(data)
+	if !strings.HasPrefix(text, delim) {
+		return "", "", text, nil
+	}
+	rest := text[len(delim):]
+	end := strings.Index(rest, "\n---")
+	if end < 0 {
+		return "", "", text, nil
+	}
+	var fm skillFrontMatter
+	if err := yaml.Unmarshal([]byte(rest[:end]), &fm); err != nil {
+		return "", "", "", fmt.Errorf("parse front matter: %w", err)
+	}
+	body = strings.TrimPrefix(rest[end+len("\n---"):], "\n")
+	return fm.Name, fm.Description, body, nil
+}
+
+// expandHome expands a leading "~" (home-directory shorthand) in path, e.g.
+// "~/.claude/skills/foo/SKILL.md" -- unlike a shell, os.ReadFile does not do
+// this itself. A path without a leading "~" is returned unchanged and
+// resolves against the process's current working directory, same as every
+// other file path config.Parse reads (env_file, ssh identity_file, ...).
+func expandHome(path string) (string, error) {
+	if path != "~" && !strings.HasPrefix(path, "~/") {
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("expand ~: %w", err)
+	}
+	if path == "~" {
+		return home, nil
+	}
+	return filepath.Join(home, path[len("~/"):]), nil
 }
 
 // mergeEnvFiles reads each backend's EnvFile (if set) and merges it into

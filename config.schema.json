@@ -171,14 +171,13 @@
         },
         "text": {
           "type": "string"
+        },
+        "skill_file": {
+          "type": "string"
         }
       },
       "additionalProperties": false,
-      "type": "object",
-      "required": [
-        "name",
-        "text"
-      ]
+      "type": "object"
     },
     "TimeoutsConfig": {
       "properties": {
