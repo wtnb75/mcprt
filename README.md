@@ -176,18 +176,22 @@ on its entry -- `name`/`description`/`text`/`skill_file`/`arguments` are all
 rejected alongside it, since one entry now expands into many prompts rather
 than describing a single one; give each file its own front matter `name`/
 `description` instead. `arguments` is not available for a `skill_dir`
-prompt at all (SKILL.md's front matter format has no field for it) -- use
-`skill_file` if a prompt needs `required: true` arguments.
+prompt at all -- use `skill_file` if a prompt needs `required: true` arguments.
 
 Unlike `skill_file`, `skill_dir`'s contents are watched live while `mcprt
 server` is running: adding, editing, or removing a `*.md` file under it
 updates `prompts/list` (and sends `notifications/prompts/list_changed` to
 every connected client) within about 300ms, without a SIGHUP or restart --
 and, unlike SIGHUP-triggered config reload, this applies equally to stdio
-and HTTP sessions. A name any other `prompts` entry already serves (a fixed
-entry, or another `skill_dir`) is never taken over; the earlier entry
-(higher up in `prompts:`) keeps winning, and the conflicting file is logged
-and ignored until the name-holder changes. A file that fails to parse (bad
+and HTTP sessions. At config-load time (`mcprt validate`/startup/SIGHUP reload),
+any name collision across every source is a hard error, so priority ordering
+is never actually tested there. Once mcprt is running, a name a `skill_dir`
+newly introduces that no other currently-registered source already holds is
+claimed by whichever source's watcher scans it first — not necessarily
+whichever is listed earlier in `prompts:`. A file that loses this race is
+logged and skipped, and is only reconsidered when that specific file itself
+changes (or the server restarts / gets a SIGHUP reload) — not automatically
+when the name's current holder later goes away. A file that fails to parse (bad
 front matter, or a body that isn't a valid template) is logged and skipped
 without disturbing the directory's other prompts -- but this leniency is
 runtime-only: a `skill_dir` with a bad file already in place at `mcprt
