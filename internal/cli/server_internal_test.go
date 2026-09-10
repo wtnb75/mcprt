@@ -1111,6 +1111,44 @@ func TestBuildGateway_StaticPromptServesConfiguredText(t *testing.T) {
 	}
 }
 
+func TestBuildGateway_SkillDirPicksUpRuntimeFileChanges(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "greet.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Listen:  config.ListenConfig{Stdio: true},
+		Prompts: []config.StaticPromptConfig{{SkillDir: dir}},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	srv, err := buildGateway(ctx, logger, cfg)
+	if err != nil {
+		t.Fatalf("buildGateway: %v", err)
+	}
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if _, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "greet"}); err != nil {
+		t.Fatalf("GetPrompt(greet): %v, want it registered from the initial scan", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "farewell.md"), []byte("bye\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitForPromptPresence(t, ctx, session, "farewell", true)
+}
+
 func TestBuildGateway_StaticPromptTemplateErrorFailsBuild(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 

@@ -370,7 +370,7 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 		gateway.LogEvent(ctx, logger, slog.LevelWarn, gateway.EventNameConflict, "kind", "prompt", "name", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
 
-	staticPrompts, _, err := buildStaticPrompts(cfg.Prompts)
+	staticPrompts, dirScans, err := buildStaticPrompts(cfg.Prompts)
 	if err != nil {
 		return nil, err
 	}
@@ -403,6 +403,19 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 		KeepAliveFailureThreshold: cfg.Timeouts.DownstreamKeepAliveFailureThreshold,
 	})
 	gwH.ptr.Store(srv)
+
+	// Each skill_dir entry gets its own live-update watcher, scoped to this
+	// generation's ctx: a SIGHUP-triggered reload's new generation builds
+	// its own fresh watcher (seeded from ITS OWN initial scan, above), and
+	// this one stops when ctx is cancelled on this generation's supersession
+	// (see watchSIGHUP/scheduleDrain) -- the same lifecycle backend
+	// supervisors already follow.
+	for i, p := range cfg.Prompts {
+		if p.SkillDir == "" {
+			continue
+		}
+		go watchSkillDir(ctx, logger, p.SkillDir, i, dirScans[i], srv)
+	}
 
 	return srv, nil
 }
