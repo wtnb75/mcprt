@@ -676,6 +676,84 @@ func TestConnectBackend_ConcurrentWithUpdateToolsDoesNotRace(t *testing.T) {
 	wg.Wait()
 }
 
+func TestUpdateDirPrompts_AddsAndRemovesByDiff(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := gateway.New(gateway.NewConfig{Logger: logger, Backends: map[string]*backend.Backend{}})
+
+	first, err := gateway.NewStaticPrompt("alpha", "", nil, "alpha text")
+	if err != nil {
+		t.Fatalf("NewStaticPrompt: %v", err)
+	}
+	first.EntryIndex = 0
+	srv.UpdateDirPrompts(0, []*gateway.StaticPrompt{first}, nil)
+
+	second, err := gateway.NewStaticPrompt("beta", "", nil, "beta text")
+	if err != nil {
+		t.Fatalf("NewStaticPrompt: %v", err)
+	}
+	second.EntryIndex = 0
+	srv.UpdateDirPrompts(0, []*gateway.StaticPrompt{second}, []string{"alpha"})
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+	ctx := context.Background()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if _, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "beta"}); err != nil {
+		t.Fatalf("GetPrompt(beta): %v, want it registered", err)
+	}
+	if _, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "alpha"}); err == nil {
+		t.Fatal("GetPrompt(alpha) succeeded, want an error: it should have been removed")
+	}
+}
+
+func TestUpdateDirPrompts_SkipsNameOwnedByAnotherEntry(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	fixed, err := gateway.NewStaticPrompt("shared", "", nil, "fixed entry's text")
+	if err != nil {
+		t.Fatalf("NewStaticPrompt: %v", err)
+	}
+	fixed.EntryIndex = 0
+
+	srv := gateway.New(gateway.NewConfig{
+		Logger:        logger,
+		Backends:      map[string]*backend.Backend{},
+		StaticPrompts: []*gateway.StaticPrompt{fixed},
+	})
+
+	dirVersion, err := gateway.NewStaticPrompt("shared", "", nil, "skill_dir's text, must be rejected")
+	if err != nil {
+		t.Fatalf("NewStaticPrompt: %v", err)
+	}
+	dirVersion.EntryIndex = 1
+	srv.UpdateDirPrompts(1, []*gateway.StaticPrompt{dirVersion}, nil)
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+	ctx := context.Background()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	res, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "shared"})
+	if err != nil {
+		t.Fatalf("GetPrompt(shared): %v", err)
+	}
+	text, ok := res.Messages[0].Content.(*mcp.TextContent)
+	if !ok || text.Text != "fixed entry's text" {
+		t.Fatalf("GetPrompt(shared) content = %+v, want the fixed entry's text (entry 0 must keep winning over entry 1)", res.Messages[0].Content)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

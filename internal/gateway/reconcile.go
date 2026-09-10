@@ -259,7 +259,7 @@ func (s *Server) updatePromptsLocked(backendName string, items []*mcp.Prompt, re
 	newTable := router.Resolve(s.promptEntries, PromptNameOf, PromptRename, s.promptOverrides)
 
 	for name := range s.promptTable.Items {
-		if s.staticPromptNames[name] {
+		if _, ok := s.promptOwner[name]; ok {
 			continue // never registered from the table in the first place; RemovePrompts would incorrectly drop the static prompt
 		}
 		if _, ok := newTable.Items[name]; !ok {
@@ -267,7 +267,7 @@ func (s *Server) updatePromptsLocked(backendName string, items []*mcp.Prompt, re
 		}
 	}
 	for name, resolved := range newTable.Items {
-		if s.staticPromptNames[name] {
+		if _, ok := s.promptOwner[name]; ok {
 			continue // a static config prompt always wins; never register a backend's version under this name
 		}
 		old, ok := s.promptTable.Items[name]
@@ -283,6 +283,42 @@ func (s *Server) updatePromptsLocked(backendName string, items []*mcp.Prompt, re
 	logNewConflicts(s.logger, "prompt", s.promptTable.Conflicts, newTable.Conflicts)
 
 	s.promptTable = newTable
+}
+
+// UpdateDirPrompts applies a skill_dir rescan's diff to the live server:
+// added holds the *StaticPrompt values to (re)register (already
+// EntryIndex-tagged), removed holds the prompt names entryIndex's directory
+// no longer produces. Both are computed by the caller (internal/cli's
+// watchSkillDir) by diffing its own record of what that directory scanned
+// last time -- this method's only added responsibility is the cross-entry
+// ownership check: a name already owned by a DIFFERENT entryIndex (a
+// higher-priority skill_dir, or a fixed prompts: entry -- unreachable at
+// config-load time thanks to validateStaticPrompts' global duplicate check,
+// but only ever unreachable AT LOAD time; two directories can still
+// introduce the same new name purely at runtime, which this guards against)
+// is skipped and logged rather than stolen. AddPrompt/RemovePrompts on
+// s.mcp trigger go-sdk's own notifications/prompts/list_changed to every
+// downstream client -- there is no separate notification step here.
+func (s *Server) UpdateDirPrompts(entryIndex int, added []*StaticPrompt, removed []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, name := range removed {
+		if s.promptOwner[name] == entryIndex {
+			delete(s.promptOwner, name)
+			s.mcp.RemovePrompts(name)
+		}
+	}
+	for _, sp := range added {
+		name := sp.Prompt.Name
+		if owner, ok := s.promptOwner[name]; ok && owner != entryIndex {
+			s.logger.Warn("skill_dir: prompt name claimed by another source, skipping",
+				"name", name, "entry_index", entryIndex, "owner_entry_index", owner)
+			continue
+		}
+		s.mcp.AddPrompt(sp.Prompt, staticPromptHandler(s.logger, s.maskKeys, sp))
+		s.promptOwner[name] = entryIndex
+	}
 }
 
 // upsertEntry is replaceEntry's counterpart for a backend connecting: it
