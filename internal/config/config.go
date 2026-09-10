@@ -309,6 +309,48 @@ func ScanSkillDir(dir string) ([]StaticPromptConfig, error) {
 	return out, nil
 }
 
+// SkillFileError records one file ScanSkillDirLenient could not use --
+// either it failed to read/parse, or its name duplicated an
+// alphabetically-earlier file's in the same directory.
+type SkillFileError struct {
+	File string
+	Err  error
+}
+
+func (e SkillFileError) Error() string { return fmt.Sprintf("%s: %v", e.File, e.Err) }
+
+// ScanSkillDirLenient is ScanSkillDir's tolerant counterpart, for a live
+// rescan while mcprt is already running (see internal/cli's
+// watchSkillDir): a file that fails to read/parse, or whose name duplicates
+// an earlier file's (files are processed in listSkillDirFiles' sorted
+// order, so "earlier" means alphabetically first), is excluded from prompts
+// and reported via skipped instead of aborting the whole scan -- one bad
+// edit must not take down every other prompt the directory serves. err is
+// non-nil only for a directory-level failure (the directory itself can't be
+// listed), which the runtime path treats as "keep whatever was registered
+// before, try again next event" rather than clearing anything.
+func ScanSkillDirLenient(dir string) (prompts []StaticPromptConfig, skipped []SkillFileError, err error) {
+	files, err := listSkillDirFiles(dir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("skill_dir %q: %w", dir, err)
+	}
+	seenBy := make(map[string]string, len(files)) // prompt name -> file that already claimed it
+	for _, name := range files {
+		p, perr := parseSkillDirFile(dir, name)
+		if perr != nil {
+			skipped = append(skipped, SkillFileError{File: name, Err: perr})
+			continue
+		}
+		if first, dup := seenBy[p.Name]; dup {
+			skipped = append(skipped, SkillFileError{File: name, Err: fmt.Errorf("duplicate name %q (already used by %q)", p.Name, first)})
+			continue
+		}
+		seenBy[p.Name] = name
+		prompts = append(prompts, p)
+	}
+	return prompts, skipped, nil
+}
+
 // listSkillDirFiles returns dir's direct-child *.md filenames (not full
 // paths), in the sorted order os.ReadDir already guarantees.
 func listSkillDirFiles(dir string) ([]string, error) {

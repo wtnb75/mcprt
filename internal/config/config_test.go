@@ -1291,3 +1291,43 @@ timeouts:
 		t.Fatal("Parse: expected error for negative downstream_keepalive_failure_threshold, got nil")
 	}
 }
+
+func TestScanSkillDirLenient_SkipsUnparseableFileAndKeepsOthers(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "good.md"), "---\nname: good\n---\nfine\n")
+	writeFile(t, filepath.Join(dir, "bad.md"), "---\nname: [this is not valid yaml\n---\nbroken front matter\n")
+
+	prompts, skipped, err := config.ScanSkillDirLenient(dir)
+	if err != nil {
+		t.Fatalf("ScanSkillDirLenient: %v", err)
+	}
+	if len(prompts) != 1 || prompts[0].Name != "good" {
+		t.Fatalf("prompts = %+v, want exactly the \"good\" entry", prompts)
+	}
+	if len(skipped) != 1 || skipped[0].File != "bad.md" {
+		t.Fatalf("skipped = %+v, want exactly one entry for bad.md", skipped)
+	}
+}
+
+func TestScanSkillDirLenient_DuplicateNameKeepsAlphabeticallyFirstFile(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "a-first.md"), "---\nname: dup\n---\nfrom a-first\n")
+	writeFile(t, filepath.Join(dir, "b-second.md"), "---\nname: dup\n---\nfrom b-second\n")
+
+	prompts, skipped, err := config.ScanSkillDirLenient(dir)
+	if err != nil {
+		t.Fatalf("ScanSkillDirLenient: %v", err)
+	}
+	if len(prompts) != 1 || prompts[0].Text != "from a-first\n" {
+		t.Fatalf("prompts = %+v, want exactly one entry with text from a-first.md (alphabetically first)", prompts)
+	}
+	if len(skipped) != 1 || skipped[0].File != "b-second.md" {
+		t.Fatalf("skipped = %+v, want b-second.md reported as skipped", skipped)
+	}
+}
+
+func TestScanSkillDirLenient_MissingDirectoryReturnsError(t *testing.T) {
+	if _, _, err := config.ScanSkillDirLenient(filepath.Join(t.TempDir(), "does-not-exist")); err == nil {
+		t.Fatal("ScanSkillDirLenient: expected error for missing directory, got nil")
+	}
+}
