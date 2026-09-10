@@ -225,13 +225,29 @@ type skillFrontMatter struct {
 // expandSkillFiles reads each prompt's SkillFile (if set) and fills in
 // Name/Description/Text from it, leaving any field the config.yaml entry
 // already set untouched -- config.yaml always wins over the file, per
-// StaticPromptConfig's doc comment. It runs from Parse before validate, so a
-// missing file, unreadable front matter, or (via validateStaticPrompts,
+// StaticPromptConfig's doc comment. It also resolves a leading "~" in
+// SkillDir (if set), writing the resolved absolute path back into
+// p.SkillDir in place -- matching the same expandHome treatment SkillFile
+// gets, and matching README.md's claim that skill_dir is "parsed the same
+// ... way skill_file is." It runs from Parse before validate, so a missing
+// file/directory, unreadable front matter, or (via validateStaticPrompts,
 // unchanged) a still-empty name/text after expansion all fail config
-// loading the same way every other misconfiguration here does.
+// loading the same way every other misconfiguration here does. Resolving
+// SkillDir here -- rather than inside ScanSkillDir itself -- ensures every
+// downstream consumer of cfg.Prompts (validateStaticPrompts' and
+// internal/cli's buildStaticPrompts' ScanSkillDir calls, and internal/cli's
+// watchSkillDir, whose fsnotify.Watcher.Add needs a real filesystem path)
+// all see the same already-resolved path.
 func expandSkillFiles(prompts []StaticPromptConfig) error {
 	for i := range prompts {
 		p := &prompts[i]
+		if p.SkillDir != "" {
+			path, err := expandHome(p.SkillDir)
+			if err != nil {
+				return fmt.Errorf("prompts: skill_dir %q: %w", p.SkillDir, err)
+			}
+			p.SkillDir = path
+		}
 		if p.SkillFile == "" {
 			continue
 		}

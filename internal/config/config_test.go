@@ -889,6 +889,43 @@ prompts:
 	}
 }
 
+// TestParse_StaticPromptSkillDirHomeExpansion is skill_file's
+// TestParse_StaticPromptSkillFileHomeExpansion counterpart for skill_dir:
+// README.md's own example config uses "skill_dir: ~/.claude/skills/..." and
+// claims skill_dir is parsed the same way skill_file is (including "~/"
+// expansion) -- this proves expandSkillFiles actually resolves SkillDir in
+// place, not just SkillFile, before validateStaticPrompts' ScanSkillDir call
+// (which would otherwise fail on the literal "~/..." path, since it doesn't
+// exist relative to the working directory).
+func TestParse_StaticPromptSkillDirHomeExpansion(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	subdir := filepath.Join(home, "some", "subdir")
+	if err := os.MkdirAll(subdir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	writeFile(t, filepath.Join(subdir, "greet.md"), "---\nname: greet\n---\nhello\n")
+
+	data := []byte(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - skill_dir: "~/some/subdir"
+`)
+
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got, want := cfg.Prompts[0].SkillDir, subdir; got != want {
+		t.Fatalf("Prompts[0].SkillDir = %q, want %q (skill_dir: \"~/...\" should expand to $HOME)", got, want)
+	}
+}
+
 func TestScanSkillDir_ParsesFrontMatterAndFallsBackToFilename(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "with-front-matter.md"), "---\nname: greet\ndescription: greets someone\n---\nhello {{.user}}\n")
