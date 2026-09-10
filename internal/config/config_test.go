@@ -889,6 +889,136 @@ prompts:
 	}
 }
 
+func TestScanSkillDir_ParsesFrontMatterAndFallsBackToFilename(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "with-front-matter.md"), "---\nname: greet\ndescription: greets someone\n---\nhello {{.user}}\n")
+	writeFile(t, filepath.Join(dir, "no-front-matter.md"), "just a plain prompt body\n")
+	writeFile(t, filepath.Join(dir, "ignored.txt"), "not markdown, must be skipped\n")
+	if err := os.Mkdir(filepath.Join(dir, "subdir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "subdir", "nested.md"), "must be ignored: skill_dir is non-recursive\n")
+
+	prompts, err := config.ScanSkillDir(dir)
+	if err != nil {
+		t.Fatalf("ScanSkillDir: %v", err)
+	}
+	if len(prompts) != 2 {
+		t.Fatalf("ScanSkillDir returned %d prompts, want 2 (subdir and .txt must be excluded): %+v", len(prompts), prompts)
+	}
+	byName := make(map[string]config.StaticPromptConfig, len(prompts))
+	for _, p := range prompts {
+		byName[p.Name] = p
+	}
+	greet, ok := byName["greet"]
+	if !ok || greet.Description != "greets someone" || greet.Text != "hello {{.user}}\n" {
+		t.Fatalf("prompts[\"greet\"] = %+v, want description=%q text=%q", greet, "greets someone", "hello {{.user}}\n")
+	}
+	plain, ok := byName["no-front-matter"]
+	if !ok || plain.Text != "just a plain prompt body\n" {
+		t.Fatalf("prompts[\"no-front-matter\"] (from filename fallback) = %+v, want text=%q", plain, "just a plain prompt body\n")
+	}
+}
+
+func TestScanSkillDir_MissingDirectoryReturnsError(t *testing.T) {
+	if _, err := config.ScanSkillDir(filepath.Join(t.TempDir(), "does-not-exist")); err == nil {
+		t.Fatal("ScanSkillDir: expected error for missing directory, got nil")
+	}
+}
+
+func TestParse_StaticPromptSkillDir(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "greet.md"), "hello {{.user}}\n")
+
+	data := []byte(fmt.Sprintf(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - skill_dir: %q
+`, dir))
+	cfg, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.Prompts) != 1 || cfg.Prompts[0].SkillDir != dir {
+		t.Fatalf("cfg.Prompts = %+v, want one entry with SkillDir=%q (Parse does not expand skill_dir into cfg.Prompts itself)", cfg.Prompts, dir)
+	}
+}
+
+func TestParse_StaticPromptSkillDirMutualExclusionRejected(t *testing.T) {
+	dir := t.TempDir()
+	data := []byte(fmt.Sprintf(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - skill_dir: %q
+    text: "also set, must be rejected"
+`, dir))
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for skill_dir combined with text, got nil")
+	}
+}
+
+func TestParse_StaticPromptSkillDirMissingDirectoryRejected(t *testing.T) {
+	data := []byte(fmt.Sprintf(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - skill_dir: %q
+`, filepath.Join(t.TempDir(), "does-not-exist")))
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for missing skill_dir, got nil")
+	}
+}
+
+func TestParse_StaticPromptSkillDirDuplicateNameAcrossSourcesRejected(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "greet.md"), "hello from the directory\n")
+
+	data := []byte(fmt.Sprintf(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - name: greet
+    text: "hello from a fixed entry"
+  - skill_dir: %q
+`, dir))
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for a skill_dir file colliding with a fixed prompt's name, got nil")
+	}
+}
+
+func TestParse_StaticPromptSkillDirDuplicateNameWithinDirectoryRejected(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "a.md"), "---\nname: greet\n---\nfirst\n")
+	writeFile(t, filepath.Join(dir, "b.md"), "---\nname: greet\n---\nsecond\n")
+
+	data := []byte(fmt.Sprintf(`
+backends:
+  - name: a
+    transport: stdio
+    command: ["x"]
+
+prompts:
+  - skill_dir: %q
+`, dir))
+	if _, err := config.Parse(data); err == nil {
+		t.Fatal("Parse: expected error for two files in the same skill_dir producing the same name, got nil")
+	}
+}
+
 func TestParse_LoggingMaskKeys(t *testing.T) {
 	data := []byte(`
 backends:

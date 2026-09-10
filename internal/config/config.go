@@ -48,12 +48,21 @@ type Config struct {
 // wins over the skill_file's front matter/body, so a single entry can
 // override any of them, or add Arguments (which a SKILL.md's front matter
 // doesn't carry), without touching the file.
+//
+// SkillDir, when set, must be the only non-empty field on this entry (see
+// validateStaticPrompts): it names a directory whose *.md files (direct
+// children only, no recursion) each become their own prompt via
+// ScanSkillDir, using front matter the same way SkillFile does, with the
+// filename (minus ".md") as the name fallback when front matter omits one.
+// Unlike SkillFile, SkillDir's contents are re-read live while mcprt is
+// running (see internal/cli's watchSkillDir) -- SkillFile is not.
 type StaticPromptConfig struct {
 	Name        string                 `yaml:"name,omitempty" json:"name,omitempty"`
 	Description string                 `yaml:"description,omitempty" json:"description,omitempty"`
 	Arguments   []StaticPromptArgument `yaml:"arguments,omitempty" json:"arguments,omitempty"`
 	Text        string                 `yaml:"text,omitempty" json:"text,omitempty"`
 	SkillFile   string                 `yaml:"skill_file,omitempty" json:"skill_file,omitempty"`
+	SkillDir    string                 `yaml:"skill_dir,omitempty" json:"skill_dir,omitempty"`
 }
 
 // StaticPromptArgument mirrors mcp.PromptArgument's fields (Name,
@@ -274,6 +283,67 @@ func parseSkillFile(data []byte) (name, description, body string, err error) {
 	return fm.Name, fm.Description, body, nil
 }
 
+// ScanSkillDir lists dir's *.md files (direct children only, no recursion --
+// os.ReadDir already returns entries sorted by filename, so callers get a
+// stable, reproducible ordering across repeated scans of an unchanged
+// directory) and parses each via parseSkillFile into a StaticPromptConfig.
+// A file whose front matter omits name falls back to the filename minus its
+// ".md" extension. Arguments is always empty -- SKILL.md's front matter
+// format has no field for it. Aborts on the first file that fails to read
+// or parse, matching config.Parse's existing all-or-nothing strictness at
+// startup/SIGHUP reload; ScanSkillDirLenient (added in a later task) is the
+// runtime rescan's tolerant counterpart.
+func ScanSkillDir(dir string) ([]StaticPromptConfig, error) {
+	files, err := listSkillDirFiles(dir)
+	if err != nil {
+		return nil, fmt.Errorf("skill_dir %q: %w", dir, err)
+	}
+	out := make([]StaticPromptConfig, 0, len(files))
+	for _, name := range files {
+		p, err := parseSkillDirFile(dir, name)
+		if err != nil {
+			return nil, fmt.Errorf("skill_dir %q: file %q: %w", dir, name, err)
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// listSkillDirFiles returns dir's direct-child *.md filenames (not full
+// paths), in the sorted order os.ReadDir already guarantees.
+func listSkillDirFiles(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		files = append(files, e.Name())
+	}
+	return files, nil
+}
+
+// parseSkillDirFile reads dir/name and parses it exactly like a skill_file
+// entry (parseSkillFile), falling back to name (minus ".md") when front
+// matter omits Name. Arguments is always left empty.
+func parseSkillDirFile(dir, name string) (StaticPromptConfig, error) {
+	data, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		return StaticPromptConfig{}, err
+	}
+	pname, description, body, err := parseSkillFile(data)
+	if err != nil {
+		return StaticPromptConfig{}, err
+	}
+	if pname == "" {
+		pname = strings.TrimSuffix(name, ".md")
+	}
+	return StaticPromptConfig{Name: pname, Description: description, Text: body}, nil
+}
+
 // expandHome expands a leading "~" (home-directory shorthand) in path, e.g.
 // "~/.claude/skills/foo/SKILL.md" -- unlike a shell, os.ReadFile does not do
 // this itself. A path without a leading "~" is returned unchanged and
@@ -452,33 +522,64 @@ func validate(cfg *Config) error {
 // an empty text body, and a text body that doesn't parse as a Go
 // text/template -- so a broken prompts: entry fails fast at config-load
 // time (mcprt validate/server startup/SIGHUP reload), the same as every
-// other misconfiguration this file checks.
+// other misconfiguration this file checks. A skill_dir entry is expanded via
+// ScanSkillDir first, and every file it produces is checked exactly like a
+// fixed entry, against the SAME seen map -- so a name collision between two
+// skill_dir files, or between a skill_dir file and a fixed entry, fails
+// config-load just as strictly as two fixed entries sharing a name always
+// have.
 func validateStaticPrompts(prompts []StaticPromptConfig) error {
 	seen := make(map[string]bool, len(prompts))
 	for _, p := range prompts {
-		if p.Name == "" {
-			return fmt.Errorf("prompts: name is required")
-		}
-		if seen[p.Name] {
-			return fmt.Errorf("prompts %q: duplicate name", p.Name)
-		}
-		seen[p.Name] = true
-		if p.Text == "" {
-			return fmt.Errorf("prompts %q: text is required", p.Name)
-		}
-		if _, err := template.New(p.Name).Parse(p.Text); err != nil {
-			return fmt.Errorf("prompts %q: parse text template: %w", p.Name, err)
-		}
-		argSeen := make(map[string]bool, len(p.Arguments))
-		for _, a := range p.Arguments {
-			if a.Name == "" {
-				return fmt.Errorf("prompts %q: argument name is required", p.Name)
+		if p.SkillDir == "" {
+			if err := validateOnePrompt(p, seen); err != nil {
+				return err
 			}
-			if argSeen[a.Name] {
-				return fmt.Errorf("prompts %q: duplicate argument %q", p.Name, a.Name)
-			}
-			argSeen[a.Name] = true
+			continue
 		}
+		if p.Name != "" || p.Description != "" || p.Text != "" || p.SkillFile != "" || len(p.Arguments) > 0 {
+			return fmt.Errorf("prompts: skill_dir %q: name/description/text/skill_file/arguments must be empty when skill_dir is set", p.SkillDir)
+		}
+		dirPrompts, err := ScanSkillDir(p.SkillDir)
+		if err != nil {
+			return err
+		}
+		for _, dp := range dirPrompts {
+			if err := validateOnePrompt(dp, seen); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validateOnePrompt is validateStaticPrompts' per-prompt check, shared by a
+// fixed prompts: entry and every file a skill_dir entry expands to (both
+// checked against the same seen map, so names collide across sources the
+// same way they always have across fixed entries).
+func validateOnePrompt(p StaticPromptConfig, seen map[string]bool) error {
+	if p.Name == "" {
+		return fmt.Errorf("prompts: name is required")
+	}
+	if seen[p.Name] {
+		return fmt.Errorf("prompts %q: duplicate name", p.Name)
+	}
+	seen[p.Name] = true
+	if p.Text == "" {
+		return fmt.Errorf("prompts %q: text is required", p.Name)
+	}
+	if _, err := template.New(p.Name).Parse(p.Text); err != nil {
+		return fmt.Errorf("prompts %q: parse text template: %w", p.Name, err)
+	}
+	argSeen := make(map[string]bool, len(p.Arguments))
+	for _, a := range p.Arguments {
+		if a.Name == "" {
+			return fmt.Errorf("prompts %q: argument name is required", p.Name)
+		}
+		if argSeen[a.Name] {
+			return fmt.Errorf("prompts %q: duplicate argument %q", p.Name, a.Name)
+		}
+		argSeen[a.Name] = true
 	}
 	return nil
 }
