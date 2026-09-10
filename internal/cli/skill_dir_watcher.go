@@ -59,6 +59,15 @@ func watchSkillDir(ctx context.Context, logger *slog.Logger, dir string, entryIn
 		return
 	}
 
+	// last means "what this entry currently has successfully applied to the
+	// live server" -- NOT "what this directory's last scan looked like".
+	// The two differ exactly when UpdateDirPrompts rejects a name from
+	// added because a different entryIndex already owns it (see
+	// UpdateDirPrompts' ownership-conflict check): that name must not enter
+	// last, so the next rescan treats it as still-new and retries claiming
+	// it (in case the conflicting owner has since freed the name), and so a
+	// later deletion of that same file never asks UpdateDirPrompts to
+	// remove a name this entry never actually registered.
 	last := skillDirPromptsByName(initial)
 
 	rescan := func() {
@@ -95,8 +104,24 @@ func watchSkillDir(ctx context.Context, logger *slog.Logger, dir string, entryIn
 		if len(added) == 0 && len(removedNames) == 0 {
 			return
 		}
-		gw.UpdateDirPrompts(entryIndex, added, removedNames)
-		last = freshByName
+		applied := gw.UpdateDirPrompts(entryIndex, added, removedNames)
+
+		// Rebuild last from the fresh scan: a name unchanged from the old
+		// last needed no trip through UpdateDirPrompts at all, so it's kept
+		// as-is; a new/changed name is kept only if UpdateDirPrompts
+		// confirms it was actually applied -- a name it rejected (lost an
+		// ownership race) is left out entirely, per the invariant above.
+		newLast := make(map[string]config.StaticPromptConfig, len(freshByName))
+		for name, p := range freshByName {
+			if old, ok := last[name]; ok && reflect.DeepEqual(old, p) {
+				newLast[name] = p
+				continue
+			}
+			if applied[name] {
+				newLast[name] = p
+			}
+		}
+		last = newLast
 	}
 
 	// debounce/debounceC are read and written from this goroutine alone --

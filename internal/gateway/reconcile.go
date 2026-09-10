@@ -299,16 +299,42 @@ func (s *Server) updatePromptsLocked(backendName string, items []*mcp.Prompt, re
 // is skipped and logged rather than stolen. AddPrompt/RemovePrompts on
 // s.mcp trigger go-sdk's own notifications/prompts/list_changed to every
 // downstream client -- there is no separate notification step here.
-func (s *Server) UpdateDirPrompts(entryIndex int, added []*StaticPrompt, removed []string) {
+//
+// It returns applied, the subset of added's names that were actually
+// registered (i.e. NOT skipped by the ownership-conflict check above). The
+// caller (watchSkillDir) needs this to know which names it may safely
+// remember as "already applied" in its own diffing state -- a name it
+// asked for but that lost the ownership race must NOT be remembered as
+// applied, so the next rescan retries it (see watchSkillDir's rescan).
+//
+// A name in removed is only actually removed -- from s.promptOwner and
+// s.mcp -- when s.promptOwner currently attributes it to entryIndex; in
+// particular a missing promptOwner entry (e.g. a name a connected backend
+// serves, which is never recorded in promptOwner at all) must not match
+// entryIndex's zero value by accident, hence the explicit ", ok" presence
+// check below. When a name IS actually removed and s.promptTable still
+// holds a backend-sourced definition for it (from a backend prompt this
+// skill_dir entry had been shadowing -- see registerPrompt/New's "static
+// always wins" model), that backend prompt is re-registered so removing the
+// static prompt doesn't leave the backend's own prompt permanently hidden
+// until that backend reconnects or a SIGHUP reload happens.
+func (s *Server) UpdateDirPrompts(entryIndex int, added []*StaticPrompt, removed []string) map[string]bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for _, name := range removed {
-		if s.promptOwner[name] == entryIndex {
-			delete(s.promptOwner, name)
-			s.mcp.RemovePrompts(name)
+		owner, ok := s.promptOwner[name]
+		if !ok || owner != entryIndex {
+			continue
+		}
+		delete(s.promptOwner, name)
+		s.mcp.RemovePrompts(name)
+		if resolved, ok := s.promptTable.Items[name]; ok {
+			registerPrompt(s.mcp, s.logger, s.backends, resolved, s.maskKeys)
 		}
 	}
+
+	applied := make(map[string]bool, len(added))
 	for _, sp := range added {
 		name := sp.Prompt.Name
 		if owner, ok := s.promptOwner[name]; ok && owner != entryIndex {
@@ -318,7 +344,9 @@ func (s *Server) UpdateDirPrompts(entryIndex int, added []*StaticPrompt, removed
 		}
 		s.mcp.AddPrompt(sp.Prompt, staticPromptHandler(s.logger, s.maskKeys, sp))
 		s.promptOwner[name] = entryIndex
+		applied[name] = true
 	}
+	return applied
 }
 
 // upsertEntry is replaceEntry's counterpart for a backend connecting: it

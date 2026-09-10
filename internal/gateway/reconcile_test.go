@@ -754,6 +754,137 @@ func TestUpdateDirPrompts_SkipsNameOwnedByAnotherEntry(t *testing.T) {
 	}
 }
 
+// TestUpdateDirPrompts_RemovalIgnoresNameNeverOwnedByAnyEntry is finding 2's
+// regression test: s.promptOwner[name] on a missing key returns Go's int
+// zero value, 0 -- so a naive `s.promptOwner[name] == entryIndex` check in
+// the removal loop would incorrectly match for entryIndex == 0 even when
+// promptOwner has NO entry at all for name. entryIndex 0 is used here
+// deliberately to hit that zero-value case. "review" is served by a
+// connected BACKEND -- backend prompts are never entered into promptOwner
+// at all (see promptOwner's doc comment) -- so calling
+// UpdateDirPrompts(0, nil, ["review"]) simulates watchSkillDir passing a
+// name entry 0 never actually registered (e.g. a rejected/never-applied
+// name -- see TestWatchSkillDir_RejectedNameIsRetriedOnLaterRescan for that
+// path end to end) into removed. The backend's prompt must survive
+// untouched: this must NOT call s.mcp.RemovePrompts on it.
+func TestUpdateDirPrompts_RemovalIgnoresNameNeverOwnedByAnyEntry(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendServer := newFakePromptBackendServer("backend-a", "review")
+	httpBackend := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpBackend.Close()
+
+	ctx := context.Background()
+	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpBackend.URL}, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	prompts, err := conn.ListPrompts(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a prompts: %v", err)
+	}
+	table := router.Resolve([]router.Entry[*mcp.Prompt]{{BackendName: "backend-a", Items: prompts}}, promptNameOf, promptRename, nil)
+
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"backend-a": conn},
+		Tables:   gateway.Tables{Prompts: table},
+	})
+
+	// entryIndex 0 asks to remove "review", which no skill_dir/prompts:
+	// entry ever owned -- promptOwner has no entry for it at all.
+	stillApplied := srv.UpdateDirPrompts(0, nil, []string{"review"})
+	if len(stillApplied) != 0 {
+		t.Fatalf("UpdateDirPrompts(0, nil, [review]) applied = %v, want empty (nothing was added)", stillApplied)
+	}
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if _, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "review"}); err != nil {
+		t.Fatalf("GetPrompt(review): %v, want the backend's prompt to survive entry 0's incorrect removal request", err)
+	}
+}
+
+// TestUpdateDirPrompts_RemovalRestoresShadowedBackendPrompt is finding 4's
+// regression test: a skill_dir prompt that shadows a same-named
+// backend-sourced prompt in s.promptTable must, once removed, let the
+// backend's own prompt become servable again -- not leave a permanent hole
+// until that backend reconnects or a SIGHUP reload happens.
+func TestUpdateDirPrompts_RemovalRestoresShadowedBackendPrompt(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendServer := newFakePromptBackendServer("backend-a", "review")
+	httpBackend := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return backendServer }, nil))
+	defer httpBackend.Close()
+
+	ctx := context.Background()
+	conn, err := backend.Connect(ctx, config.BackendConfig{Name: "backend-a", Transport: "http", URL: httpBackend.URL}, backend.ChangeCallbacks{})
+	if err != nil {
+		t.Fatalf("connect backend-a: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	prompts, err := conn.ListPrompts(ctx)
+	if err != nil {
+		t.Fatalf("list backend-a prompts: %v", err)
+	}
+	table := router.Resolve([]router.Entry[*mcp.Prompt]{{BackendName: "backend-a", Items: prompts}}, promptNameOf, promptRename, nil)
+
+	srv := gateway.New(gateway.NewConfig{
+		Logger:   logger,
+		Backends: map[string]*backend.Backend{"backend-a": conn},
+		Tables:   gateway.Tables{Prompts: table},
+	})
+
+	// A skill_dir prompt now shadows "review".
+	dirVersion, err := gateway.NewStaticPrompt("review", "", nil, "skill_dir's shadowing text")
+	if err != nil {
+		t.Fatalf("NewStaticPrompt: %v", err)
+	}
+	dirVersion.EntryIndex = 0
+	srv.UpdateDirPrompts(0, []*gateway.StaticPrompt{dirVersion}, nil)
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if res, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "review"}); err != nil {
+		t.Fatalf("GetPrompt(review) before removal: %v", err)
+	} else if text, ok := res.Messages[0].Content.(*mcp.TextContent); !ok || text.Text != "skill_dir's shadowing text" {
+		t.Fatalf("GetPrompt(review) before removal = %+v, want the static prompt's text", res.Messages[0].Content)
+	}
+
+	// Remove the skill_dir prompt -- the backend's own "review" must be
+	// restored, not left as a permanent hole.
+	srv.UpdateDirPrompts(0, nil, []string{"review"})
+
+	res, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "review"})
+	if err != nil {
+		t.Fatalf("GetPrompt(review) after removal: %v, want the backend's prompt restored", err)
+	}
+	text, ok := res.Messages[0].Content.(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("GetPrompt(review) after removal content = %+v, want text content", res.Messages[0].Content)
+	}
+	if text.Text == "skill_dir's shadowing text" {
+		t.Fatal("GetPrompt(review) after removal still returned the removed static prompt's text")
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
