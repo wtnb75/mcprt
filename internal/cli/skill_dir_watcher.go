@@ -99,7 +99,18 @@ func watchSkillDir(ctx context.Context, logger *slog.Logger, dir string, entryIn
 		last = freshByName
 	}
 
+	// debounce/debounceC are read and written from this goroutine alone --
+	// rescan() runs synchronously in the <-debounceC case below, never in a
+	// separately spawned goroutine (unlike time.AfterFunc, whose documented
+	// Reset semantics allow a second firing to run concurrently with a
+	// still-running prior one). That makes overlapping rescan() invocations
+	// -- which would race on the shared last map and on gw.UpdateDirPrompts
+	// -- impossible by construction, and makes ctx cancellation's cleanup
+	// complete: rescan can never be "in flight" while this goroutine is
+	// blocked in select, since it only ever runs from inside a select-case
+	// body on this same goroutine.
 	var debounce *time.Timer
+	var debounceC <-chan time.Time
 	defer func() {
 		if debounce != nil {
 			debounce.Stop()
@@ -114,10 +125,18 @@ func watchSkillDir(ctx context.Context, logger *slog.Logger, dir string, entryIn
 				return
 			}
 			if debounce == nil {
-				debounce = time.AfterFunc(skillDirDebounce, rescan)
+				debounce = time.NewTimer(skillDirDebounce)
+				debounceC = debounce.C
 			} else {
+				if !debounce.Stop() {
+					<-debounce.C // drain: timer already fired but its value wasn't read yet
+				}
 				debounce.Reset(skillDirDebounce)
 			}
+		case <-debounceC:
+			rescan()
+			debounce = nil
+			debounceC = nil
 		case err, ok := <-watcher.Errors:
 			if !ok {
 				return
