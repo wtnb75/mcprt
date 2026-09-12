@@ -245,3 +245,77 @@ func TestWatchSkillDir_RejectedNameIsRetriedOnLaterRescan(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// TestWatchSkillDir_BuildFailureDoesNotOrphanTheOldRegistration is a
+// regression test for a bug the final-review fix for
+// TestWatchSkillDir_RejectedNameIsRetriedOnLaterRescan itself introduced:
+// newLast's rebuild only kept a changed name when UpdateDirPrompts reported
+// it as applied, which conflated two different reasons a name could be
+// missing from applied -- an ownership-conflict rejection (correct to drop
+// from last, see the test above) and a buildOneStaticPrompt failure
+// (incorrect to drop: this entry's PREVIOUS version of that file is still
+// registered and being served, so last must keep remembering it as applied
+// or a later deletion of the broken file will never be recognized as a
+// removal).
+//
+// Reproduces the exact trigger: good.md is edited into an invalid template
+// AND an unrelated file changes in the same debounce window (so the
+// len(added)==0 && len(removedNames)==0 early return doesn't skip the
+// rescan entirely) -- before the fix, this made "good" quietly vanish from
+// last while its stale v1 content stayed registered, so deleting good.md
+// afterward produced no removedNames entry for it and the stale prompt
+// stayed registered forever.
+func TestWatchSkillDir_BuildFailureDoesNotOrphanTheOldRegistration(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "good.md"), []byte("good body v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := config.ScanSkillDir(dir)
+	if err != nil {
+		t.Fatalf("ScanSkillDir: %v", err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	sp, err := buildOneStaticPrompt(initial[0], 0)
+	if err != nil {
+		t.Fatalf("buildOneStaticPrompt: %v", err)
+	}
+	srv := gateway.New(gateway.NewConfig{Logger: logger, Backends: map[string]*backend.Backend{}, StaticPrompts: []*gateway.StaticPrompt{sp}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go watchSkillDir(ctx, logger, dir, 0, initial, srv)
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	// Break good.md's template AND add an unrelated file, back-to-back so
+	// both land in the same debounce window.
+	if err := os.WriteFile(filepath.Join(dir, "good.md"), []byte("{{.unterminated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "other.md"), []byte("other body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitForPromptPresence(t, ctx, session, "other", true) // confirms the batched rescan already ran
+
+	res, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "good"})
+	if err != nil {
+		t.Fatalf("GetPrompt(good) right after the batched rescan: %v, want its stale v1 content still served", err)
+	}
+	if text, ok := res.Messages[0].Content.(*mcp.TextContent); !ok || text.Text != "good body v1\n" {
+		t.Fatalf("GetPrompt(good) content = %+v, want the unchanged v1 body", res.Messages[0].Content)
+	}
+
+	// Now delete the broken file -- this must actually unregister "good".
+	if err := os.Remove(filepath.Join(dir, "good.md")); err != nil {
+		t.Fatal(err)
+	}
+	waitForPromptPresence(t, ctx, session, "good", false)
+}

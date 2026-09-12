@@ -88,6 +88,15 @@ func watchSkillDir(ctx context.Context, logger *slog.Logger, dir string, entryIn
 			}
 		}
 
+		// buildFailed tracks a name whose fresh content failed to compile as
+		// a template: unlike an ownership-conflict rejection (this entry
+		// genuinely has nothing new to apply), this entry's PREVIOUS version
+		// of that name is still registered and being served, so it must
+		// carry forward into newLast unchanged rather than being dropped --
+		// otherwise a later deletion of the broken file would never be
+		// recognized as a removal (see
+		// TestWatchSkillDir_BuildFailureDoesNotOrphanTheOldRegistration).
+		buildFailed := make(map[string]bool)
 		var added []*gateway.StaticPrompt
 		for name, p := range freshByName {
 			if old, ok := last[name]; ok && reflect.DeepEqual(old, p) {
@@ -96,6 +105,7 @@ func watchSkillDir(ctx context.Context, logger *slog.Logger, dir string, entryIn
 			sp, err := buildOneStaticPrompt(p, entryIndex)
 			if err != nil {
 				logger.Warn("skill_dir: skipping file with invalid template", "dir", dir, "name", name, "error", err)
+				buildFailed[name] = true
 				continue
 			}
 			added = append(added, sp)
@@ -108,13 +118,21 @@ func watchSkillDir(ctx context.Context, logger *slog.Logger, dir string, entryIn
 
 		// Rebuild last from the fresh scan: a name unchanged from the old
 		// last needed no trip through UpdateDirPrompts at all, so it's kept
-		// as-is; a new/changed name is kept only if UpdateDirPrompts
-		// confirms it was actually applied -- a name it rejected (lost an
-		// ownership race) is left out entirely, per the invariant above.
+		// as-is; a name whose fresh content failed to build keeps its OLD
+		// entry (still what's actually registered); a new/changed name that
+		// did reach UpdateDirPrompts is kept only if it confirms the name
+		// was actually applied -- a name it rejected (lost an ownership
+		// race) is left out entirely, per the invariant above.
 		newLast := make(map[string]config.StaticPromptConfig, len(freshByName))
 		for name, p := range freshByName {
 			if old, ok := last[name]; ok && reflect.DeepEqual(old, p) {
 				newLast[name] = p
+				continue
+			}
+			if buildFailed[name] {
+				if old, ok := last[name]; ok {
+					newLast[name] = old
+				}
 				continue
 			}
 			if applied[name] {
