@@ -695,12 +695,13 @@ func TestConnect_HTTP_Proxy(t *testing.T) {
 	defer backendSrv.Close()
 
 	// A forward-proxy request already arrives with an absolute-form URL, so
-	// a no-op Director is enough to turn ReverseProxy into a forward proxy;
+	// a no-op Rewrite is enough to turn ReverseProxy into a forward proxy
+	// (pr.Out is already a clone of pr.In carrying that absolute URL);
 	// FlushInterval: -1 streams the response immediately instead of
 	// buffering, which the MCP client's long-lived SSE connection needs.
 	var proxied atomic.Bool
 	proxySrv := httptest.NewServer(&httputil.ReverseProxy{
-		Director:      func(r *http.Request) { proxied.Store(true) },
+		Rewrite:       func(pr *httputil.ProxyRequest) { proxied.Store(true) },
 		FlushInterval: -1,
 	})
 	defer proxySrv.Close()
