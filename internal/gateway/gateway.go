@@ -149,12 +149,14 @@ type Server struct {
 	promptTable     *router.Table[*mcp.Prompt]
 	promptOverrides map[string]string
 
-	// staticPromptNames is the set of prompt names New registered directly
-	// from NewConfig.StaticPrompts. Unlike the reconcile fields above, it is
-	// written once (in New) and never mutated afterward, but reading it
-	// happens under mu anyway since its only reader (updatePromptsLocked in
-	// reconcile.go) is already there for other reasons.
-	staticPromptNames map[string]bool
+	// promptOwner maps every currently-registered static prompt name (from
+	// a fixed prompts: entry, or currently produced by a skill_dir entry) to
+	// the index of the prompts: entry that owns it -- the same index
+	// StaticPrompt.EntryIndex carries. Populated once in New from
+	// NewConfig.StaticPrompts, and mutated afterward only by
+	// UpdateDirPrompts (reconcile.go), always under mu like every other
+	// Server field below.
+	promptOwner map[string]int
 }
 
 // MCP returns the underlying *mcp.Server, for ServeStdio/ServeHTTP.
@@ -206,9 +208,9 @@ func emptyTable[T any](t *router.Table[T]) *router.Table[T] {
 // BackendName referenced in cfg.Tables (the caller builds both from the
 // same set of connected backends).
 func New(cfg NewConfig) *Server {
-	staticNames := make(map[string]bool, len(cfg.StaticPrompts))
+	promptOwner := make(map[string]int, len(cfg.StaticPrompts))
 	for _, sp := range cfg.StaticPrompts {
-		staticNames[sp.Prompt.Name] = true
+		promptOwner[sp.Prompt.Name] = sp.EntryIndex
 	}
 
 	s := &Server{
@@ -234,7 +236,7 @@ func New(cfg NewConfig) *Server {
 		promptTable:     emptyTable(cfg.Tables.Prompts),
 		promptOverrides: cfg.Overrides.Prompts,
 
-		staticPromptNames: staticNames,
+		promptOwner: promptOwner,
 	}
 
 	opts := &mcp.ServerOptions{
@@ -267,7 +269,7 @@ func New(cfg NewConfig) *Server {
 	}
 	if cfg.Tables.Prompts != nil {
 		for _, resolved := range cfg.Tables.Prompts.Items {
-			if staticNames[resolved.Item.Name] {
+			if _, ok := promptOwner[resolved.Item.Name]; ok {
 				LogEvent(context.Background(), cfg.Logger, slog.LevelWarn, EventPromptShadowedByStatic,
 					"prompt", resolved.Item.Name, "backend", resolved.BackendName)
 				continue
@@ -307,7 +309,7 @@ func (s *Server) completionHandler(ctx context.Context, req *mcp.CompleteRequest
 	found := false
 	switch ref.Type {
 	case "ref/prompt":
-		if s.staticPromptNames[ref.Name] {
+		if _, ok := s.promptOwner[ref.Name]; ok {
 			// Static prompts have no backend and no completion source
 			// (see the design spec's future-extensions list) -- answer
 			// with no suggestions rather than forwarding to a shadowed

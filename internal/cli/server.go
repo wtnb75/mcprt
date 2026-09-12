@@ -273,26 +273,61 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 	return firstErr
 }
 
-// buildStaticPrompts converts each config-level static prompt definition
-// into the *gateway.StaticPrompt New actually registers, parsing its text
-// template along the way. internal/config's validateStaticPrompts already
-// rejects an unparseable template at config-load time, so an error here
-// should only happen if that validation was skipped somehow -- still
-// handled, not assumed impossible.
-func buildStaticPrompts(prompts []config.StaticPromptConfig) ([]*gateway.StaticPrompt, error) {
-	out := make([]*gateway.StaticPrompt, 0, len(prompts))
-	for _, p := range prompts {
-		args := make([]*mcp.PromptArgument, 0, len(p.Arguments))
-		for _, a := range p.Arguments {
-			args = append(args, &mcp.PromptArgument{Name: a.Name, Description: a.Description, Required: a.Required})
-		}
-		sp, err := gateway.NewStaticPrompt(p.Name, p.Description, args, p.Text)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, sp)
+// buildOneStaticPrompt converts one config.StaticPromptConfig (a fixed
+// entry, or one file a skill_dir entry expanded to) into the
+// *gateway.StaticPrompt New actually registers, tagging it with entryIndex
+// (its originating prompts: entry's position, i.e. its priority -- see
+// gateway.Server.promptOwner).
+func buildOneStaticPrompt(p config.StaticPromptConfig, entryIndex int) (*gateway.StaticPrompt, error) {
+	args := make([]*mcp.PromptArgument, 0, len(p.Arguments))
+	for _, a := range p.Arguments {
+		args = append(args, &mcp.PromptArgument{Name: a.Name, Description: a.Description, Required: a.Required})
 	}
-	return out, nil
+	sp, err := gateway.NewStaticPrompt(p.Name, p.Description, args, p.Text)
+	if err != nil {
+		return nil, err
+	}
+	sp.EntryIndex = entryIndex
+	return sp, nil
+}
+
+// buildStaticPrompts converts every prompts: entry into the
+// *gateway.StaticPrompt list New actually registers, expanding each
+// skill_dir entry via config.ScanSkillDir along the way (internal/config's
+// validateStaticPrompts already rejects an unparseable template or a
+// skill_dir that can't be scanned at config-load time, so an error here
+// should only happen if that validation was skipped somehow -- still
+// handled, not assumed impossible). dirScans records, per skill_dir entry's
+// index, exactly the []config.StaticPromptConfig its scan produced -- the
+// caller (buildGateway) passes this to watchSkillDir as the starting point
+// for that directory's live diffing, so the watcher's first rescan compares
+// against precisely what got registered here, not a second, differently-
+// timed scan of the same directory.
+func buildStaticPrompts(prompts []config.StaticPromptConfig) (out []*gateway.StaticPrompt, dirScans map[int][]config.StaticPromptConfig, err error) {
+	dirScans = make(map[int][]config.StaticPromptConfig)
+	for i, p := range prompts {
+		if p.SkillDir == "" {
+			sp, err := buildOneStaticPrompt(p, i)
+			if err != nil {
+				return nil, nil, err
+			}
+			out = append(out, sp)
+			continue
+		}
+		dirPrompts, err := config.ScanSkillDir(p.SkillDir)
+		if err != nil {
+			return nil, nil, err
+		}
+		dirScans[i] = dirPrompts
+		for _, dp := range dirPrompts {
+			sp, err := buildOneStaticPrompt(dp, i)
+			if err != nil {
+				return nil, nil, err
+			}
+			out = append(out, sp)
+		}
+	}
+	return out, dirScans, nil
 }
 
 // buildGateway connects to every configured backend (see connectBackends)
@@ -335,7 +370,7 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 		gateway.LogEvent(ctx, logger, slog.LevelWarn, gateway.EventNameConflict, "kind", "prompt", "name", c.ExposedName, "winner", c.Winner, "hidden", c.Losers)
 	}
 
-	staticPrompts, err := buildStaticPrompts(cfg.Prompts)
+	staticPrompts, dirScans, err := buildStaticPrompts(cfg.Prompts)
 	if err != nil {
 		return nil, err
 	}
@@ -368,6 +403,19 @@ func buildGateway(ctx context.Context, logger *slog.Logger, cfg *config.Config) 
 		KeepAliveFailureThreshold: cfg.Timeouts.DownstreamKeepAliveFailureThreshold,
 	})
 	gwH.ptr.Store(srv)
+
+	// Each skill_dir entry gets its own live-update watcher, scoped to this
+	// generation's ctx: a SIGHUP-triggered reload's new generation builds
+	// its own fresh watcher (seeded from ITS OWN initial scan, above), and
+	// this one stops when ctx is cancelled on this generation's supersession
+	// (see watchSIGHUP/scheduleDrain) -- the same lifecycle backend
+	// supervisors already follow.
+	for i, p := range cfg.Prompts {
+		if p.SkillDir == "" {
+			continue
+		}
+		go watchSkillDir(ctx, logger, p.SkillDir, i, dirScans[i], srv)
+	}
 
 	return srv, nil
 }

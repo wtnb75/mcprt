@@ -19,6 +19,13 @@ import (
 type StaticPrompt struct {
 	Prompt   *mcp.Prompt
 	Template *template.Template
+	// EntryIndex is this prompt's originating prompts: entry's index in
+	// config.Config.Prompts -- the same index for every StaticPrompt one
+	// skill_dir entry expands to. It is this prompt's priority for
+	// Server.promptOwner (see gateway.go/reconcile.go): a smaller index
+	// wins. Left at its zero value by NewStaticPrompt itself; internal/cli's
+	// buildStaticPrompts sets it explicitly after construction.
+	EntryIndex int
 }
 
 // NewStaticPrompt parses text as a Go text/template and pairs it with the

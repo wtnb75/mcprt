@@ -90,6 +90,7 @@ Minimal example:
         arguments:
           - name: diff
             required: true
+      - skill_dir: ~/.claude/skills/team-prompts
 
     logging:
       mask_keys: ["internal_id"] # extra key-name substrings to mask in the audit log, in addition to the built-in key/auth/pass/cred/token patterns
@@ -164,6 +165,38 @@ with no front matter is used as `text` in full. Fields set directly on the
 which no front matter carries) take priority over the file, so one entry
 can point at a shared `SKILL.md` while still adding `arguments` or
 overriding any of the other fields locally.
+
+`skill_file` still means one entry per file. To serve many prompts from a
+directory of Markdown files instead, point `skill_dir` at it -- every direct
+child `*.md` file (subdirectories are not scanned) becomes its own prompt,
+parsed the same `---`-delimited front matter way `skill_file` is, falling
+back to the filename (minus `.md`) for `name` when front matter omits one.
+Unlike every other `prompts` field, `skill_dir` must be the ONLY field set
+on its entry -- `name`/`description`/`text`/`skill_file`/`arguments` are all
+rejected alongside it, since one entry now expands into many prompts rather
+than describing a single one; give each file its own front matter `name`/
+`description` instead. `arguments` is not available for a `skill_dir`
+prompt at all -- use `skill_file` if a prompt needs `required: true` arguments.
+
+Unlike `skill_file`, `skill_dir`'s contents are watched live while `mcprt
+server` is running: adding, editing, or removing a `*.md` file under it
+updates `prompts/list` (and sends `notifications/prompts/list_changed` to
+every connected client) within about 300ms, without a SIGHUP or restart --
+and, unlike SIGHUP-triggered config reload, this applies equally to stdio
+and HTTP sessions. At config-load time (`mcprt validate`/startup/SIGHUP reload),
+any name collision across every source is a hard error, so priority ordering
+is never actually tested there. Once mcprt is running, a name a `skill_dir`
+newly introduces that no other currently-registered source already holds is
+claimed by whichever source's watcher scans it first — not necessarily
+whichever is listed earlier in `prompts:`. A file that loses this race is
+logged and skipped, and is only reconsidered when that specific file itself
+changes (or the server restarts / gets a SIGHUP reload) — not automatically
+when the name's current holder later goes away. A file that fails to parse (bad
+front matter, or a body that isn't a valid template) is logged and skipped
+without disturbing the directory's other prompts -- but this leniency is
+runtime-only: a `skill_dir` with a bad file already in place at `mcprt
+validate`/startup/SIGHUP-reload time fails to load, exactly as strict as
+every other prompts: misconfiguration.
 
 Client support for MCP's `prompts` feature (invoking `prompts/get`,
 typically surfaced as a slash command) varies widely between clients and

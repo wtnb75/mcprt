@@ -1005,7 +1005,7 @@ func TestBuildStaticPrompts_ConvertsConfig(t *testing.T) {
 			Text:        "hello {{.name}}",
 		},
 	}
-	out, err := buildStaticPrompts(prompts)
+	out, dirScans, err := buildStaticPrompts(prompts)
 	if err != nil {
 		t.Fatalf("buildStaticPrompts: %v", err)
 	}
@@ -1019,12 +1019,55 @@ func TestBuildStaticPrompts_ConvertsConfig(t *testing.T) {
 	if len(sp.Prompt.Arguments) != 1 || sp.Prompt.Arguments[0].Name != "name" || !sp.Prompt.Arguments[0].Required {
 		t.Fatalf("Prompt.Arguments = %+v, want one required argument named \"name\"", sp.Prompt.Arguments)
 	}
+	if sp.EntryIndex != 0 {
+		t.Fatalf("sp.EntryIndex = %d, want 0", sp.EntryIndex)
+	}
+	if len(dirScans) != 0 {
+		t.Fatalf("dirScans = %+v, want empty (no skill_dir entries)", dirScans)
+	}
 }
 
 func TestBuildStaticPrompts_InvalidTemplatePropagatesError(t *testing.T) {
 	prompts := []config.StaticPromptConfig{{Name: "bad", Text: "{{.unterminated"}}
-	if _, err := buildStaticPrompts(prompts); err == nil {
+	if _, _, err := buildStaticPrompts(prompts); err == nil {
 		t.Fatal("buildStaticPrompts: expected error for invalid template, got nil")
+	}
+}
+
+func TestBuildStaticPrompts_SkillDirExpandsAndRecordsScan(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "greet.md"), []byte("hello {{.user}}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prompts := []config.StaticPromptConfig{
+		{Name: "fixed", Text: "fixed text"},
+		{SkillDir: dir},
+	}
+	out, dirScans, err := buildStaticPrompts(prompts)
+	if err != nil {
+		t.Fatalf("buildStaticPrompts: %v", err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("buildStaticPrompts returned %d entries, want 2 (1 fixed + 1 from skill_dir)", len(out))
+	}
+	var fixed, fromDir *gateway.StaticPrompt
+	for _, sp := range out {
+		switch sp.Prompt.Name {
+		case "fixed":
+			fixed = sp
+		case "greet":
+			fromDir = sp
+		}
+	}
+	if fixed == nil || fixed.EntryIndex != 0 {
+		t.Fatalf("fixed entry = %+v, want EntryIndex 0", fixed)
+	}
+	if fromDir == nil || fromDir.EntryIndex != 1 {
+		t.Fatalf("skill_dir entry = %+v, want name=greet EntryIndex=1", fromDir)
+	}
+	scan, ok := dirScans[1]
+	if !ok || len(scan) != 1 || scan[0].Name != "greet" {
+		t.Fatalf("dirScans[1] = %+v, want the one-entry scan of dir", scan)
 	}
 }
 
@@ -1066,6 +1109,44 @@ func TestBuildGateway_StaticPromptServesConfiguredText(t *testing.T) {
 	if !ok || text.Text != "hello world" {
 		t.Fatalf("GetPrompt(greet) content = %+v, want text \"hello world\"", res.Messages[0].Content)
 	}
+}
+
+func TestBuildGateway_SkillDirPicksUpRuntimeFileChanges(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "greet.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Listen:  config.ListenConfig{Stdio: true},
+		Prompts: []config.StaticPromptConfig{{SkillDir: dir}},
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	srv, err := buildGateway(ctx, logger, cfg)
+	if err != nil {
+		t.Fatalf("buildGateway: %v", err)
+	}
+
+	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
+	defer gw.Close()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1"}, nil)
+	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: gw.URL}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = session.Close() }()
+
+	if _, err := session.GetPrompt(ctx, &mcp.GetPromptParams{Name: "greet"}); err != nil {
+		t.Fatalf("GetPrompt(greet): %v, want it registered from the initial scan", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "farewell.md"), []byte("bye\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitForPromptPresence(t, ctx, session, "farewell", true)
 }
 
 func TestBuildGateway_StaticPromptTemplateErrorFailsBuild(t *testing.T) {
