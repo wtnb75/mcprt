@@ -41,12 +41,6 @@ type Backend struct {
 	Name    string
 	Prefix  string
 	Session *mcp.ClientSession
-	// ListChangedUnsupported is true when Connect had to fall back to
-	// connecting without tools/resources/prompts list-changed subscriptions
-	// -- see Connect's doc comment on subscriptions/listen. This backend's
-	// list is then only ever what Connect saw at startup: a later change on
-	// the backend's side won't be noticed until the next full reconnect.
-	ListChangedUnsupported bool
 }
 
 // ChangeCallbacks are invoked when a connected backend reports that its
@@ -88,80 +82,28 @@ type ChangeCallbacks struct {
 //
 // If cb requests any list-changed notifications, go-sdk's Client.Connect
 // (for a backend that negotiates MCP protocol 2026-07-28+, SEP-2575)
-// additionally opens a "subscriptions/listen" stream to deliver them.
-// Some real-world servers advertise support for that stateless discovery
-// handshake without correctly implementing subscriptions/listen itself --
-// and go-sdk doesn't surface that failure synchronously from Connect: the
-// listen stream opens in the background, and its failure only appears
-// later, tearing the whole session down out from under whatever RPC the
-// caller happens to make next (observed as that RPC failing with
-// `client is closing: sending "subscriptions/listen": ...`). Since
-// Connect's own caller has no way to tell "this backend can never support
-// list-changed notifications" apart from an ordinary transient failure on
-// its own, Connect makes one throwaway ListTools call itself right after
-// connecting whenever cb requested list-changed notifications, purely to
-// flush out that async failure before handing the session back. If that
-// probe fails with the subscriptions/listen signature, Connect discards
-// the session and retries once, fresh, without any list-changed handlers
-// -- degrading to whatever ListTools/etc see at startup, never
-// live-updated -- rather than leaving the caller to fail (and retry)
-// forever over a feature it may not even need. See
-// isSubscriptionsListenFailure and Backend.ListChangedUnsupported.
+// additionally opens a "subscriptions/listen" stream to deliver them. Some
+// real-world servers advertise support for that stateless discovery
+// handshake without correctly implementing subscriptions/listen itself; as
+// of go-sdk v1.8.0 that failure no longer takes the session down or
+// surfaces as an error at all (see go-sdk's
+// TestStreamableClient_StatelessSubscriptionsListen404) -- Connect and
+// later RPCs like ListTools just keep working, silently without
+// list-changed notifications ever arriving for that backend. Older
+// versions of this function used to detect that case itself (a throwaway
+// post-connect ListTools probe, matched against go-sdk's error text) and
+// reconnect without list-changed handlers; that workaround is gone because
+// go-sdk no longer gives Connect any signal to detect it by.
 func Connect(ctx context.Context, cfg config.BackendConfig, cb ChangeCallbacks) (*Backend, error) {
 	session, err := connectOnce(ctx, cfg, cb)
-	degraded := false
-	if err == nil && hasListChangedHandlers(cb) {
-		if probeErr := probeListTools(ctx, session); probeErr != nil && isSubscriptionsListenFailure(probeErr) {
-			_ = session.Close()
-			degraded = true
-			degradedCB := ChangeCallbacks{OnProgress: cb.OnProgress, OnElicit: cb.OnElicit, OnResourceUpdated: cb.OnResourceUpdated}
-			session, err = connectOnce(ctx, cfg, degradedCB)
-		}
-	}
 	if err != nil {
 		return nil, fmt.Errorf("backend %q: connect: %w", cfg.Name, err)
 	}
-	return &Backend{Name: cfg.Name, Prefix: cfg.Prefix, Session: session, ListChangedUnsupported: degraded}, nil
-}
-
-// hasListChangedHandlers reports whether cb requests any list-changed
-// notification, i.e. whether connectOnce would ask go-sdk to open a
-// subscriptions/listen stream at all -- gating Connect's post-connect probe
-// so ping/list/call (which never set these) pay no extra RPC round trip.
-func hasListChangedHandlers(cb ChangeCallbacks) bool {
-	return cb.OnToolsChanged != nil || cb.OnPromptsChanged != nil || cb.OnResourcesChanged != nil
-}
-
-// probeListTools makes one throwaway tools/list call, purely to force any
-// already-failed-but-not-yet-surfaced subscriptions/listen stream (see
-// Connect's doc comment) to actually manifest as an error here rather than
-// on whatever call the caller happens to make first.
-func probeListTools(ctx context.Context, session *mcp.ClientSession) error {
-	for _, err := range session.Tools(ctx, nil) {
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// isSubscriptionsListenFailure reports whether err is go-sdk's
-// subscriptions/listen (SEP-2575) failing -- either Client.Connect's own
-// synchronous open of it, or (far more commonly observed) its
-// asynchronously-opened stream's failure surfacing later on some other
-// RPC's "client is closing" wrapper. String matching on go-sdk's own wrap
-// text is the only option available in either case: that RPC exchange is
-// entirely internal to Client.Connect, with no exported sentinel error or
-// way to opt out of it from ClientOptions.
-func isSubscriptionsListenFailure(err error) bool {
-	return strings.Contains(err.Error(), "subscriptions/listen")
+	return &Backend{Name: cfg.Name, Prefix: cfg.Prefix, Session: session}, nil
 }
 
 // connectOnce is Connect's single connection attempt: build clientOpts from
-// cb, build a fresh transport from cfg, and connect. Separated out so
-// Connect can retry it with a different cb (see Connect's doc comment) --
-// each call builds its own fresh mcp.Client and transport, since a failed
-// attempt's may already be unusable (e.g. a stdio backend's subprocess).
+// cb, build a fresh transport from cfg, and connect.
 func connectOnce(ctx context.Context, cfg config.BackendConfig, cb ChangeCallbacks) (*mcp.ClientSession, error) {
 	clientOpts := &mcp.ClientOptions{
 		KeepAlive:                 KeepAlive,

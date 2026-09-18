@@ -362,15 +362,14 @@ func newFakeDiscoverableBrokenListenBackend(t *testing.T) *httptest.Server {
 	}))
 }
 
-// TestConnect_DegradesWhenSubscriptionsListenUnsupported reproduces a
-// duckdb-mcp-server report: `mcprt ping`/`list` (which never request
-// list-changed notifications) connect fine, but `mcprt server` (which
-// does, to support live tool-list updates) fails outright with "backend
-// connect failed, retrying" forever, because go-sdk's Client.Connect
-// treats a failed subscriptions/listen as a fatal connect error. Connect
-// must instead retry once without list-changed handlers and succeed, with
-// ListChangedUnsupported set so the caller can log the degradation.
-func TestConnect_DegradesWhenSubscriptionsListenUnsupported(t *testing.T) {
+// TestConnect_SurvivesBrokenSubscriptionsListen reproduces a duckdb-mcp-server
+// report: a backend advertises MCP protocol 2026-07-28+ (SEP-2575) but fails
+// every subscriptions/listen call outright. As of go-sdk v1.8.0 (see its
+// TestStreamableClient_StatelessSubscriptionsListen404), that failure no
+// longer tears the session down or surfaces as an error on any later RPC --
+// Connect and ListTools must both just succeed, silently without
+// list-changed notifications ever arriving for this backend.
+func TestConnect_SurvivesBrokenSubscriptionsListen(t *testing.T) {
 	srv := newFakeDiscoverableBrokenListenBackend(t)
 	defer srv.Close()
 
@@ -381,10 +380,6 @@ func TestConnect_DegradesWhenSubscriptionsListenUnsupported(t *testing.T) {
 		t.Fatalf("Connect: %v", err)
 	}
 	defer func() { _ = b.Close() }()
-
-	if !b.ListChangedUnsupported {
-		t.Fatal("ListChangedUnsupported = false, want true (this backend's subscriptions/listen always fails)")
-	}
 
 	tools, err := b.ListTools(ctx)
 	if err != nil {
@@ -416,9 +411,6 @@ func TestConnect_ToolListChangedCallback(t *testing.T) {
 		t.Fatalf("Connect: %v", err)
 	}
 	defer func() { _ = b.Close() }()
-	if b.ListChangedUnsupported {
-		t.Fatal("ListChangedUnsupported = true, want false (this backend's subscriptions/listen -- if even attempted -- works fine)")
-	}
 
 	// Registering a second tool on the already-connected fake server makes
 	// the SDK emit notifications/tools/list_changed to b's session.
