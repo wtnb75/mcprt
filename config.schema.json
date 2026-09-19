@@ -276,6 +276,8 @@
   "type": "object",
   "required": [
     "listen",
-    "backends"
+    "backends",
+    "logging",
+    "timeouts"
   ]
 }

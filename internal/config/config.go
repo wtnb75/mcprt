@@ -31,8 +31,8 @@ type Config struct {
 	ResourceTemplateOverrides map[string]string    `yaml:"resource_template_overrides,omitempty" json:"resource_template_overrides,omitempty"`
 	PromptOverrides           map[string]string    `yaml:"prompt_overrides,omitempty" json:"prompt_overrides,omitempty"`
 	Prompts                   []StaticPromptConfig `yaml:"prompts,omitempty" json:"prompts,omitempty"`
-	Logging                   LoggingConfig        `yaml:"logging,omitempty" json:"logging,omitempty"`
-	Timeouts                  TimeoutsConfig       `yaml:"timeouts,omitempty" json:"timeouts,omitempty"`
+	Logging                   LoggingConfig        `yaml:"logging,omitempty" json:"logging"`
+	Timeouts                  TimeoutsConfig       `yaml:"timeouts,omitempty" json:"timeouts"`
 }
 
 // StaticPromptConfig defines a prompt mcprt serves directly from config,
@@ -287,15 +287,15 @@ func parseSkillFile(data []byte) (name, description, body string, err error) {
 		return "", "", text, nil
 	}
 	rest := text[len(delim):]
-	end := strings.Index(rest, "\n---")
-	if end < 0 {
+	before, after, ok := strings.Cut(rest, "\n---")
+	if !ok {
 		return "", "", text, nil
 	}
 	var fm skillFrontMatter
-	if err := yaml.Unmarshal([]byte(rest[:end]), &fm); err != nil {
+	if err := yaml.Unmarshal([]byte(before), &fm); err != nil {
 		return "", "", "", fmt.Errorf("parse front matter: %w", err)
 	}
-	body = strings.TrimPrefix(rest[end+len("\n---"):], "\n")
+	body = strings.TrimPrefix(after, "\n")
 	return fm.Name, fm.Description, body, nil
 }
 

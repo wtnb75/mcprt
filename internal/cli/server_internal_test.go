@@ -1122,8 +1122,7 @@ func TestBuildGateway_SkillDirPicksUpRuntimeFileChanges(t *testing.T) {
 		Prompts: []config.StaticPromptConfig{{SkillDir: dir}},
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	srv, err := buildGateway(ctx, logger, cfg)
 	if err != nil {

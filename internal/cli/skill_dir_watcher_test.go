@@ -56,8 +56,7 @@ func TestWatchSkillDir_PicksUpAddedChangedAndRemovedFiles(t *testing.T) {
 	}
 	srv := gateway.New(gateway.NewConfig{Logger: logger, Backends: map[string]*backend.Backend{}, StaticPrompts: staticPrompts})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go watchSkillDir(ctx, logger, dir, 0, initial, srv)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
@@ -117,8 +116,7 @@ func TestWatchSkillDir_SkipsUnparseableEditWithoutRemovingOthers(t *testing.T) {
 	}
 	srv := gateway.New(gateway.NewConfig{Logger: logger, Backends: map[string]*backend.Backend{}, StaticPrompts: []*gateway.StaticPrompt{sp}})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go watchSkillDir(ctx, logger, dir, 0, initial, srv)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
@@ -191,8 +189,7 @@ func TestWatchSkillDir_RejectedNameIsRetriedOnLaterRescan(t *testing.T) {
 	}
 	srv := gateway.New(gateway.NewConfig{Logger: logger, Backends: map[string]*backend.Backend{}, StaticPrompts: staticPrompts})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go watchSkillDir(ctx, logger, dirHigh, 0, initialHigh, srv)
 	go watchSkillDir(ctx, logger, dirLow, 1, initialLow, srv)
 
@@ -282,8 +279,7 @@ func TestWatchSkillDir_BuildFailureDoesNotOrphanTheOldRegistration(t *testing.T)
 	}
 	srv := gateway.New(gateway.NewConfig{Logger: logger, Backends: map[string]*backend.Backend{}, StaticPrompts: []*gateway.StaticPrompt{sp}})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go watchSkillDir(ctx, logger, dir, 0, initial, srv)
 
 	gw := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv.MCP() }, nil))
