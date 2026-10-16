@@ -1657,13 +1657,16 @@ func TestServeHTTP_KeepAliveClosesSessionAfterDownstreamClientDisappears(t *test
 	go func() { waitErr <- serverSession.Wait() }()
 
 	select {
-	case <-waitErr:
+	case err := <-waitErr:
+		t.Logf("ServerSession.Wait() returned: %v", err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("ServerSession.Wait() did not return within 2s of the client disappearing; want KeepAlive to detect it and close the session")
 	}
 
 	cancel()
-	<-serveErr
+	if err := <-serveErr; err != nil {
+		t.Logf("ServeHTTP returned: %v", err)
+	}
 }
 
 // TestGateway_CallCreatesSpanWithParentFromTraceparent checks the core

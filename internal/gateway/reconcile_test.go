@@ -297,7 +297,10 @@ func TestUpdateResources_AddsRemovesResourcesAndTemplatesInOneCall(t *testing.T)
 	}
 
 	var templateCount int
-	for range session.ResourceTemplates(ctx, nil) {
+	for _, err := range session.ResourceTemplates(ctx, nil) {
+		if err != nil {
+			t.Fatalf("listing resource templates: %v", err)
+		}
 		templateCount++
 	}
 	if templateCount != 0 {
