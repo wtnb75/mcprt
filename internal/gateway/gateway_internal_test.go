@@ -193,7 +193,9 @@ func TestServeHTTP_GetServerCalledPerNewSession(t *testing.T) {
 	go func() { serveErr <- ServeHTTP(ctx, func() *mcp.Server { return current.Load() }, addr) }()
 	t.Cleanup(func() {
 		cancel()
-		<-serveErr
+		if err := <-serveErr; err != nil {
+			t.Logf("ServeHTTP returned: %v", err)
+		}
 	})
 
 	dial := func() *mcp.ClientSession {

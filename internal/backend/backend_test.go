@@ -978,7 +978,8 @@ func TestConnect_KeepAliveClosesSessionAfterPingFailures(t *testing.T) {
 	srv.Close()
 
 	select {
-	case <-waitErr:
+	case err := <-waitErr:
+		t.Logf("Session.Wait() returned: %v", err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("Session.Wait() did not return within 2s of the backend disappearing; want KeepAlive to detect it and close the session")
 	}
