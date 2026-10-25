@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -197,7 +196,8 @@ func TestConnectBackends_ResourceListFailureKeepsBackendTools(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	conn := connectBackends(ctx, logger, configs, nil)
+	conn, supervisorsDone := connectBackendsWaitable(ctx, logger, configs, nil)
+	defer func() { waitSupervisorsDone(t, supervisorsDone) }()
 	defer func() {
 		for _, b := range conn.backends {
 			_ = b.Close()
@@ -240,7 +240,8 @@ func TestConnectBackends_PromptListFailureKeepsBackendTools(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	conn := connectBackends(ctx, logger, configs, nil)
+	conn, supervisorsDone := connectBackendsWaitable(ctx, logger, configs, nil)
+	defer func() { waitSupervisorsDone(t, supervisorsDone) }()
 	defer func() {
 		for _, b := range conn.backends {
 			_ = b.Close()
@@ -273,7 +274,8 @@ func TestConnectBackends_LogsSuccessfulConnect(t *testing.T) {
 	configs := []config.BackendConfig{{Name: "fake", Transport: "http", URL: backendHTTP.URL}}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	conn := connectBackends(ctx, logger, configs, nil)
+	conn, supervisorsDone := connectBackendsWaitable(ctx, logger, configs, nil)
+	defer func() { waitSupervisorsDone(t, supervisorsDone) }()
 	defer func() {
 		for _, b := range conn.backends {
 			_ = b.Close()
@@ -361,7 +363,14 @@ func TestSuperviseBackend_ReconnectsAfterDisconnect(t *testing.T) {
 	backendBackoffMin, backendBackoffMax = 10*time.Millisecond, 50*time.Millisecond
 	t.Cleanup(func() { backendBackoffMin, backendBackoffMax = origMin, origMax })
 
-	backendHTTP := newFakeBackendHTTP("ping")
+	// While held, the backend refuses new connections (initialize), so the
+	// supervisor's reconnect cannot complete and the "tools cleared" state
+	// stays observable until the test releases it. Without this the cleared
+	// window lasts only as long as one reconnect handshake and is gone for
+	// good once it closes, so a test that samples too late can never see it
+	// no matter how long it polls.
+	var held atomic.Bool
+	backendHTTP := newFakeBackendHTTPWrapped("ping", func(h http.Handler) http.Handler { return holdInitializeWhen(&held, h) })
 	defer backendHTTP.Close()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -438,29 +447,22 @@ func TestSuperviseBackend_ReconnectsAfterDisconnect(t *testing.T) {
 	// Client-initiated Close() is a terminal disconnect (unlike a server-side
 	// connection reset, which go-sdk's streamable transport would silently
 	// auto-heal on its own -- see this plan's Global Constraints), so this
-	// reliably fires Session.Wait() inside superviseBackend.
+	// reliably fires Session.Wait() inside superviseBackend. The hold goes up
+	// first so the reconnect that follows immediately (there is no backoff on
+	// the graceful-disconnect path -- see superviseBackend) is refused and the
+	// cleared state below persists; it is the DELETE of Close() that must not
+	// be held, which holdInitializeWhen guarantees.
+	held.Store(true)
 	if err := firstConn.Close(); err != nil {
 		t.Fatalf("closing backend connection: %v", err)
 	}
 
-	// superviseBackend's disconnect -> clear -> reconnect -> re-register
-	// cycle can complete in well under a millisecond against a local
-	// httptest backend (backoff is shrunk above, and there is no backoff at
-	// all on the graceful-disconnect path -- see superviseBackend), so a
-	// second, freshly-issued toolNames() call after this loop breaks could
-	// race past the empty window and observe the *next* reconnect's tools
-	// instead. Deciding on the sampled value from inside the loop (like the
-	// reconnect-wait loop below already does) instead of re-querying
-	// afterward avoids that race while still proving superviseBackend
-	// actually cleared the tools at some point within the deadline.
-	// 2s was observed to flake on loaded CI runners (the disconnect -> clear
-	// cycle above is normally sub-millisecond locally, but shares no such
-	// guarantee under contention); 5s (the margin already used by this
-	// file's other polling loops, e.g. the reconnect wait right below) then
-	// ALSO flaked twice in a row on CI, finishing at ~5.0-5.03s -- right at
-	// the edge, not a fluke. 15s gives real headroom instead of nudging the
-	// number up by a few seconds and re-litigating this the next time CI is
-	// under load.
+	// With the reconnect held off, the tools stay cleared until released, so
+	// polling is deterministic: it only has to wait for superviseBackend to
+	// notice the disconnect and clear them. (Earlier versions raced the
+	// reconnect instead and kept raising this deadline -- 2s, 5s, 15s --
+	// which could not help: once the reconnect won, the cleared state never
+	// came back.)
 	deadline := time.Now().Add(15 * time.Second)
 	var sawEmpty bool
 	for time.Now().Before(deadline) {
@@ -474,9 +476,10 @@ func TestSuperviseBackend_ReconnectsAfterDisconnect(t *testing.T) {
 		t.Fatal("tools never went empty within 15s of disconnect (superviseBackend must clear them)")
 	}
 
-	// The fake backend server is still up -- superviseBackend's retry loop
+	// Let new connections through again -- superviseBackend's retry loop
 	// (backoff shrunk above) should reconnect automatically. Same 15s
-	// margin as the empty-tools wait above, for the same reason.
+	// margin as the empty-tools wait above.
+	held.Store(false)
 	deadline = time.Now().Add(15 * time.Second)
 	var got []string
 	for time.Now().Before(deadline) {
@@ -1370,12 +1373,48 @@ func TestRunServer_ConfiguresGlobalTracerProvider(t *testing.T) {
 // toolName, for buildGateway/watchSIGHUP tests that need a real backend to
 // connect to. The caller must Close() the returned server.
 func newFakeBackendHTTP(toolName string) *httptest.Server {
+	return newFakeBackendHTTPWrapped(toolName, func(h http.Handler) http.Handler { return h })
+}
+
+// newFakeBackendHTTPWrapped is newFakeBackendHTTP with wrap applied around the
+// MCP handler, for tests that need to interfere with the backend's HTTP
+// traffic (see holdInitializeWhen).
+func newFakeBackendHTTPWrapped(toolName string, wrap func(http.Handler) http.Handler) *httptest.Server {
 	srv := mcp.NewServer(&mcp.Implementation{Name: "backend", Version: "v1"}, nil)
 	mcp.AddTool(srv, &mcp.Tool{Name: toolName, Description: toolName},
 		func(ctx context.Context, req *mcp.CallToolRequest, in struct{}) (*mcp.CallToolResult, struct{}, error) {
 			return nil, struct{}{}, nil
 		})
-	return httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil))
+	return httptest.NewServer(wrap(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, nil)))
+}
+
+// holdInitializeWhen wraps an MCP StreamableHTTP handler so that, while held
+// is true, every JSON-RPC "initialize" request is refused with a 503. Every
+// other request (notably the DELETE a client sends on Close) passes through,
+// so already-open sessions keep working and can still be closed cleanly. It
+// lets a test keep a backend unreachable-for-NEW-connections for exactly as
+// long as it wants, instead of racing the supervisor's reconnect.
+func holdInitializeWhen(held *atomic.Bool, inner http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !held.Load() {
+			inner.ServeHTTP(w, r)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		var probe struct {
+			Method string `json:"method"`
+		}
+		if json.Unmarshal(body, &probe) == nil && probe.Method == "initialize" {
+			http.Error(w, "initialize held by test", http.StatusServiceUnavailable)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	})
 }
 
 // TestWatchSIGHUP_ReloadsConfig checks that a SIGHUP delivered to the test
@@ -1436,23 +1475,14 @@ func TestWatchSIGHUP_ReloadsConfig(t *testing.T) {
 		}
 	}()
 
-	// Register a throwaway SIGHUP handler synchronously, before spawning
-	// watchSIGHUP (whose own signal.Notify runs inside its goroutine, racing
-	// against the syscall.Kill below). Without this, if the kill lands
-	// before that goroutine gets scheduled, the process has no registered
-	// handler for SIGHUP yet and the Go runtime applies the default action
-	// (terminate) -- killing the whole test binary instead of just this
-	// test. Once ANY handler is registered for a signal, the runtime never
-	// reverts to default disposition for it, and every registered channel
-	// (this one and watchSIGHUP's own) receives every subsequent delivery,
-	// so this doesn't interfere with watchSIGHUP actually seeing the signal.
-	ready := make(chan os.Signal, 1)
-	signal.Notify(ready, syscall.SIGHUP)
-	defer signal.Stop(ready)
+	// Subscribe before spawning watchSIGHUP so a SIGHUP sent right away is
+	// buffered instead of lost to a not-yet-scheduled goroutine.
+	sighup, stopSIGHUP := subscribeSIGHUP()
+	defer stopSIGHUP()
 
 	done := make(chan struct{})
 	go func() {
-		watchSIGHUP(ctx, logger, configPath, startupListen{http: cfg.Listen.HTTP}, current, live, genCancel)
+		watchSIGHUP(ctx, logger, sighup, configPath, startupListen{http: cfg.Listen.HTTP}, current, live, genCancel)
 		close(done)
 	}()
 
@@ -1474,6 +1504,93 @@ func TestWatchSIGHUP_ReloadsConfig(t *testing.T) {
 	}
 	if genCtx.Err() == nil {
 		t.Fatal("generation 0's genCtx should be cancelled once superseded")
+	}
+
+	cancel()
+	<-done
+}
+
+// TestWatchSIGHUP_SignalSentBeforeWatcherStartsIsNotLost pins the ordering
+// the other watchSIGHUP tests only hit by luck: a SIGHUP delivered after
+// subscribeSIGHUP but before the watch goroutine ever runs must still trigger
+// a reload. The old design registered signal.Notify inside the goroutine, so
+// a signal sent first was dropped and the reload never happened (flaky under
+// CI load).
+func TestWatchSIGHUP_SignalSentBeforeWatcherStartsIsNotLost(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	backendA := newFakeBackendHTTP("from-a")
+	defer backendA.Close()
+	backendB := newFakeBackendHTTP("from-b")
+	defer backendB.Close()
+
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	writeCfg := func(url string) {
+		t.Helper()
+		content := fmt.Sprintf("listen:\n  http: \"127.0.0.1:0\"\nbackends:\n  - name: b\n    transport: http\n    url: %q\n", url)
+		if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+			t.Fatalf("writing config: %v", err)
+		}
+	}
+	writeCfg(backendA.URL)
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	genCtx, genCancel := context.WithCancel(ctx)
+	srv, err := buildGateway(genCtx, logger, cfg)
+	if err != nil {
+		t.Fatalf("buildGateway: %v", err)
+	}
+	// Close every generation's backends on the way out (see
+	// TestWatchSIGHUP_ReloadsConfig on why httptest.Close would hang otherwise).
+	defer func() {
+		for _, b := range srv.Backends() {
+			_ = b.Close()
+		}
+	}()
+	current := new(atomic.Pointer[gateway.Server])
+	current.Store(srv)
+	live := new(generations)
+	live.add(srv)
+	defer func() {
+		for _, b := range current.Load().Backends() {
+			_ = b.Close()
+		}
+	}()
+
+	sighup, stopSIGHUP := subscribeSIGHUP()
+	defer stopSIGHUP()
+
+	// Signal FIRST, start the watcher afterwards.
+	writeCfg(backendB.URL)
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatalf("sending SIGHUP: %v", err)
+	}
+	// Signal delivery to the channel is asynchronous; make sure it has
+	// actually been queued so this test doesn't depend on delivery timing.
+	for deadline := time.Now().Add(5 * time.Second); len(sighup) == 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("SIGHUP never reached the subscribed channel")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		watchSIGHUP(ctx, logger, sighup, configPath, startupListen{http: cfg.Listen.HTTP}, current, live, genCancel)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && current.Load() == srv {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if current.Load() == srv {
+		t.Fatal("current was not swapped: a SIGHUP queued before watchSIGHUP started was lost")
 	}
 
 	cancel()
@@ -1525,27 +1642,18 @@ func TestRunServer_ShutdownClosesDrainingGenerations(t *testing.T) {
 	}
 	writeCfg(backendA.URL)
 
-	// See the matching comment in TestWatchSIGHUP_ReloadsConfig: register a
-	// throwaway SIGHUP handler synchronously, before the process under test
-	// can receive one, so a delivery that lands before runServer's watchSIGHUP
-	// goroutine registers its own can never terminate the test binary.
-	ready := make(chan os.Signal, 1)
-	signal.Notify(ready, syscall.SIGHUP)
-	defer signal.Stop(ready)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- runServer(ctx, logger, configPath) }()
 
-	// Wait for runServer to get as far as spawning watchSIGHUP (which
-	// registers its own signal.Notify) before signalling, so exactly one
-	// reload happens: a SIGHUP that lands earlier would be dropped, and one
-	// sent again later would build a third generation this test doesn't need.
+	// runServer subscribes to SIGHUP before it logs "listening", so once that
+	// line appears a SIGHUP is buffered even if watchSIGHUP hasn't started
+	// reading yet. Signal exactly once: sending again later would build a
+	// third generation this test doesn't need.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) && !strings.Contains(logBuf.String(), "listening") {
 		time.Sleep(20 * time.Millisecond)
 	}
-	time.Sleep(200 * time.Millisecond)
 
 	// Point the config at backend B and reload.
 	writeCfg(backendB.URL)
@@ -1640,18 +1748,14 @@ func TestWatchSIGHUP_IgnoresReloadWithoutHTTPListener(t *testing.T) {
 		}
 	}()
 
-	// See the matching comment in TestWatchSIGHUP_ReloadsConfig: register a
-	// throwaway SIGHUP handler synchronously before spawning watchSIGHUP, so
-	// the syscall.Kill below can never land while SIGHUP's disposition is
-	// still "default" (which would terminate the whole test binary instead
-	// of just this test).
-	ready := make(chan os.Signal, 1)
-	signal.Notify(ready, syscall.SIGHUP)
-	defer signal.Stop(ready)
+	// Subscribe before spawning watchSIGHUP so a SIGHUP sent right away is
+	// buffered instead of lost to a not-yet-scheduled goroutine.
+	sighup, stopSIGHUP := subscribeSIGHUP()
+	defer stopSIGHUP()
 
 	done := make(chan struct{})
 	go func() {
-		watchSIGHUP(ctx, logger, configPath, startupListen{http: cfg.Listen.HTTP}, current, live, genCancel)
+		watchSIGHUP(ctx, logger, sighup, configPath, startupListen{http: cfg.Listen.HTTP}, current, live, genCancel)
 		close(done)
 	}()
 
@@ -1738,13 +1842,14 @@ func TestWatchSIGHUP_ReportsListenChangesAgainstStartupListeners(t *testing.T) {
 	live.add(srv)
 	defer func() { closeAll(current.Load()) }()
 
-	ready := make(chan os.Signal, 1)
-	signal.Notify(ready, syscall.SIGHUP)
-	defer signal.Stop(ready)
+	// Subscribe before spawning watchSIGHUP so a SIGHUP sent right away is
+	// buffered instead of lost to a not-yet-scheduled goroutine.
+	sighup, stopSIGHUP := subscribeSIGHUP()
+	defer stopSIGHUP()
 
 	done := make(chan struct{})
 	go func() {
-		watchSIGHUP(ctx, logger, configPath, startupListen{http: boundAddr, stdio: false}, current, live, genCancel)
+		watchSIGHUP(ctx, logger, sighup, configPath, startupListen{http: boundAddr, stdio: false}, current, live, genCancel)
 		close(done)
 	}()
 
@@ -1837,14 +1942,15 @@ func TestWatchSIGHUP_StdioWarningMentionsDrainForceClose(t *testing.T) {
 	live.add(srv)
 	defer func() { closeAll(current.Load()) }()
 
-	ready := make(chan os.Signal, 1)
-	signal.Notify(ready, syscall.SIGHUP)
-	defer signal.Stop(ready)
+	// Subscribe before spawning watchSIGHUP so a SIGHUP sent right away is
+	// buffered instead of lost to a not-yet-scheduled goroutine.
+	sighup, stopSIGHUP := subscribeSIGHUP()
+	defer stopSIGHUP()
 
 	done := make(chan struct{})
 	go func() {
 		// The process really did start a stdio listener (stdio: true above).
-		watchSIGHUP(ctx, logger, configPath, startupListen{http: boundAddr, stdio: true}, current, live, genCancel)
+		watchSIGHUP(ctx, logger, sighup, configPath, startupListen{http: boundAddr, stdio: true}, current, live, genCancel)
 		close(done)
 	}()
 
@@ -1917,13 +2023,14 @@ func TestWatchSIGHUP_MalformedConfigKeepsCurrentGeneration(t *testing.T) {
 		}
 	}()
 
-	ready := make(chan os.Signal, 1)
-	signal.Notify(ready, syscall.SIGHUP)
-	defer signal.Stop(ready)
+	// Subscribe before spawning watchSIGHUP so a SIGHUP sent right away is
+	// buffered instead of lost to a not-yet-scheduled goroutine.
+	sighup, stopSIGHUP := subscribeSIGHUP()
+	defer stopSIGHUP()
 
 	done := make(chan struct{})
 	go func() {
-		watchSIGHUP(ctx, logger, configPath, startupListen{http: boundAddr}, current, live, genCancel)
+		watchSIGHUP(ctx, logger, sighup, configPath, startupListen{http: boundAddr}, current, live, genCancel)
 		close(done)
 	}()
 
@@ -2027,13 +2134,14 @@ func TestWatchSIGHUP_ConsecutiveReloadsSupersedeEachGeneration(t *testing.T) {
 	live.add(gen0)
 	defer func() { closeAll(current.Load()) }()
 
-	ready := make(chan os.Signal, 1)
-	signal.Notify(ready, syscall.SIGHUP)
-	defer signal.Stop(ready)
+	// Subscribe before spawning watchSIGHUP so a SIGHUP sent right away is
+	// buffered instead of lost to a not-yet-scheduled goroutine.
+	sighup, stopSIGHUP := subscribeSIGHUP()
+	defer stopSIGHUP()
 
 	done := make(chan struct{})
 	go func() {
-		watchSIGHUP(ctx, logger, configPath, startupListen{http: boundAddr}, current, live, genCancel)
+		watchSIGHUP(ctx, logger, sighup, configPath, startupListen{http: boundAddr}, current, live, genCancel)
 		close(done)
 	}()
 
