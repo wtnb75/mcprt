@@ -226,6 +226,15 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 		}
 	}()
 
+	// Subscribe before logging "listening": that line is the signal that the
+	// process is ready to be reloaded, so a SIGHUP sent once it appears must
+	// already be buffered (see subscribeSIGHUP).
+	var sighup <-chan os.Signal
+	stopSIGHUP := func() {}
+	if cfg.Listen.HTTP != "" {
+		sighup, stopSIGHUP = subscribeSIGHUP()
+	}
+
 	logger.Info("listening", "stdio", cfg.Listen.Stdio, "http", cfg.Listen.HTTP)
 
 	running := 0
@@ -245,7 +254,8 @@ func runServer(ctx context.Context, logger *slog.Logger, configPath string) erro
 		sighupDone = make(chan struct{})
 		go func() {
 			defer close(sighupDone)
-			watchSIGHUP(ctx, logger, configPath, startup, current, live, genCancel)
+			defer stopSIGHUP()
+			watchSIGHUP(ctx, logger, sighup, configPath, startup, current, live, genCancel)
 		}()
 	}
 
@@ -1010,8 +1020,21 @@ func (g *generations) takeAll() []*gateway.Server {
 	return all
 }
 
+// subscribeSIGHUP registers for SIGHUP and returns the channel it arrives on,
+// plus the func that unregisters. It is separate from watchSIGHUP so the
+// caller can subscribe synchronously BEFORE spawning the watch goroutine: a
+// SIGHUP delivered while that goroutine is still waiting to be scheduled is
+// then buffered in the channel instead of being dropped (signal.Notify only
+// delivers to channels registered at delivery time).
+func subscribeSIGHUP() (<-chan os.Signal, func()) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGHUP)
+	return ch, func() { signal.Stop(ch) }
+}
+
 // watchSIGHUP blocks until ctx is cancelled, rebuilding the gateway (via
-// buildGateway) and swapping current on every SIGHUP. initialGenCancel is
+// buildGateway) and swapping current on every SIGHUP received on sighup (see
+// subscribeSIGHUP; the caller owns the subscription). initialGenCancel is
 // the cancel func for the generation runServer already built before
 // spawning this loop -- watchSIGHUP takes ownership of it so that
 // generation 0 is cancelled on its first supersession exactly like every
@@ -1020,11 +1043,7 @@ func (g *generations) takeAll() []*gateway.Server {
 // builds is registered in live so process shutdown can close it even while it
 // drains. Only spawned by runServer when cfg.Listen.HTTP != "" -- hot-reload
 // only makes sense for HTTP (see this plan's Global Constraints).
-func watchSIGHUP(ctx context.Context, logger *slog.Logger, configPath string, startup startupListen, current *atomic.Pointer[gateway.Server], live *generations, initialGenCancel context.CancelFunc) {
-	sighup := make(chan os.Signal, 1)
-	signal.Notify(sighup, syscall.SIGHUP)
-	defer signal.Stop(sighup)
-
+func watchSIGHUP(ctx context.Context, logger *slog.Logger, sighup <-chan os.Signal, configPath string, startup startupListen, current *atomic.Pointer[gateway.Server], live *generations, initialGenCancel context.CancelFunc) {
 	genCancel := initialGenCancel // the currently-live generation's cancel func
 
 	for {
